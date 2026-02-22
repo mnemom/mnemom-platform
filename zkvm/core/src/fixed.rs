@@ -124,8 +124,8 @@ impl Fixed {
     }
 
     /// Taylor-approximated exp(-y) for y >= 0.
-    /// Uses 4th-order Taylor expansion: 1 - y + y²/2 - y³/6 + y⁴/24
-    /// Max error ~0.0016 at y=2.
+    /// Uses 8th-order Taylor expansion for sufficient precision in Q16.16.
+    /// Max error ~80 units (~0.0012) at y=2.
     pub fn exp_neg(self) -> Fixed {
         let y = self.abs();
         if y.0 == 0 {
@@ -139,15 +139,21 @@ impl Fixed {
         let y2 = y * y;
         let y3 = y2 * y;
         let y4 = y3 * y;
+        let y5 = y4 * y;
+        let y6 = y5 * y;
+        let y7 = y6 * y;
+        let y8 = y7 * y;
 
-        // 1 - y + y²/2 - y³/6 + y⁴/24
-        let term0 = Fixed::ONE;
-        let term1 = y;
-        let term2 = y2 * Fixed::HALF;
-        let term3 = y3 * Fixed::from_ratio(1, 6);
-        let term4 = y4 * Fixed::from_ratio(1, 24);
+        // 1 - y + y²/2 - y³/6 + y⁴/24 - y⁵/120 + y⁶/720 - y⁷/5040 + y⁸/40320
+        let result = Fixed::ONE - y
+            + y2 * Fixed::HALF
+            - y3 * Fixed::from_ratio(1, 6)
+            + y4 * Fixed::from_ratio(1, 24)
+            - y5 * Fixed::from_ratio(1, 120)
+            + y6 * Fixed::from_ratio(1, 720)
+            - y7 * Fixed::from_ratio(1, 5040)
+            + y8 * Fixed::from_ratio(1, 40320);
 
-        let result = term0 - term1 + term2 - term3 + term4;
         // Clamp to [0, 1] since exp(-y) is always in this range for y >= 0
         result.clamp(Fixed::ZERO, Fixed::ONE)
     }
