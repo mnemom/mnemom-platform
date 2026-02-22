@@ -295,45 +295,9 @@ async fn handle_prove_risk(
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        // Build ExecutorEnv with the input
-        let env = match risc0_zkvm::ExecutorEnv::builder()
-            .write(&guest_input)
-            .and_then(|b| b.build())
-        {
-            Ok(e) => e,
-            Err(e) => {
-                error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
-                let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
-                    .bind(&proof_id)
-                    .bind(format!("Executor env build failed: {}", e))
-                    .execute(&db)
-                    .await;
-                return;
-            }
-        };
-
-        // Prove with the risk guest ELF
-        match risc0_zkvm::default_prover()
-            .prove(env, risk_zkvm_methods::RISK_ZKVM_GUEST_ELF)
-        {
-            Ok(prove_info) => {
+        match prover::prove_risk_assessment(guest_input) {
+            Ok((receipt, output)) => {
                 let duration_ms = start.elapsed().as_millis() as i32;
-                let receipt = prove_info.receipt;
-
-                // Decode journal
-                let output: RiskGuestOutput = match receipt.journal.decode() {
-                    Ok(o) => o,
-                    Err(e) => {
-                        error!(proof_id = %proof_id, "Failed to decode risk journal: {}", e);
-                        let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
-                            .bind(&proof_id)
-                            .bind(format!("Journal decode failed: {}", e))
-                            .execute(&db)
-                            .await;
-                        return;
-                    }
-                };
-
                 let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
                     Ok(b) => b,
                     Err(e) => {
@@ -354,7 +318,6 @@ async fn handle_prove_risk(
                     .map(|b| format!("{:02x}", b))
                     .collect();
 
-                // Self-verify receipt
                 let verified = receipt
                     .verify(risk_zkvm_methods::RISK_ZKVM_GUEST_ID)
                     .is_ok();
@@ -431,45 +394,9 @@ async fn handle_prove_team_risk(
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        // Build ExecutorEnv with the input
-        let env = match risc0_zkvm::ExecutorEnv::builder()
-            .write(&guest_input)
-            .and_then(|b| b.build())
-        {
-            Ok(e) => e,
-            Err(e) => {
-                error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
-                let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
-                    .bind(&proof_id)
-                    .bind(format!("Executor env build failed: {}", e))
-                    .execute(&db)
-                    .await;
-                return;
-            }
-        };
-
-        // Prove with the team risk guest ELF
-        match risc0_zkvm::default_prover()
-            .prove(env, team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ELF)
-        {
-            Ok(prove_info) => {
+        match prover::prove_team_risk_assessment(guest_input) {
+            Ok((receipt, output)) => {
                 let duration_ms = start.elapsed().as_millis() as i32;
-                let receipt = prove_info.receipt;
-
-                // Decode journal
-                let output: TeamRiskOutput = match receipt.journal.decode() {
-                    Ok(o) => o,
-                    Err(e) => {
-                        error!(proof_id = %proof_id, "Failed to decode team risk journal: {}", e);
-                        let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
-                            .bind(&proof_id)
-                            .bind(format!("Journal decode failed: {}", e))
-                            .execute(&db)
-                            .await;
-                        return;
-                    }
-                };
-
                 let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
                     Ok(b) => b,
                     Err(e) => {
@@ -490,7 +417,6 @@ async fn handle_prove_team_risk(
                     .map(|b| format!("{:02x}", b))
                     .collect();
 
-                // Self-verify receipt
                 let verified = receipt
                     .verify(team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ID)
                     .is_ok();
@@ -854,28 +780,9 @@ pub async fn retry_loop(db: PgPool) {
                                 }
                             };
 
-                            let env = match risc0_zkvm::ExecutorEnv::builder()
-                                .write(&guest_input)
-                                .and_then(|b| b.build())
-                            {
-                                Ok(e) => e,
-                                Err(e) => {
-                                    error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
-                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
-                                        .bind(&proof_id)
-                                        .bind(format!("Executor env build failed: {}", e))
-                                        .execute(&db_clone)
-                                        .await;
-                                    return;
-                                }
-                            };
-
-                            match risc0_zkvm::default_prover()
-                                .prove(env, team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ELF)
-                            {
-                                Ok(prove_info) => {
+                            match prover::prove_team_risk_assessment(guest_input) {
+                                Ok((receipt, _output)) => {
                                     let duration_ms = start.elapsed().as_millis() as i32;
-                                    let receipt = prove_info.receipt;
                                     let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
                                         Ok(b) => b,
                                         Err(e) => {
@@ -935,28 +842,9 @@ pub async fn retry_loop(db: PgPool) {
                                 }
                             };
 
-                            let env = match risc0_zkvm::ExecutorEnv::builder()
-                                .write(&guest_input)
-                                .and_then(|b| b.build())
-                            {
-                                Ok(e) => e,
-                                Err(e) => {
-                                    error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
-                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
-                                        .bind(&proof_id)
-                                        .bind(format!("Executor env build failed: {}", e))
-                                        .execute(&db_clone)
-                                        .await;
-                                    return;
-                                }
-                            };
-
-                            match risc0_zkvm::default_prover()
-                                .prove(env, risk_zkvm_methods::RISK_ZKVM_GUEST_ELF)
-                            {
-                                Ok(prove_info) => {
+                            match prover::prove_risk_assessment(guest_input) {
+                                Ok((receipt, _output)) => {
                                     let duration_ms = start.elapsed().as_millis() as i32;
-                                    let receipt = prove_info.receipt;
                                     let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
                                         Ok(b) => b,
                                         Err(e) => {

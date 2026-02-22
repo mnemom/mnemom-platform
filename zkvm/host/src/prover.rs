@@ -1,9 +1,12 @@
 //! Proving and verification functions.
 
+use aip_zkvm_core::team_types::{TeamRiskInput, TeamRiskOutput};
 use aip_zkvm_core::{GuestInput, GuestOutput};
 use aip_zkvm_methods::AIP_ZKVM_GUEST_ELF;
 use anyhow::{Context, Result};
 use risc0_zkvm::{default_prover, ExecutorEnv, Receipt};
+
+use crate::server::{RiskGuestInput, RiskGuestOutput};
 
 /// Prove that the verdict was correctly derived from the analysis.
 ///
@@ -58,6 +61,54 @@ pub fn verify_verdict_proof(receipt: &Receipt) -> Result<GuestOutput> {
         .context("Failed to decode journal output")?;
 
     Ok(output)
+}
+
+/// Prove an individual risk assessment.
+///
+/// Returns the STARK receipt and the committed risk output.
+pub fn prove_risk_assessment(input: RiskGuestInput) -> Result<(Receipt, RiskGuestOutput)> {
+    let env = ExecutorEnv::builder()
+        .write(&input)
+        .context("Failed to write risk input to executor env")?
+        .build()
+        .context("Failed to build executor env")?;
+
+    let prover = default_prover();
+    let prove_info = prover
+        .prove(env, risk_zkvm_methods::RISK_ZKVM_GUEST_ELF)
+        .context("Failed to generate risk proof")?;
+
+    let receipt = prove_info.receipt;
+    let output: RiskGuestOutput = receipt
+        .journal
+        .decode()
+        .context("Failed to decode risk journal output")?;
+
+    Ok((receipt, output))
+}
+
+/// Prove a team risk assessment.
+///
+/// Returns the STARK receipt and the committed team risk output.
+pub fn prove_team_risk_assessment(input: TeamRiskInput) -> Result<(Receipt, TeamRiskOutput)> {
+    let env = ExecutorEnv::builder()
+        .write(&input)
+        .context("Failed to write team risk input to executor env")?
+        .build()
+        .context("Failed to build executor env")?;
+
+    let prover = default_prover();
+    let prove_info = prover
+        .prove(env, team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ELF)
+        .context("Failed to generate team risk proof")?;
+
+    let receipt = prove_info.receipt;
+    let output: TeamRiskOutput = receipt
+        .journal
+        .decode()
+        .context("Failed to decode team risk journal output")?;
+
+    Ok((receipt, output))
 }
 
 /// Serialize a receipt to bytes for transport/storage.
