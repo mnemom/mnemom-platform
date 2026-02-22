@@ -1,10 +1,12 @@
 //! Axum HTTP proving service.
 //!
 //! Routes:
-//!   POST /prove        — accept proof request, spawn proving task
-//!   GET  /prove/:id    — proof status
-//!   POST /prove/verify — verify a receipt
-//!   GET  /health       — health check
+//!   POST /prove            — accept verdict proof request, spawn proving task
+//!   POST /prove/risk       — accept risk proof request, spawn proving task
+//!   POST /prove/team-risk  — accept team risk proof request, spawn proving task
+//!   GET  /prove/:id        — proof status
+//!   POST /prove/verify     — verify a receipt
+//!   GET  /health           — health check
 
 use axum::{
     extract::{Path, State},
@@ -17,6 +19,9 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
+
+use aip_zkvm_core::fixed::Fixed;
+use aip_zkvm_core::team_types::{TeamRiskInput, TeamRiskOutput};
 
 use crate::prover;
 
@@ -80,10 +85,67 @@ pub struct HealthResponse {
     pub version: String,
 }
 
+// ---------------------------------------------------------------------------
+// Risk proof types
+// ---------------------------------------------------------------------------
+
+/// Reputation component scores (mirrors the guest-side type).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReputationComponents {
+    pub integrity: Fixed,
+    pub reliability: Fixed,
+    pub competence: Fixed,
+    pub transparency: Fixed,
+    pub alignment: Fixed,
+}
+
+/// A single violation record (mirrors the guest-side type).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViolationRecord {
+    pub severity_weight: Fixed,
+    pub days_since: Fixed,
+}
+
+/// Input to the individual risk guest program (mirrors the guest-side type).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RiskGuestInput {
+    pub reputation: ReputationComponents,
+    pub violations: Vec<ViolationRecord>,
+    pub action_type: String,
+    pub risk_tolerance: String,
+}
+
+/// Output committed by the individual risk guest program (mirrors the guest-side type).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RiskGuestOutput {
+    pub risk_score: Fixed,
+    pub risk_level: String,
+    pub recommendation: String,
+    pub input_hash: String,
+}
+
+/// Risk proof request payload.
+#[derive(Deserialize)]
+pub struct RiskProofRequest {
+    pub proof_id: String,
+    pub assessment_id: String,
+    pub input_data: serde_json::Value,
+}
+
+/// Team risk proof request payload.
+#[derive(Deserialize)]
+pub struct TeamRiskProofRequest {
+    pub proof_id: String,
+    pub assessment_id: String,
+    pub input_data: serde_json::Value,
+}
+
 /// Build the Axum router.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/prove", post(handle_prove))
+        .route("/prove/risk", post(handle_prove_risk))
+        .route("/prove/team-risk", post(handle_prove_team_risk))
         .route("/prove/{id}", get(handle_proof_status))
         .route("/prove/verify", post(handle_verify))
         .route("/health", get(handle_health))
@@ -194,6 +256,278 @@ async fn handle_prove(
                 .bind(format!("Proving failed: {}", e))
                 .execute(&db)
                 .await;
+            }
+        }
+    });
+
+    Ok(Json(ProofResponse {
+        proof_id: req.proof_id,
+        status: "proving".to_string(),
+    }))
+}
+
+/// POST /prove/risk — accept a risk proof request and spawn a background task.
+async fn handle_prove_risk(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RiskProofRequest>,
+) -> Result<Json<ProofResponse>, StatusCode> {
+    check_auth(&headers, &state)?;
+
+    info!(proof_id = %req.proof_id, assessment_id = %req.assessment_id, "Received risk proof request");
+
+    // Deserialize input_data into the risk guest input
+    let guest_input: RiskGuestInput = serde_json::from_value(req.input_data)
+        .map_err(|e| {
+            error!(proof_id = %req.proof_id, "Invalid risk input_data: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
+    // Update status to 'proving'
+    let _ = sqlx::query("UPDATE risk_proofs SET status = 'proving', updated_at = now() WHERE proof_id = $1")
+        .bind(&req.proof_id)
+        .execute(&state.db)
+        .await;
+
+    // Spawn proving task in background
+    let db = state.db.clone();
+    let proof_id = req.proof_id.clone();
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+
+        // Build ExecutorEnv with the input
+        let env = match risc0_zkvm::ExecutorEnv::builder()
+            .write(&guest_input)
+            .and_then(|b| b.build())
+        {
+            Ok(e) => e,
+            Err(e) => {
+                error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
+                let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                    .bind(&proof_id)
+                    .bind(format!("Executor env build failed: {}", e))
+                    .execute(&db)
+                    .await;
+                return;
+            }
+        };
+
+        // Prove with the risk guest ELF
+        match risc0_zkvm::default_prover()
+            .prove(env, risk_zkvm_methods::RISK_ZKVM_GUEST_ELF)
+        {
+            Ok(prove_info) => {
+                let duration_ms = start.elapsed().as_millis() as i32;
+                let receipt = prove_info.receipt;
+
+                // Decode journal
+                let output: RiskGuestOutput = match receipt.journal.decode() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        error!(proof_id = %proof_id, "Failed to decode risk journal: {}", e);
+                        let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                            .bind(&proof_id)
+                            .bind(format!("Journal decode failed: {}", e))
+                            .execute(&db)
+                            .await;
+                        return;
+                    }
+                };
+
+                let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(proof_id = %proof_id, "Failed to serialize risk receipt: {}", e);
+                        let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                            .bind(&proof_id)
+                            .bind(format!("Receipt serialization failed: {}", e))
+                            .execute(&db)
+                            .await;
+                        return;
+                    }
+                };
+
+                let journal_bytes = receipt.journal.bytes.clone();
+                let image_id_hex: String = risk_zkvm_methods::RISK_ZKVM_GUEST_ID
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+
+                // Self-verify receipt
+                let verified = receipt
+                    .verify(risk_zkvm_methods::RISK_ZKVM_GUEST_ID)
+                    .is_ok();
+
+                info!(
+                    proof_id = %proof_id,
+                    risk_level = %output.risk_level,
+                    risk_score = ?output.risk_score,
+                    duration_ms = duration_ms,
+                    verified = verified,
+                    "Risk proof completed"
+                );
+
+                match sqlx::query(
+                    "SELECT complete_risk_proof($1, $2, $3, $4, $5, $6::numeric, $7, $8)"
+                )
+                .bind(&proof_id)
+                .bind(&image_id_hex)
+                .bind(&receipt_bytes)
+                .bind(&journal_bytes)
+                .bind(duration_ms)
+                .bind(0.005f64)
+                .bind(verified)
+                .bind(if verified { Some(chrono::Utc::now()) } else { None })
+                .execute(&db)
+                .await {
+                    Ok(_) => info!(proof_id = %proof_id, "Risk proof persisted to DB"),
+                    Err(e) => error!(proof_id = %proof_id, "Failed to persist risk proof: {}", e),
+                }
+            }
+            Err(e) => {
+                error!(proof_id = %proof_id, "Risk proving failed: {}", e);
+                let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                    .bind(&proof_id)
+                    .bind(format!("Proving failed: {}", e))
+                    .execute(&db)
+                    .await;
+            }
+        }
+    });
+
+    Ok(Json(ProofResponse {
+        proof_id: req.proof_id,
+        status: "proving".to_string(),
+    }))
+}
+
+/// POST /prove/team-risk — accept a team risk proof request and spawn a background task.
+async fn handle_prove_team_risk(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TeamRiskProofRequest>,
+) -> Result<Json<ProofResponse>, StatusCode> {
+    check_auth(&headers, &state)?;
+
+    info!(proof_id = %req.proof_id, assessment_id = %req.assessment_id, "Received team risk proof request");
+
+    // Deserialize input_data into the team risk input
+    let guest_input: TeamRiskInput = serde_json::from_value(req.input_data)
+        .map_err(|e| {
+            error!(proof_id = %req.proof_id, "Invalid team risk input_data: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
+    // Update status to 'proving'
+    let _ = sqlx::query("UPDATE risk_proofs SET status = 'proving', updated_at = now() WHERE proof_id = $1")
+        .bind(&req.proof_id)
+        .execute(&state.db)
+        .await;
+
+    // Spawn proving task in background
+    let db = state.db.clone();
+    let proof_id = req.proof_id.clone();
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+
+        // Build ExecutorEnv with the input
+        let env = match risc0_zkvm::ExecutorEnv::builder()
+            .write(&guest_input)
+            .and_then(|b| b.build())
+        {
+            Ok(e) => e,
+            Err(e) => {
+                error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
+                let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                    .bind(&proof_id)
+                    .bind(format!("Executor env build failed: {}", e))
+                    .execute(&db)
+                    .await;
+                return;
+            }
+        };
+
+        // Prove with the team risk guest ELF
+        match risc0_zkvm::default_prover()
+            .prove(env, team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ELF)
+        {
+            Ok(prove_info) => {
+                let duration_ms = start.elapsed().as_millis() as i32;
+                let receipt = prove_info.receipt;
+
+                // Decode journal
+                let output: TeamRiskOutput = match receipt.journal.decode() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        error!(proof_id = %proof_id, "Failed to decode team risk journal: {}", e);
+                        let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                            .bind(&proof_id)
+                            .bind(format!("Journal decode failed: {}", e))
+                            .execute(&db)
+                            .await;
+                        return;
+                    }
+                };
+
+                let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(proof_id = %proof_id, "Failed to serialize team risk receipt: {}", e);
+                        let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                            .bind(&proof_id)
+                            .bind(format!("Receipt serialization failed: {}", e))
+                            .execute(&db)
+                            .await;
+                        return;
+                    }
+                };
+
+                let journal_bytes = receipt.journal.bytes.clone();
+                let image_id_hex: String = team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ID
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+
+                // Self-verify receipt
+                let verified = receipt
+                    .verify(team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ID)
+                    .is_ok();
+
+                info!(
+                    proof_id = %proof_id,
+                    team_risk_score = ?output.team_risk_score,
+                    circuit_breaker = output.circuit_breaker_triggered,
+                    duration_ms = duration_ms,
+                    verified = verified,
+                    "Team risk proof completed"
+                );
+
+                match sqlx::query(
+                    "SELECT complete_risk_proof($1, $2, $3, $4, $5, $6::numeric, $7, $8)"
+                )
+                .bind(&proof_id)
+                .bind(&image_id_hex)
+                .bind(&receipt_bytes)
+                .bind(&journal_bytes)
+                .bind(duration_ms)
+                .bind(0.005f64)
+                .bind(verified)
+                .bind(if verified { Some(chrono::Utc::now()) } else { None })
+                .execute(&db)
+                .await {
+                    Ok(_) => info!(proof_id = %proof_id, "Team risk proof persisted to DB"),
+                    Err(e) => error!(proof_id = %proof_id, "Failed to persist team risk proof: {}", e),
+                }
+            }
+            Err(e) => {
+                error!(proof_id = %proof_id, "Team risk proving failed: {}", e);
+                let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                    .bind(&proof_id)
+                    .bind(format!("Proving failed: {}", e))
+                    .execute(&db)
+                    .await;
             }
         }
     });
@@ -325,6 +659,19 @@ struct PendingProof {
     model: Option<String>,
 }
 
+/// Row returned by get_pending_risk_proofs.
+#[derive(sqlx::FromRow)]
+struct PendingRiskProof {
+    proof_id: String,
+    #[allow(dead_code)]
+    assessment_id: String,
+    proof_type: String,
+    retry_count: i32,
+    #[allow(dead_code)]
+    created_at: chrono::DateTime<chrono::Utc>,
+    input_data: Option<serde_json::Value>,
+}
+
 /// Background retry loop for pending proofs.
 ///
 /// Every 30 seconds, fetches pending proofs that have stored input data
@@ -452,6 +799,215 @@ pub async fn retry_loop(db: PgPool) {
             Ok(_) => {} // No pending proofs
             Err(e) => {
                 warn!("Failed to query pending proofs: {}", e);
+            }
+        }
+
+        // --- Risk proofs retry ---
+        let pending_risk = sqlx::query_as::<_, PendingRiskProof>(
+            "SELECT proof_id, assessment_id, proof_type, retry_count, created_at, input_data \
+             FROM get_pending_risk_proofs(5)"
+        )
+        .fetch_all(&db)
+        .await;
+
+        match pending_risk {
+            Ok(rows) if !rows.is_empty() => {
+                info!(count = rows.len(), "Retrying pending risk proofs");
+                for row in rows {
+                    let input_data = match row.input_data {
+                        Some(v) => v,
+                        None => {
+                            warn!(proof_id = %row.proof_id, "Skipping risk retry: missing input_data");
+                            continue;
+                        }
+                    };
+
+                    info!(proof_id = %row.proof_id, proof_type = %row.proof_type, retry_count = row.retry_count, "Spawning risk proof retry");
+
+                    // Mark as proving
+                    let _ = sqlx::query(
+                        "UPDATE risk_proofs SET status = 'proving', updated_at = now() WHERE proof_id = $1"
+                    )
+                    .bind(&row.proof_id)
+                    .execute(&db)
+                    .await;
+
+                    let db_clone = db.clone();
+                    let proof_id = row.proof_id.clone();
+                    let proof_type = row.proof_type.clone();
+
+                    tokio::spawn(async move {
+                        let start = std::time::Instant::now();
+
+                        if proof_type == "team_risk" {
+                            // --- Team risk proof ---
+                            let guest_input: TeamRiskInput = match serde_json::from_value(input_data) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    error!(proof_id = %proof_id, "Failed to deserialize team risk input: {}", e);
+                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                        .bind(&proof_id)
+                                        .bind(format!("Input deserialization failed: {}", e))
+                                        .execute(&db_clone)
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            let env = match risc0_zkvm::ExecutorEnv::builder()
+                                .write(&guest_input)
+                                .and_then(|b| b.build())
+                            {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
+                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                        .bind(&proof_id)
+                                        .bind(format!("Executor env build failed: {}", e))
+                                        .execute(&db_clone)
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            match risc0_zkvm::default_prover()
+                                .prove(env, team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ELF)
+                            {
+                                Ok(prove_info) => {
+                                    let duration_ms = start.elapsed().as_millis() as i32;
+                                    let receipt = prove_info.receipt;
+                                    let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            error!(proof_id = %proof_id, "Failed to serialize receipt: {}", e);
+                                            let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                                .bind(&proof_id)
+                                                .bind(format!("Receipt serialization failed: {}", e))
+                                                .execute(&db_clone)
+                                                .await;
+                                            return;
+                                        }
+                                    };
+
+                                    let journal_bytes = receipt.journal.bytes.clone();
+                                    let image_id_hex: String = team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ID
+                                        .iter()
+                                        .flat_map(|w| w.to_le_bytes())
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect();
+                                    let verified = receipt.verify(team_risk_zkvm_methods::TEAM_RISK_ZKVM_GUEST_ID).is_ok();
+
+                                    info!(proof_id = %proof_id, duration_ms = duration_ms, verified = verified, "Retry team risk proof completed");
+
+                                    let _ = sqlx::query("SELECT complete_risk_proof($1, $2, $3, $4, $5, $6::numeric, $7, $8)")
+                                        .bind(&proof_id)
+                                        .bind(&image_id_hex)
+                                        .bind(&receipt_bytes)
+                                        .bind(&journal_bytes)
+                                        .bind(duration_ms)
+                                        .bind(0.005f64)
+                                        .bind(verified)
+                                        .bind(if verified { Some(chrono::Utc::now()) } else { None })
+                                        .execute(&db_clone)
+                                        .await;
+                                }
+                                Err(e) => {
+                                    error!(proof_id = %proof_id, "Retry team risk proving failed: {}", e);
+                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                        .bind(&proof_id)
+                                        .bind(format!("Proving failed: {}", e))
+                                        .execute(&db_clone)
+                                        .await;
+                                }
+                            }
+                        } else {
+                            // --- Individual risk proof ---
+                            let guest_input: RiskGuestInput = match serde_json::from_value(input_data) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    error!(proof_id = %proof_id, "Failed to deserialize risk input: {}", e);
+                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                        .bind(&proof_id)
+                                        .bind(format!("Input deserialization failed: {}", e))
+                                        .execute(&db_clone)
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            let env = match risc0_zkvm::ExecutorEnv::builder()
+                                .write(&guest_input)
+                                .and_then(|b| b.build())
+                            {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    error!(proof_id = %proof_id, "Failed to build executor env: {}", e);
+                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                        .bind(&proof_id)
+                                        .bind(format!("Executor env build failed: {}", e))
+                                        .execute(&db_clone)
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            match risc0_zkvm::default_prover()
+                                .prove(env, risk_zkvm_methods::RISK_ZKVM_GUEST_ELF)
+                            {
+                                Ok(prove_info) => {
+                                    let duration_ms = start.elapsed().as_millis() as i32;
+                                    let receipt = prove_info.receipt;
+                                    let receipt_bytes = match prover::receipt_to_bytes(&receipt) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            error!(proof_id = %proof_id, "Failed to serialize receipt: {}", e);
+                                            let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                                .bind(&proof_id)
+                                                .bind(format!("Receipt serialization failed: {}", e))
+                                                .execute(&db_clone)
+                                                .await;
+                                            return;
+                                        }
+                                    };
+
+                                    let journal_bytes = receipt.journal.bytes.clone();
+                                    let image_id_hex: String = risk_zkvm_methods::RISK_ZKVM_GUEST_ID
+                                        .iter()
+                                        .flat_map(|w| w.to_le_bytes())
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect();
+                                    let verified = receipt.verify(risk_zkvm_methods::RISK_ZKVM_GUEST_ID).is_ok();
+
+                                    info!(proof_id = %proof_id, duration_ms = duration_ms, verified = verified, "Retry risk proof completed");
+
+                                    let _ = sqlx::query("SELECT complete_risk_proof($1, $2, $3, $4, $5, $6::numeric, $7, $8)")
+                                        .bind(&proof_id)
+                                        .bind(&image_id_hex)
+                                        .bind(&receipt_bytes)
+                                        .bind(&journal_bytes)
+                                        .bind(duration_ms)
+                                        .bind(0.005f64)
+                                        .bind(verified)
+                                        .bind(if verified { Some(chrono::Utc::now()) } else { None })
+                                        .execute(&db_clone)
+                                        .await;
+                                }
+                                Err(e) => {
+                                    error!(proof_id = %proof_id, "Retry risk proving failed: {}", e);
+                                    let _ = sqlx::query("SELECT fail_risk_proof($1, $2)")
+                                        .bind(&proof_id)
+                                        .bind(format!("Proving failed: {}", e))
+                                        .execute(&db_clone)
+                                        .await;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            Ok(_) => {} // No pending risk proofs
+            Err(e) => {
+                warn!("Failed to query pending risk proofs: {}", e);
             }
         }
     }

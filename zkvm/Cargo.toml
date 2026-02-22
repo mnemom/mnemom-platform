@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "methods/guest", "methods", "host", "wasm-verifier"]
+members = ["core", "methods/guest", "methods", "host", "wasm-verifier", "risk-methods/guest", "risk-methods", "team-risk-methods/guest", "team-risk-methods"]
 resolver = "2"
 
 [workspace.package]
