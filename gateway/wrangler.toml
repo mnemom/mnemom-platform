@@ -36,6 +36,6 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 # ED25519_SIGNING_KEY  (64-char hex Ed25519 secret key)
 # ED25519_KEY_ID       (Key identifier, e.g. "key-001")
 
-# Phase 3: ZK proving via RISC Zero (set via wrangler secret put)
-# PROVER_URL      (e.g. "https://prover.mnemom.ai")
+# Phase 3: ZK proving via SP1 on Modal GPU (set via wrangler secret put)
+# PROVER_URL      (Modal endpoint, e.g. "https://mnemom--mnemom-prover-prover-service.modal.run")
 # PROVER_API_KEY  (shared secret for prover auth)

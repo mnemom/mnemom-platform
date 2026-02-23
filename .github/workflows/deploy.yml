@@ -4,29 +4,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  changes:
-    name: Detect Changes
-    runs-on: ubuntu-latest
-    outputs:
-      prover: ${{ steps.check.outputs.prover }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 20
-
-      - name: Check for prover/zkvm changes
-        id: check
-        run: |
-          # Check last 20 commits for prover-related changes
-          CHANGED=$(git log --oneline --name-only -20 | grep -cE '^(prover/|zkvm/|\.github/workflows/deploy\.yml)' || true)
-          if [ "$CHANGED" -gt 0 ]; then
-            echo "prover=true" >> "$GITHUB_OUTPUT"
-            echo "Prover-related changes detected — will deploy prover"
-          else
-            echo "prover=false" >> "$GITHUB_OUTPUT"
-            echo "No prover-related changes in last 20 commits — skipping"
-          fi
-
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -96,52 +73,6 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: observer
-
-  deploy-prover:
-    name: Deploy Prover
-    runs-on: ubuntu-latest-m
-    needs: [test, changes]
-    if: needs.changes.outputs.prover == 'true'
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Add swap
-        run: |
-          sudo swapoff /swapfile 2>/dev/null || true
-          sudo rm -f /swapfile
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Install Flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@master
-
-      - name: Login to Fly registry
-        uses: docker/login-action@v3
-        with:
-          registry: registry.fly.io
-          username: x
-          password: ${{ secrets.FLY_API_TOKEN }}
-
-      - name: Build prover image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: prover/Dockerfile
-          push: true
-          tags: registry.fly.io/mnemom-prover:deployment-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Deploy to Fly.io
-        run: flyctl deploy --image registry.fly.io/mnemom-prover:deployment-${{ github.sha }} --config prover/fly.toml
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
   publish-cli:
     name: Publish CLI
