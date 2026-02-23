@@ -46,6 +46,7 @@ interface Env {
   OTLP_ENDPOINT?: string;
   OTLP_AUTH?: string;
   STRIPE_SECRET_KEY?: string;
+  TRIGGER_SECRET: string;
 }
 
 interface GatewayLog {
@@ -154,6 +155,12 @@ export default {
 
     // Manual trigger endpoint
     if (url.pathname === '/trigger') {
+      // Authenticate: require X-Trigger-Secret header
+      const triggerSecret = request.headers.get('X-Trigger-Secret');
+      if (!triggerSecret || triggerSecret !== env.TRIGGER_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
       console.log('[observer] Manual trigger initiated');
 
       const otelExporter = createOTelExporter(env);
@@ -176,6 +183,12 @@ export default {
 
     // Status endpoint - check gateway connectivity
     if (url.pathname === '/status') {
+      // Authenticate: require X-Trigger-Secret header
+      const triggerSecret = request.headers.get('X-Trigger-Secret');
+      if (!triggerSecret || triggerSecret !== env.TRIGGER_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
       try {
         const logs = await fetchLogs(env, 1);
         return Response.json({
@@ -1492,7 +1505,7 @@ async function detectDisagreement(
     if (!reconciliationEnabled || ddrMode === 'off') return;
 
     // INSERT disagreement review (idempotent via unique constraint)
-    const reviewId = `ddr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const reviewId = `ddr-${Date.now().toString(36)}-${randomHex(6)}`;
     const insertResponse = await fetch(
       `${env.SUPABASE_URL}/rest/v1/disagreement_reviews`,
       {
@@ -2306,13 +2319,14 @@ async function expireStaleNudges(env: Env): Promise<void> {
 // ============================================================================
 
 /**
- * Generate a random hex string of specified length
+ * Generate a random hex string of specified length.
+ * Uses crypto.getRandomValues for cryptographic safety.
  */
 function randomHex(length: number): string {
-  const chars = '0123456789abcdef';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return result;
+  const bytes = new Uint8Array(Math.ceil(length / 2));
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes)
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, length);
 }

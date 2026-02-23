@@ -707,7 +707,9 @@ describe('handleAnthropicProxy', () => {
     expect(response.status).toBe(500);
     const body = await response.json();
     expect(body.type).toBe('gateway_error');
-    expect(body.message).toBe('Network failure');
+    // Error message is sanitized — no internal details exposed to client
+    expect(body.error).toBe('An internal error occurred');
+    expect(body.message).toBeUndefined();
   });
 
   it('should preserve query parameters when forwarding', async () => {
@@ -784,7 +786,8 @@ describe('Request handler integration', () => {
     const response = await handler.fetch(request, env, ctx);
 
     expect(response.status).toBe(204);
-    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    // CORS origin is restricted to whitelist — no Origin header means default origin
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://mnemom.ai');
     expect(response.headers.get('Access-Control-Allow-Methods')).toContain('POST');
     expect(response.headers.get('Access-Control-Allow-Headers')).toContain('x-api-key');
   });

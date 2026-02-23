@@ -1090,7 +1090,10 @@ function shouldProve(
   if (!agentSettings?.proof_enabled) return false;
   if (checkpoint.verdict === 'boundary_violation') return true;
   const rate = (agentSettings.proof_rate ?? 10) / 100;
-  return Math.random() < rate;
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  const rand = new DataView(bytes.buffer).getUint32(0) / 0xFFFFFFFF;
+  return rand < rate;
 }
 
 /**
@@ -1189,12 +1192,8 @@ export async function submitMeteringEvent(
     const result = (await rpcResponse.json()) as { account_id: string | null };
     if (!result.account_id) return;
 
-    // Generate event ID
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    let eventIdSuffix = '';
-    for (let i = 0; i < 8; i++) {
-      eventIdSuffix += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
+    // Generate event ID using crypto.getRandomValues
+    const eventIdSuffix = randomHex(8);
 
     // Insert metering event
     const insertResponse = await fetch(`${env.SUPABASE_URL}/rest/v1/metering_events`, {
@@ -1624,7 +1623,10 @@ function shouldCreateNudge(
       return false;
     case 'sampling': {
       const rate = agentSettings?.nudge_rate ?? agentSettings?.proof_rate ?? 100;
-      return Math.random() * 100 < rate;
+      const bytes = new Uint8Array(4);
+      crypto.getRandomValues(bytes);
+      const rand = (new DataView(bytes.buffer).getUint32(0) / 0xFFFFFFFF) * 100;
+      return rand < rate;
     }
     case 'threshold': {
       const threshold = agentSettings?.nudge_threshold ?? 3;
@@ -3028,12 +3030,12 @@ export async function handleProviderProxy(
       });
     }
   } catch (error) {
+    // Log full error details server-side, return generic message to client
     console.error('Gateway error:', error);
     return new Response(
       JSON.stringify({
-        error: 'Internal gateway error',
+        error: 'An internal error occurred',
         type: 'gateway_error',
-        message: error instanceof Error ? error.message : 'Unknown error',
       }),
       {
         status: 500,
@@ -3168,6 +3170,27 @@ async function validateLicense(env: Env): Promise<{ valid: boolean; warning?: st
 }
 
 // ============================================================================
+// CORS Origin Whitelist
+// ============================================================================
+
+const ALLOWED_ORIGINS = [
+  'https://mnemom.ai',
+  'https://www.mnemom.ai',
+  'https://app.mnemom.ai',
+  'https://gateway.mnemom.ai',
+];
+
+/**
+ * Return the appropriate CORS origin header value.
+ * If the request origin is in the whitelist, echo it back.
+ * Otherwise, return the primary origin (restricts access).
+ */
+function getCorsOrigin(request: Request): string {
+  const origin = request.headers.get('Origin') || '';
+  return ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+}
+
+// ============================================================================
 // Main Request Handler
 // ============================================================================
 
@@ -3185,11 +3208,12 @@ export default {
       return new Response(null, {
         status: 204,
         headers: {
-          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key',
           'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent',
           'Access-Control-Max-Age': '86400',
+          'Vary': 'Origin',
         },
       });
     }

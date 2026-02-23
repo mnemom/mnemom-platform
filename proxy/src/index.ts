@@ -16,6 +16,26 @@ export interface Env {
   ALLOWED_TARGETS: string;
 }
 
+/**
+ * Constant-time string comparison using SHA-256 digest comparison.
+ * Prevents timing attacks on secret token validation.
+ */
+async function timingSafeEqual(a: string, b: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [hashA, hashB] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(a)),
+    crypto.subtle.digest('SHA-256', encoder.encode(b)),
+  ]);
+  const arrA = new Uint8Array(hashA);
+  const arrB = new Uint8Array(hashB);
+  if (arrA.length !== arrB.length) return false;
+  let result = 0;
+  for (let i = 0; i < arrA.length; i++) {
+    result |= arrA[i] ^ arrB[i];
+  }
+  return result === 0;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     // CORS preflight
@@ -37,8 +57,9 @@ export default {
     }
 
     // Auth check — uses X-Proxy-Token so Authorization passes through to target
+    // Uses constant-time comparison to prevent timing attacks
     const proxyToken = request.headers.get('X-Proxy-Token');
-    if (!env.PROXY_TOKEN || proxyToken !== env.PROXY_TOKEN) {
+    if (!env.PROXY_TOKEN || !proxyToken || !(await timingSafeEqual(proxyToken, env.PROXY_TOKEN))) {
       return Response.json({ error: 'unauthorized' }, { status: 401 });
     }
 

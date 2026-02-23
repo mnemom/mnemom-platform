@@ -2,6 +2,7 @@ interface Env {
   STATUSPAGE_API_KEY: string;
   SUPABASE_URL: string;
   SUPABASE_KEY: string;
+  MONITOR_SECRET: string;
 }
 
 const PAGE_ID = '2vbfqw4638pl';
@@ -215,6 +216,12 @@ export default {
   },
 
   async fetch(_request: Request, env: Env): Promise<Response> {
+    // Authenticate: require X-Monitor-Secret header
+    const secret = _request.headers.get('X-Monitor-Secret');
+    if (!secret || secret !== env.MONITOR_SECRET) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
     // Manual trigger via HTTP for testing
     await this.scheduled({} as ScheduledEvent, env, {} as ExecutionContext);
     return new Response(JSON.stringify({ ok: true, checked: Object.keys(COMPONENTS) }), {

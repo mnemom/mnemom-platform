@@ -13,3 +13,4 @@ GATEWAY_ID = "smoltbot"
 # OTLP_ENDPOINT      (Grafana Cloud / OTel collector)
 # OTLP_AUTH           (e.g. "Basic <base64>")
 # STRIPE_SECRET_KEY   (Stripe API secret key, for daily usage reporting)
+# TRIGGER_SECRET      (shared secret for /trigger and /status HTTP endpoints)

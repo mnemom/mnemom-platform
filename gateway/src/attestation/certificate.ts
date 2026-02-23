@@ -134,13 +134,14 @@ export interface SignedPayloadInput {
 
 /**
  * Generate a certificate ID in the format "cert-{8 random chars}".
+ * Uses crypto.getRandomValues for cryptographic safety.
  */
 export function generateCertificateId(): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let id = '';
-  for (let i = 0; i < 8; i++) {
-    id += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  const id = Array.from(bytes)
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
   return `cert-${id}`;
 }
 
