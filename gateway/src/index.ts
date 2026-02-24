@@ -2394,6 +2394,16 @@ function injectThinkingForProvider(
       if (!requestBody.thinking) {
         requestBody.thinking = { type: 'enabled', budget_tokens: 10000 };
       }
+      // Anthropic requires temperature=1 and max_tokens > budget_tokens
+      // when thinking is enabled. Since the gateway injects thinking,
+      // enforce the constraints here so clients don't need to know about it.
+      if (requestBody.thinking?.type === 'enabled') {
+        delete requestBody.temperature;
+        const budget = requestBody.thinking.budget_tokens || 10000;
+        if (typeof requestBody.max_tokens === 'number' && requestBody.max_tokens <= budget) {
+          requestBody.max_tokens = budget + 1024;
+        }
+      }
       break;
     case 'openai': {
       const model = requestBody.model || '';
