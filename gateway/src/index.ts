@@ -2595,6 +2595,7 @@ export async function handleProviderProxy(
 
     // Clone headers and add metadata + AI Gateway auth
     const forwardHeaders = new Headers(request.headers);
+    forwardHeaders.delete('x-smoltbot-agent'); // Internal routing header — don't forward to CF AI Gateway
     forwardHeaders.set('cf-aig-metadata', metadataHeader);
     forwardHeaders.set('cf-aig-authorization', `Bearer ${env.CF_AIG_TOKEN}`);
 

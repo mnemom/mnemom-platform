@@ -283,11 +283,19 @@ async function processLog(
 ): Promise<boolean> {
   // Extract metadata from log - CF AI Gateway parses cf-aig-metadata header
   // and returns it directly as the metadata object (not nested under a key)
-  const metadata = log.metadata as GatewayMetadata | undefined;
+  let metadata = log.metadata as GatewayMetadata | undefined;
+
+  // Fallback: if CF AI Gateway didn't preserve metadata (e.g. unknown headers
+  // in the forwarded request cause it to drop cf-aig-metadata), recover
+  // agent_id and session_id from the AIP checkpoint the gateway already stored.
+  if (!metadata?.agent_id && log.success) {
+    console.log(`[observer] No metadata for ${log.id}, attempting checkpoint fallback`);
+    metadata = await recoverMetadataFromCheckpoint(log, env) ?? undefined;
+  }
 
   // Validate this is a smoltbot request by checking for agent_id
   if (!metadata?.agent_id) {
-    console.log(`[observer] Skipping ${log.id}: no smoltbot metadata`);
+    console.log(`[observer] Skipping ${log.id}: no smoltbot metadata and no checkpoint fallback`);
     await deleteLog(log.id, env);
     return false;
   }
@@ -1356,6 +1364,62 @@ async function submitUsageEvent(
     }
   } catch (error) {
     console.warn('[observer] Error submitting usage event:', error);
+  }
+}
+
+// ============================================================================
+// Metadata Recovery (Checkpoint Fallback)
+// ============================================================================
+
+/**
+ * Recover agent_id and session_id from an AIP checkpoint when CF AI Gateway
+ * metadata is missing. The gateway writes checkpoints to Supabase before the
+ * observer processes logs, so a matching checkpoint should exist.
+ *
+ * Matches by timestamp proximity: finds the most recent unlinked checkpoint
+ * created within 60 seconds of the CF AI Gateway log entry.
+ */
+async function recoverMetadataFromCheckpoint(
+  log: GatewayLog,
+  env: Env
+): Promise<GatewayMetadata | null> {
+  try {
+    const logTime = new Date(log.created_at);
+    const windowStart = new Date(logTime.getTime() - 60_000).toISOString();
+    const windowEnd = new Date(logTime.getTime() + 60_000).toISOString();
+
+    const url = `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints` +
+      `?linked_trace_id=is.null` +
+      `&created_at=gte.${windowStart}` +
+      `&created_at=lte.${windowEnd}` +
+      `&select=agent_id,session_id` +
+      `&order=created_at.desc&limit=1`;
+
+    const response = await fetch(url, {
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      },
+    });
+
+    if (!response.ok) return null;
+
+    const rows = (await response.json()) as Array<{ agent_id: string; session_id: string }>;
+    if (rows.length === 0) return null;
+
+    const { agent_id, session_id } = rows[0];
+    console.log(`[observer] Recovered metadata from checkpoint: agent=${agent_id} session=${session_id}`);
+
+    return {
+      agent_id,
+      agent_hash: 'recovered',
+      session_id,
+      timestamp: log.created_at,
+      gateway_version: 'unknown',
+    };
+  } catch (error) {
+    console.warn(`[observer] Checkpoint fallback failed for ${log.id}:`, error);
+    return null;
   }
 }
 
