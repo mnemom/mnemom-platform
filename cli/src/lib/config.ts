@@ -6,7 +6,11 @@ import * as crypto from "node:crypto";
 export const CONFIG_DIR = path.join(os.homedir(), ".smoltbot");
 export const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 
-export interface Config {
+// ---------------------------------------------------------------------------
+// V1 config (legacy single-agent format)
+// ---------------------------------------------------------------------------
+
+export interface ConfigV1 {
   agentId: string;
   email?: string;
   gateway?: string;
@@ -17,30 +21,129 @@ export interface Config {
   configuredAt?: string;
 }
 
+// ---------------------------------------------------------------------------
+// V2 config (multi-agent format)
+// ---------------------------------------------------------------------------
+
+export interface AgentConfig {
+  agentId: string;
+  openclawConfigured?: boolean;
+  providers?: string[];
+  configuredAt?: string;
+}
+
+export interface ConfigV2 {
+  version: 2;
+  defaultAgent: string;
+  gateway: string;
+  mnemomApiKey?: string;
+  licenseJwt?: string;
+  agents: Record<string, AgentConfig>;
+}
+
+/** Backward-compatible alias so existing imports keep working. */
+export type Config = ConfigV2;
+
+// ---------------------------------------------------------------------------
+// Migration
+// ---------------------------------------------------------------------------
+
+/**
+ * Migrate a v1 config into v2 format.
+ * All agent-specific fields move into `agents.default`.
+ */
+export function migrateConfig(raw: ConfigV1): ConfigV2 {
+  return {
+    version: 2,
+    defaultAgent: "default",
+    gateway: raw.gateway ?? "https://gateway.mnemom.ai",
+    mnemomApiKey: raw.mnemomApiKey,
+    licenseJwt: raw.licenseJwt,
+    agents: {
+      default: {
+        agentId: raw.agentId,
+        openclawConfigured: raw.openclawConfigured,
+        providers: raw.providers,
+        configuredAt: raw.configuredAt,
+      },
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
 export function configExists(): boolean {
   return fs.existsSync(CONFIG_FILE);
 }
 
-export function loadConfig(): Config | null {
+/**
+ * Load the config file.
+ * If the file is v1 (no `version` field), it is automatically migrated to v2
+ * and written back to disk before returning.
+ */
+export function loadConfig(): ConfigV2 | null {
   if (!configExists()) {
     return null;
   }
 
   try {
     const content = fs.readFileSync(CONFIG_FILE, "utf-8");
-    return JSON.parse(content) as Config;
+    const raw = JSON.parse(content);
+
+    // Detect v1: no `version` field present
+    if (!raw.version) {
+      const migrated = migrateConfig(raw as ConfigV1);
+      saveConfig(migrated);
+      return migrated;
+    }
+
+    return raw as ConfigV2;
   } catch {
     return null;
   }
 }
 
-export function saveConfig(config: Config): void {
+export function saveConfig(config: ConfigV2): void {
   if (!fs.existsSync(CONFIG_DIR)) {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
   }
 
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
+
+// ---------------------------------------------------------------------------
+// Agent resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the active agent config.
+ *
+ * Resolution order:
+ *  1. Explicit `agentName` parameter
+ *  2. `SMOLTBOT_AGENT` environment variable
+ *  3. `config.defaultAgent`
+ *
+ * Returns `null` if the config doesn't exist or the agent is not found.
+ */
+export function getActiveAgent(agentName?: string): AgentConfig | null {
+  const config = loadConfig();
+  if (!config) {
+    return null;
+  }
+
+  const name =
+    agentName ??
+    process.env.SMOLTBOT_AGENT ??
+    config.defaultAgent;
+
+  return config.agents[name] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// ID generation
+// ---------------------------------------------------------------------------
 
 export function generateAgentId(): string {
   const randomHex = crypto.randomBytes(4).toString("hex");
@@ -55,4 +158,16 @@ export function deriveAgentId(apiKey: string): string {
   const hash = crypto.createHash("sha256").update(apiKey).digest("hex");
   const agentHash = hash.substring(0, 16);
   return `smolt-${agentHash.slice(0, 8)}`;
+}
+
+/**
+ * Derive agent ID deterministically from an API key *and* a name.
+ * Allows multiple named agents to share one API key with distinct IDs.
+ */
+export function deriveAgentIdWithName(apiKey: string, name: string): string {
+  const hash = crypto
+    .createHash("sha256")
+    .update(`${apiKey}|${name}`)
+    .digest("hex");
+  return `smolt-${hash.slice(0, 8)}`;
 }

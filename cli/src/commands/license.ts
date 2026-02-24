@@ -67,7 +67,11 @@ export async function licenseActivateCommand(jwt: string): Promise<void> {
   }
 
   // Store in config
-  const config = loadConfig() || { agentId: "unknown" };
+  const config = loadConfig();
+  if (!config) {
+    console.log("No configuration found. Run 'smoltbot init' first.");
+    process.exit(1);
+  }
   config.licenseJwt = jwt;
   saveConfig(config);
 

@@ -1,8 +1,8 @@
-import { configExists, loadConfig } from "../lib/config.js";
+import { configExists, loadConfig, getActiveAgent } from "../lib/config.js";
 import { getIntegrity } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
-export async function integrityCommand(): Promise<void> {
+export async function integrityCommand(agentName?: string): Promise<void> {
   if (!configExists()) {
     console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
     console.log("Run `smoltbot init` to get started.\n");
@@ -15,10 +15,16 @@ export async function integrityCommand(): Promise<void> {
     process.exit(1);
   }
 
+  const agent = getActiveAgent(agentName);
+  if (!agent) {
+    console.log("\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
+    process.exit(1);
+  }
+
   console.log("\nFetching integrity score...\n");
 
   try {
-    const integrity = await getIntegrity(config.agentId);
+    const integrity = await getIntegrity(agent.agentId);
 
     const scorePercent = (integrity.score * 100).toFixed(1);
     const scoreBar = generateScoreBar(integrity.score);

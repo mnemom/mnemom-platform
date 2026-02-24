@@ -117,6 +117,7 @@ export interface Env {
 interface Agent {
   id: string;
   agent_hash: string;
+  name: string | null;
   created_at: string;
   last_seen: string | null;
   claimed_at: string | null;
@@ -462,7 +463,8 @@ async function sha256(content: string): Promise<string> {
  */
 export async function getOrCreateAgent(
   agentHash: string,
-  env: Env
+  env: Env,
+  agentName?: string
 ): Promise<{ agent: Agent; isNew: boolean }> {
   const headers = {
     'apikey': env.SUPABASE_KEY,
@@ -484,7 +486,22 @@ export async function getOrCreateAgent(
   const agents: Agent[] = await lookupResponse.json();
 
   if (agents.length > 0) {
-    return { agent: agents[0], isNew: false };
+    const existing = agents[0];
+
+    // Update name if provided and different (or not yet set)
+    if (agentName && existing.name !== agentName) {
+      fetch(
+        `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${existing.id}`,
+        {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ name: agentName }),
+        }
+      ).catch(() => {}); // Best-effort, don't block the request
+      existing.name = agentName;
+    }
+
+    return { agent: existing, isNew: false };
   }
 
   // Create new agent - generate id from hash prefix per spec
@@ -498,6 +515,7 @@ export async function getOrCreateAgent(
       body: JSON.stringify({
         id: agentId,
         agent_hash: agentHash,
+        ...(agentName ? { name: agentName } : {}),
         last_seen: new Date().toISOString(),
       }),
     }
@@ -621,7 +639,8 @@ export function buildMetadataHeader(
   agentId: string,
   agentHash: string,
   sessionId: string,
-  gatewayVersion: string
+  gatewayVersion: string,
+  agentName?: string
 ): string {
   const metadata = {
     agent_id: agentId,
@@ -629,6 +648,7 @@ export function buildMetadataHeader(
     session_id: sessionId,
     timestamp: new Date().toISOString(),
     gateway_version: gatewayVersion,
+    ...(agentName ? { agent_name: agentName } : {}),
   };
   return JSON.stringify(metadata);
 }
@@ -1087,13 +1107,18 @@ function shouldProve(
   checkpoint: { verdict: string },
   agentSettings: AgentSettings | null,
 ): boolean {
-  if (!agentSettings?.proof_enabled) return false;
+  if (!agentSettings?.proof_enabled) {
+    console.log(`[gateway/proof] shouldProve=false: proof_enabled=${agentSettings?.proof_enabled}`);
+    return false;
+  }
   if (checkpoint.verdict === 'boundary_violation') return true;
   const rate = (agentSettings.proof_rate ?? 10) / 100;
   const bytes = new Uint8Array(4);
   crypto.getRandomValues(bytes);
   const rand = new DataView(bytes.buffer).getUint32(0) / 0xFFFFFFFF;
-  return rand < rate;
+  const result = rand < rate;
+  console.log(`[gateway/proof] shouldProve=${result}: verdict=${checkpoint.verdict} rate=${rate} rand=${rand.toFixed(4)}`);
+  return result;
 }
 
 /**
@@ -1113,9 +1138,13 @@ async function requestProof(
   attestation: { input_commitment?: string } | undefined,
   env: Env,
 ): Promise<void> {
-  if (!env.PROVER_URL) return;
+  if (!env.PROVER_URL) {
+    console.warn('[gateway/proof] requestProof: PROVER_URL not set, skipping');
+    return;
+  }
 
   const proofId = `prf-${crypto.randomUUID().slice(0, 8)}`;
+  console.log(`[gateway/proof] requestProof: ${proofId} for checkpoint ${checkpointId}`);
 
   // Insert pending proof row
   try {
@@ -1130,7 +1159,7 @@ async function requestProof(
       body: JSON.stringify({
         proof_id: proofId,
         checkpoint_id: checkpointId,
-        proof_type: 'risc-zero-stark',
+        proof_type: 'sp1-stark',
         status: 'pending',
         analysis_json: checkpointData.analysis_response_text || '',
         thinking_hash: checkpointData.thinking_block_hash,
@@ -1139,8 +1168,14 @@ async function requestProof(
         model: checkpointData.model,
       }),
     });
-    if (!res.ok) return;
-  } catch {
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(`[gateway/proof] DB INSERT failed: ${res.status} ${body}`);
+      return;
+    }
+    console.log(`[gateway/proof] DB INSERT ok: ${proofId}`);
+  } catch (err) {
+    console.error(`[gateway/proof] DB INSERT error:`, err);
     return;
   }
 
@@ -1160,7 +1195,8 @@ async function requestProof(
       values_hash: checkpointData.values_hash || '',
       model: checkpointData.model,
     }),
-  }).catch(() => { /* fail-open */ });
+  }).then(r => console.log(`[gateway/proof] Prover POST: ${r.status}`))
+    .catch(err => console.warn(`[gateway/proof] Prover POST failed:`, err));
 }
 
 /**
@@ -1907,7 +1943,7 @@ async function analyzeStreamInBackground(
 
     // 13b. Request ZK proof if enabled
     if (shouldProve(checkpoint, agentSettings)) {
-      requestProof(
+      await requestProof(
         checkpoint.checkpoint_id,
         {
           analysis_response_text: analysisResponseText,
@@ -2400,7 +2436,8 @@ export async function handleProviderProxy(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
-  provider: GatewayProvider
+  provider: GatewayProvider,
+  agentName?: string
 ): Promise<Response> {
   // Extract API key from header (provider-specific)
   const apiKey = extractApiKey(request, provider);
@@ -2424,10 +2461,12 @@ export async function handleProviderProxy(
 
   try {
     // Hash the API key for agent identification
-    const agentHash = await hashApiKey(apiKey);
+    const agentHash = agentName
+      ? await hashApiKey(apiKey + '|' + agentName)
+      : await hashApiKey(apiKey);
 
     // Get or create the agent
-    const { agent } = await getOrCreateAgent(agentHash, env);
+    const { agent } = await getOrCreateAgent(agentHash, env, agentName);
 
     // Generate session ID
     const sessionId = generateSessionId(agentHash);
@@ -2437,7 +2476,8 @@ export async function handleProviderProxy(
       agent.id,
       agentHash,
       sessionId,
-      env.GATEWAY_VERSION
+      env.GATEWAY_VERSION,
+      agentName
     );
 
     // ====================================================================
@@ -3210,7 +3250,7 @@ export default {
         headers: {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key',
+          'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
           'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
@@ -3239,19 +3279,26 @@ export default {
       return handleModelsEndpoint(env);
     }
 
+    // Named agent identification via x-smoltbot-agent header.
+    // URL paths stay the same (/anthropic/*, /openai/*, /gemini/*).
+    // NOTE: URL-prefix approaches (/a/{name}/ and /agent/{name}/) don't work
+    // because Cloudflare AI Gateway intercepts paths matching /{provider}/v1/...
+    // at any depth on this domain.
+    const agentName = request.headers.get('x-smoltbot-agent') || undefined;
+
     // Anthropic API proxy
     if (path.startsWith('/anthropic/') || path === '/anthropic') {
-      return handleProviderProxy(request, env, ctx, 'anthropic');
+      return handleProviderProxy(request, env, ctx, 'anthropic', agentName);
     }
 
     // OpenAI API proxy
     if (path.startsWith('/openai/') || path === '/openai') {
-      return handleProviderProxy(request, env, ctx, 'openai');
+      return handleProviderProxy(request, env, ctx, 'openai', agentName);
     }
 
     // Gemini API proxy
     if (path.startsWith('/gemini/') || path === '/gemini') {
-      return handleProviderProxy(request, env, ctx, 'gemini');
+      return handleProviderProxy(request, env, ctx, 'gemini', agentName);
     }
 
     // 404 for all other paths
@@ -3259,7 +3306,7 @@ export default {
       JSON.stringify({
         error: 'Not found',
         type: 'not_found',
-        message: 'This gateway handles /health, /anthropic/*, /openai/*, and /gemini/* endpoints',
+        message: 'This gateway handles /health, /anthropic/*, /openai/*, /gemini/* endpoints. Use x-smoltbot-agent header for named agents.',
       }),
       {
         status: 404,

@@ -86,6 +86,7 @@ export interface SmoltbotProvider {
   baseUrl: string;
   apiKey: string;
   api: string;
+  defaultHeaders?: Record<string, string>;
   models: ModelDefinition[];
 }
 
@@ -554,6 +555,90 @@ export function configureSmoltbotProviders(
       baseUrl: route.baseUrl,
       apiKey: data.apiKey,
       api: route.apiType,
+      models: data.models,
+    };
+
+    configured.push(provider);
+  }
+
+  saveOpenClawConfig(config);
+  return configured;
+}
+
+// ============================================================================
+// Named Agent Provider Functions
+// ============================================================================
+
+/**
+ * Get provider routes for a named agent.
+ * Named agents use the same base URLs as default, but add x-smoltbot-agent header.
+ */
+export function getProviderRoutes(
+  agentName?: string
+): Record<Provider, { baseUrl: string; apiType: string }> {
+  // Same URLs for all agents — agent identity is in the x-smoltbot-agent header
+  return PROVIDER_ROUTES;
+}
+
+/**
+ * Get provider config keys for a named agent.
+ * Default agent uses existing keys (smoltbot, smoltbot-openai, smoltbot-gemini).
+ * Named agents use: smoltbot-{name}, smoltbot-{name}-openai, smoltbot-{name}-gemini.
+ */
+export function getProviderConfigKeys(
+  agentName?: string
+): Record<Provider, string> {
+  if (!agentName) {
+    return PROVIDER_CONFIG_KEYS;
+  }
+
+  return {
+    anthropic: `smoltbot-${agentName}`,
+    openai: `smoltbot-${agentName}-openai`,
+    gemini: `smoltbot-${agentName}-gemini`,
+  };
+}
+
+/**
+ * Configure OpenClaw providers for a named agent.
+ * Each named agent gets its own provider entries with URL-prefixed base URLs.
+ */
+export function configureNamedAgentProviders(
+  agentName: string,
+  providerKeys: Partial<Record<Provider, { apiKey: string; models: ModelDefinition[] }>>
+): Provider[] {
+  const config = loadOpenClawConfig();
+  if (!config) {
+    throw new Error("Could not load OpenClaw config");
+  }
+
+  if (!config.models) {
+    config.models = {};
+  }
+  if (!config.models.providers) {
+    config.models.providers = {};
+  }
+  if (!config.models.mode) {
+    config.models.mode = "merge";
+  }
+
+  const routes = getProviderRoutes(agentName);
+  const keys = getProviderConfigKeys(agentName);
+  const configured: Provider[] = [];
+
+  for (const [provider, data] of Object.entries(providerKeys) as [
+    Provider,
+    { apiKey: string; models: ModelDefinition[] },
+  ][]) {
+    if (!data) continue;
+    const route = routes[provider];
+    const configKey = keys[provider];
+
+    config.models.providers[configKey] = {
+      baseUrl: route.baseUrl,
+      apiKey: data.apiKey,
+      api: route.apiType,
+      defaultHeaders: { "x-smoltbot-agent": agentName },
       models: data.models,
     };
 

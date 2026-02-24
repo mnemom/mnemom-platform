@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { configExists, loadConfig } from "../lib/config.js";
+import { configExists, loadConfig, getActiveAgent } from "../lib/config.js";
 import {
   getCard,
   updateCard,
@@ -300,7 +300,7 @@ function displayCard(cardResponse: CardResponse): void {
 // Subcommands
 // ============================================================================
 
-export async function cardShowCommand(): Promise<void> {
+export async function cardShowCommand(agentName?: string): Promise<void> {
   if (!configExists()) {
     console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
     console.log("Run `smoltbot init` to get started.\n");
@@ -313,10 +313,16 @@ export async function cardShowCommand(): Promise<void> {
     process.exit(1);
   }
 
+  const agent = getActiveAgent(agentName);
+  if (!agent) {
+    console.log("\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
+    process.exit(1);
+  }
+
   console.log("\nFetching alignment card...\n");
 
   try {
-    const cardResponse = await getCard(config.agentId);
+    const cardResponse = await getCard(agent.agentId);
 
     if (!cardResponse) {
       console.log(fmt.warn("No custom card -- using default"));
@@ -333,7 +339,7 @@ export async function cardShowCommand(): Promise<void> {
   }
 }
 
-export async function cardPublishCommand(file: string): Promise<void> {
+export async function cardPublishCommand(file: string, agentName?: string): Promise<void> {
   if (!configExists()) {
     console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
     console.log("Run `smoltbot init` to get started.\n");
@@ -343,6 +349,12 @@ export async function cardPublishCommand(file: string): Promise<void> {
   const config = loadConfig();
   if (!config) {
     console.log("\n" + fmt.error("Failed to load configuration") + "\n");
+    process.exit(1);
+  }
+
+  const agent = getActiveAgent(agentName);
+  if (!agent) {
+    console.log("\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
     process.exit(1);
   }
 
@@ -386,7 +398,7 @@ export async function cardPublishCommand(file: string): Promise<void> {
   // Confirm with user
   if (isInteractive()) {
     const confirm = await askYesNo(
-      `Publish this card for agent ${config.agentId}?`,
+      `Publish this card for agent ${agent.agentId}?`,
       false
     );
     if (!confirm) {
@@ -400,14 +412,14 @@ export async function cardPublishCommand(file: string): Promise<void> {
 
   try {
     console.log("\nPublishing card...");
-    const result = await updateCard(config.agentId, parsed);
+    const result = await updateCard(agent.agentId, parsed);
     console.log(fmt.success(`Card published successfully!`));
     console.log(fmt.label("  Card ID:", ` ${result.card_id}`) + "\n");
 
     // Trigger re-verification
     try {
       console.log("Triggering re-verification...");
-      const reverifyResult = await reverifyAgent(config.agentId);
+      const reverifyResult = await reverifyAgent(agent.agentId);
       console.log(fmt.success(`Re-verification started (${reverifyResult.reverified} traces queued)`) + "\n");
     } catch {
       console.log(fmt.warn("Could not trigger re-verification (non-critical)") + "\n");

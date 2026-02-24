@@ -99,9 +99,14 @@ describe("config", () => {
 
     it("should return config when file exists and is valid JSON", () => {
       const mockConfig = {
-        agentId: "smolt-abc12345",
-        email: "test@example.com",
+        version: 2,
+        defaultAgent: "default",
         gateway: "https://gateway.mnemon.ai",
+        agents: {
+          default: {
+            agentId: "smolt-abc12345",
+          },
+        },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
@@ -113,9 +118,16 @@ describe("config", () => {
       expect(fs.readFileSync).toHaveBeenCalledWith(CONFIG_FILE, "utf-8");
     });
 
-    it("should return config with only required agentId field", () => {
+    it("should return config with only required fields", () => {
       const mockConfig = {
-        agentId: "smolt-minimal",
+        version: 2,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
+        agents: {
+          default: {
+            agentId: "smolt-minimal",
+          },
+        },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
@@ -124,8 +136,8 @@ describe("config", () => {
       const result = loadConfig();
 
       expect(result).toEqual(mockConfig);
-      expect(result?.email).toBeUndefined();
-      expect(result?.gateway).toBeUndefined();
+      expect(result?.mnemomApiKey).toBeUndefined();
+      expect(result?.licenseJwt).toBeUndefined();
     });
 
     it("should return null when file contains invalid JSON", () => {
@@ -164,7 +176,12 @@ describe("config", () => {
       vi.mocked(fs.mkdirSync).mockReturnValue(undefined);
       vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
 
-      const config = { agentId: "smolt-test1234" };
+      const config = {
+        version: 2 as const,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
+        agents: { default: { agentId: "smolt-test1234" } },
+      };
 
       saveConfig(config);
 
@@ -177,7 +194,12 @@ describe("config", () => {
       vi.mocked(fs.existsSync).mockReturnValue(true);
       vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
 
-      const config = { agentId: "smolt-test1234" };
+      const config = {
+        version: 2 as const,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
+        agents: { default: { agentId: "smolt-test1234" } },
+      };
 
       saveConfig(config);
 
@@ -189,9 +211,12 @@ describe("config", () => {
       vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
 
       const config = {
-        agentId: "smolt-test1234",
-        email: "test@example.com",
+        version: 2 as const,
+        defaultAgent: "default",
         gateway: "https://gateway.mnemon.ai",
+        agents: {
+          default: { agentId: "smolt-test1234" },
+        },
       };
 
       saveConfig(config);
@@ -206,7 +231,12 @@ describe("config", () => {
       vi.mocked(fs.existsSync).mockReturnValue(true);
       vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
 
-      const config = { agentId: "smolt-test1234" };
+      const config = {
+        version: 2 as const,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
+        agents: { default: { agentId: "smolt-test1234" } },
+      };
 
       saveConfig(config);
 
@@ -221,8 +251,13 @@ describe("config", () => {
       vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
 
       const config = {
-        agentId: "smolt-test1234",
-        email: "user@example.com",
+        version: 2 as const,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
+        mnemomApiKey: "mnm_test_key",
+        agents: {
+          default: { agentId: "smolt-test1234" },
+        },
       };
 
       saveConfig(config);
@@ -230,9 +265,9 @@ describe("config", () => {
       const writtenContent = vi.mocked(fs.writeFileSync).mock.calls[0][1];
       const parsedConfig = JSON.parse(writtenContent as string);
 
-      expect(parsedConfig.agentId).toBe("smolt-test1234");
-      expect(parsedConfig.email).toBe("user@example.com");
-      expect(parsedConfig.gateway).toBeUndefined();
+      expect(parsedConfig.agents.default.agentId).toBe("smolt-test1234");
+      expect(parsedConfig.mnemomApiKey).toBe("mnm_test_key");
+      expect(parsedConfig.licenseJwt).toBeUndefined();
     });
   });
 });

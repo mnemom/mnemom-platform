@@ -64,31 +64,6 @@ export async function getTraces(
   return fetchApi<Trace[]>(`/v1/traces?agent_id=${id}&limit=${limit}`);
 }
 
-export interface ClaimResult {
-  claimed: boolean;
-  agent_id: string;
-  claimed_at: string;
-}
-
-export async function claimAgent(id: string, hashProof: string): Promise<ClaimResult> {
-  const url = `${API_BASE}/v1/agents/${id}/claim`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ hash_proof: hashProof }),
-  });
-
-  if (!response.ok) {
-    const error = (await response.json().catch(() => ({
-      error: "unknown",
-      message: response.statusText,
-    }))) as ApiError;
-    throw new Error(error.message || `Claim failed: ${response.status}`);
-  }
-
-  return response.json() as Promise<ClaimResult>;
-}
-
 // ============================================================================
 // Alignment Card API
 // ============================================================================

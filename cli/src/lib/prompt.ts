@@ -52,34 +52,38 @@ export async function askInput(
   });
 
   if (mask && process.stdin.isTTY) {
-    // Mask input by suppressing echo
+    // Close readline so it doesn't echo characters
+    rl.close();
+
+    // Mask input by suppressing echo via raw mode
     process.stdout.write(`${question} `);
     return new Promise((resolve) => {
       let input = "";
       process.stdin.setRawMode(true);
       process.stdin.resume();
       process.stdin.setEncoding("utf8");
-      const onData = (char: string) => {
-        if (char === "\n" || char === "\r" || char === "\u0004") {
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stdin.removeListener("data", onData);
-          process.stdout.write("\n");
-          rl.close();
-          resolve(input);
-        } else if (char === "\u007F" || char === "\b") {
-          // Backspace
-          if (input.length > 0) {
-            input = input.slice(0, -1);
-            process.stdout.write("\b \b");
+      const onData = (chunk: string) => {
+        for (const char of chunk) {
+          if (char === "\n" || char === "\r" || char === "\u0004") {
+            process.stdin.setRawMode(false);
+            process.stdin.pause();
+            process.stdin.removeListener("data", onData);
+            process.stdout.write("\n");
+            resolve(input);
+            return;
+          } else if (char === "\u007F" || char === "\b") {
+            // Backspace
+            if (input.length > 0) {
+              input = input.slice(0, -1);
+              process.stdout.write("\b \b");
+            }
+          } else if (char === "\u0003") {
+            // Ctrl+C
+            process.exit(1);
+          } else {
+            input += char;
+            process.stdout.write("*");
           }
-        } else if (char === "\u0003") {
-          // Ctrl+C
-          rl.close();
-          process.exit(1);
-        } else {
-          input += char;
-          process.stdout.write("*");
         }
       };
       process.stdin.on("data", onData);

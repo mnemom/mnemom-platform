@@ -217,19 +217,29 @@ async function standaloneFlow(
 
   // Step 4: Create config
   const firstApiKey = verifiedProviders[0].apiKey;
+  const existingDefaultAgent = existingConfig?.agents?.[existingConfig.defaultAgent];
   const agentId = firstApiKey
     ? deriveAgentId(firstApiKey)
-    : existingConfig?.agentId || generateAgentId();
+    : existingDefaultAgent?.agentId || generateAgentId();
 
   const providerNames = verifiedProviders.map((p) => p.provider);
 
+  const existingV2 = loadConfig();
   const config: Config = {
-    agentId,
+    version: 2,
+    defaultAgent: "default",
     gateway: GATEWAY_URL,
-    openclawConfigured: false,
-    providers: providerNames,
     ...(mnemomApiKey ? { mnemomApiKey } : {}),
-    configuredAt: new Date().toISOString(),
+    ...(existingV2?.licenseJwt ? { licenseJwt: existingV2.licenseJwt } : {}),
+    agents: {
+      ...(existingV2?.agents ?? {}),
+      default: {
+        agentId,
+        openclawConfigured: false,
+        providers: providerNames,
+        configuredAt: new Date().toISOString(),
+      },
+    },
   };
 
   saveConfig(config);
@@ -328,17 +338,18 @@ function showStandaloneSuccess(
   console.log(`Your traces will appear at:\n`);
   console.log(`  ${DASHBOARD_URL}/agents/${agentId}\n`);
 
-  console.log(fmt.section("Claim your agent"));
-  console.log("\n  smoltbot claim\n");
-  console.log("  This links your agent to your Mnemom account so");
-  console.log("  you can manage traces and keep your data private.\n");
-  console.log(`  Or visit: ${DASHBOARD_URL}/claim/${agentId}\n`);
+  console.log(fmt.section("Link to your Mnemom account"));
+  console.log();
+  console.log("  Sign in (or create a free account) to see your agent's");
+  console.log("  traces and manage its alignment card.\n");
+  console.log(`  ${DASHBOARD_URL}/claim/${agentId}\n`);
 
   console.log(fmt.section("Useful commands"));
-  console.log("\n  smoltbot status     - Check configuration and connectivity");
-  console.log("  smoltbot claim      - Claim agent and link to your account");
-  console.log("  smoltbot logs       - View recent traces");
-  console.log("  smoltbot integrity  - View integrity score\n");
+  console.log("\n  smoltbot status        - Check configuration and connectivity");
+  console.log("  smoltbot logs          - View recent traces");
+  console.log("  smoltbot integrity     - View integrity score");
+  console.log("  smoltbot register <n>  - Register additional named agents");
+  console.log("  smoltbot agents        - List all registered agents\n");
 }
 
 // ============================================================================
@@ -598,25 +609,30 @@ async function handleExistingConfig(
     return null;
   }
 
-  console.log(fmt.warn("smoltbot is already initialized") + "\n");
-  console.log(`  Agent ID: ${existingConfig.agentId}`);
-  console.log(`  Gateway:  ${existingConfig.gateway || GATEWAY_URL}\n`);
+  console.log("smoltbot is already initialized.\n");
+  console.log(fmt.label("  Gateway:", ` ${existingConfig.gateway || GATEWAY_URL}`));
+  console.log();
+
+  // Show registered agents
+  const agentNames = Object.keys(existingConfig.agents);
+  console.log("  Registered agents:");
+  for (const name of agentNames) {
+    const agent = existingConfig.agents[name];
+    const isDefault = name === existingConfig.defaultAgent;
+    const marker = isDefault ? " (default)" : "";
+    console.log(`    ${name}${marker} — ${agent.agentId}`);
+  }
+  console.log();
+
+  console.log("  To add another agent:");
+  console.log("    smoltbot register <name>\n");
 
   if (options.force) {
     console.log("Reconfiguring (--force)...\n");
     return existingConfig;
   }
 
-  if (isInteractive() && !options.yes) {
-    const reconfigure = await askYesNo("Reconfigure smoltbot?", true);
-    if (!reconfigure) {
-      console.log("\nNo changes made.\n");
-      return "abort";
-    }
-    console.log();
-  }
-
-  return existingConfig;
+  return "abort";
 }
 
 /**
@@ -726,16 +742,26 @@ async function createSmoltbotConfig(
   apiKey?: string,
   mnemomApiKey?: string,
 ): Promise<string> {
+  const defaultAgent = existingConfig?.agents?.[existingConfig.defaultAgent];
   const agentId = apiKey
     ? deriveAgentId(apiKey)
-    : existingConfig?.agentId || generateAgentId();
+    : defaultAgent?.agentId || generateAgentId();
 
+  const existingV2 = loadConfig();
   const config: Config = {
-    agentId,
+    version: 2,
+    defaultAgent: "default",
     gateway: GATEWAY_URL,
-    openclawConfigured: true,
     ...(mnemomApiKey ? { mnemomApiKey } : {}),
-    configuredAt: new Date().toISOString(),
+    ...(existingV2?.licenseJwt ? { licenseJwt: existingV2.licenseJwt } : {}),
+    agents: {
+      ...(existingV2?.agents ?? {}),
+      default: {
+        agentId,
+        openclawConfigured: true,
+        configuredAt: new Date().toISOString(),
+      },
+    },
   };
 
   saveConfig(config);
@@ -784,17 +810,18 @@ function showOpenClawSuccessMessage(
 
   console.log(`  ${DASHBOARD_URL}/agents/${agentId}\n`);
 
-  console.log(fmt.section("Claim your agent"));
-  console.log("\n  smoltbot claim\n");
-  console.log("  This links your agent to your Mnemom account so");
-  console.log("  you can manage traces and keep your data private.\n");
-  console.log(`  Or visit: ${DASHBOARD_URL}/claim/${agentId}\n`);
+  console.log(fmt.section("Link to your Mnemom account"));
+  console.log();
+  console.log("  Sign in (or create a free account) to see your agent's");
+  console.log("  traces and manage its alignment card.\n");
+  console.log(`  ${DASHBOARD_URL}/claim/${agentId}\n`);
 
   console.log(fmt.section("Useful commands"));
-  console.log("\n  smoltbot status     - Check configuration and connectivity");
-  console.log("  smoltbot claim      - Claim agent and link to your account");
-  console.log("  smoltbot logs       - View recent traces");
-  console.log("  smoltbot integrity  - View integrity score\n");
+  console.log("\n  smoltbot status        - Check configuration and connectivity");
+  console.log("  smoltbot logs          - View recent traces");
+  console.log("  smoltbot integrity     - View integrity score");
+  console.log("  smoltbot register <n>  - Register additional named agents");
+  console.log("  smoltbot agents        - List all registered agents\n");
 
   console.log(fmt.section("Switch between traced and untraced mode"));
   console.log();

@@ -59,9 +59,13 @@ describe("billing", () => {
   describe("Config mnemomApiKey persistence", () => {
     it("should save config with mnemomApiKey and load it back", () => {
       const config = {
-        agentId: "smolt-abc12345",
+        version: 2 as const,
+        defaultAgent: "default",
         gateway: "https://gateway.mnemom.ai",
         mnemomApiKey: "mnm_test_key_12345",
+        agents: {
+          default: { agentId: "smolt-abc12345" },
+        },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
@@ -77,9 +81,13 @@ describe("billing", () => {
 
     it("should load config that contains mnemomApiKey", () => {
       const mockConfig = {
-        agentId: "smolt-abc12345",
+        version: 2,
+        defaultAgent: "default",
         gateway: "https://gateway.mnemom.ai",
         mnemomApiKey: "mnm_saved_key_67890",
+        agents: {
+          default: { agentId: "smolt-abc12345" },
+        },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
@@ -93,8 +101,12 @@ describe("billing", () => {
 
     it("should load config without mnemomApiKey (free tier)", () => {
       const mockConfig = {
-        agentId: "smolt-abc12345",
+        version: 2,
+        defaultAgent: "default",
         gateway: "https://gateway.mnemom.ai",
+        agents: {
+          default: { agentId: "smolt-abc12345" },
+        },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
@@ -108,13 +120,18 @@ describe("billing", () => {
 
     it("should preserve mnemomApiKey alongside other optional fields", () => {
       const config = {
-        agentId: "smolt-abc12345",
-        email: "user@example.com",
+        version: 2 as const,
+        defaultAgent: "default",
         gateway: "https://gateway.mnemom.ai",
-        openclawConfigured: true,
-        providers: ["anthropic", "openai"],
         mnemomApiKey: "mnm_full_config_key",
-        configuredAt: "2026-01-15T00:00:00.000Z",
+        agents: {
+          default: {
+            agentId: "smolt-abc12345",
+            openclawConfigured: true,
+            providers: ["anthropic", "openai"],
+            configuredAt: "2026-01-15T00:00:00.000Z",
+          },
+        },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
@@ -125,17 +142,21 @@ describe("billing", () => {
       const writtenContent = vi.mocked(fs.writeFileSync).mock.calls[0][1];
       const parsedConfig = JSON.parse(writtenContent as string);
 
-      expect(parsedConfig.agentId).toBe("smolt-abc12345");
-      expect(parsedConfig.email).toBe("user@example.com");
+      expect(parsedConfig.agents.default.agentId).toBe("smolt-abc12345");
       expect(parsedConfig.mnemomApiKey).toBe("mnm_full_config_key");
-      expect(parsedConfig.providers).toEqual(["anthropic", "openai"]);
-      expect(parsedConfig.configuredAt).toBe("2026-01-15T00:00:00.000Z");
+      expect(parsedConfig.agents.default.providers).toEqual(["anthropic", "openai"]);
+      expect(parsedConfig.agents.default.configuredAt).toBe("2026-01-15T00:00:00.000Z");
     });
 
     it("should write mnemomApiKey as formatted JSON to correct path", () => {
       const config = {
-        agentId: "smolt-test1234",
+        version: 2 as const,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
         mnemomApiKey: "mnm_path_check",
+        agents: {
+          default: { agentId: "smolt-test1234" },
+        },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
@@ -624,11 +645,17 @@ describe("billing", () => {
     it("should correctly distinguish billing states in config round-trip", () => {
       // Save config with key, load, check display
       const configWithKey = {
-        agentId: "smolt-billing01",
+        version: 2 as const,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
         mnemomApiKey: "mnm_roundtrip_key",
+        agents: { default: { agentId: "smolt-billing01" } },
       };
       const configWithoutKey = {
-        agentId: "smolt-freetier1",
+        version: 2 as const,
+        defaultAgent: "default",
+        gateway: "https://gateway.mnemom.ai",
+        agents: { default: { agentId: "smolt-freetier1" } },
       };
 
       vi.mocked(fs.existsSync).mockReturnValue(true);

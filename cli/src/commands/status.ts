@@ -1,4 +1,4 @@
-import { configExists, loadConfig } from "../lib/config.js";
+import { configExists, loadConfig, getActiveAgent, type AgentConfig } from "../lib/config.js";
 import { getAgent, getIntegrity, getTraces, API_BASE } from "../lib/api.js";
 import {
   detectOpenClaw,
@@ -35,7 +35,7 @@ const AIP_SUPPORT: Record<Provider, string> = {
   gemini: "Full (thought parts)",
 };
 
-export async function statusCommand(): Promise<void> {
+export async function statusCommand(agentName?: string): Promise<void> {
   console.log(fmt.header("smoltbot status"));
   console.log();
 
@@ -52,6 +52,12 @@ export async function statusCommand(): Promise<void> {
   }
 
   const config = loadConfig()!;
+  const agent = getActiveAgent(agentName);
+  if (!agent) {
+    console.log(fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
+    console.log("Run `smoltbot register <name>` to register a new agent.\n");
+    process.exit(1);
+  }
 
   // 2. Check OpenClaw configuration
   const openclawCheck = checkOpenClawConfig();
@@ -70,7 +76,7 @@ export async function statusCommand(): Promise<void> {
   checks.push(gatewayCheck);
 
   // 6. Test API connectivity
-  const apiCheck = await checkApiConnectivity(config.agentId);
+  const apiCheck = await checkApiConnectivity(agent.agentId);
   checks.push(apiCheck);
 
   // Print all checks
@@ -80,9 +86,9 @@ export async function statusCommand(): Promise<void> {
   console.log(fmt.section("Configuration"));
   console.log();
 
-  console.log(fmt.label("Agent ID: ", config.agentId));
+  console.log(fmt.label("Agent ID: ", agent.agentId));
   console.log(fmt.label("Gateway:  ", config.gateway || GATEWAY_URL));
-  console.log(fmt.label("Dashboard:", ` ${DASHBOARD_URL}/agents/${config.agentId}`));
+  console.log(fmt.label("Dashboard:", ` ${DASHBOARD_URL}/agents/${agent.agentId}`));
 
   if (config.mnemomApiKey) {
     const prefix = config.mnemomApiKey.slice(0, 8);
@@ -91,8 +97,8 @@ export async function statusCommand(): Promise<void> {
     console.log(`Mnemom Key: Not configured (free tier)`);
   }
 
-  if (config.openclawConfigured) {
-    console.log(`Configured: ${config.configuredAt || "yes"}`);
+  if (agent.openclawConfigured) {
+    console.log(`Configured: ${agent.configuredAt || "yes"}`);
   }
 
   // Show current model info
@@ -119,7 +125,7 @@ export async function statusCommand(): Promise<void> {
 
   // Show trace summary if available
   if (apiCheck.status === "ok") {
-    await showTraceSummary(config.agentId);
+    await showTraceSummary(agent.agentId);
   }
 
   // Show overall status
@@ -161,10 +167,11 @@ function checkSmoltbotConfig(): StatusCheckResult {
     };
   }
 
+  const defaultAgent = config.agents[config.defaultAgent];
   return {
     name: "Smoltbot Config",
     status: "ok",
-    message: `Agent ID: ${config.agentId}`,
+    message: `Agent ID: ${defaultAgent?.agentId ?? "unknown"}`,
   };
 }
 
