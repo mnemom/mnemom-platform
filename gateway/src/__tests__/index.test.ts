@@ -1363,11 +1363,11 @@ describe('resolveQuotaContext', () => {
         body: JSON.stringify({ p_agent_id: agentId }),
       })
     );
-    // Verify result was written to KV cache with 5-min TTL
+    // Verify result was written to KV cache with 30-min TTL
     expect(env.BILLING_CACHE!.put).toHaveBeenCalledWith(
       `quota:agent:${agentId}`,
       JSON.stringify(rpcContext),
-      { expirationTtl: 300 }
+      { expirationTtl: 1800 }
     );
   });
 

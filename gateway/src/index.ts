@@ -212,7 +212,7 @@ export async function resolveQuotaContext(
       ? `quota:mk:${mnemomKeyHash}`
       : `quota:agent:${agentId}`;
 
-    // Check KV cache (5-min TTL)
+    // Check KV cache (30-min TTL)
     if (env.BILLING_CACHE) {
       try {
         const cached = await env.BILLING_CACHE.get(cacheKey, 'json');
@@ -243,10 +243,10 @@ export async function resolveQuotaContext(
 
     const context = (await rpcResponse.json()) as QuotaContext;
 
-    // Write to KV cache (fire-and-forget, 5-min TTL)
+    // Write to KV cache (fire-and-forget, 30-min TTL)
     if (env.BILLING_CACHE) {
       env.BILLING_CACHE
-        .put(cacheKey, JSON.stringify(context), { expirationTtl: 300 })
+        .put(cacheKey, JSON.stringify(context), { expirationTtl: 1800 })
         .catch(() => {});
     }
 
@@ -798,7 +798,7 @@ async function fetchAlignmentData(
 
 /**
  * Fetch org-level conscience values for an agent.
- * Uses KV cache (5-min TTL) → Supabase RPC. Fail-open: returns null on error.
+ * Uses KV cache (30-min TTL) → Supabase RPC. Fail-open: returns null on error.
  */
 async function fetchOrgConscienceValuesForGateway(
   agentId: string,
@@ -832,9 +832,9 @@ async function fetchOrgConscienceValuesForGateway(
 
     const result = await response.json() as Record<string, unknown>;
 
-    // Cache for 5 minutes
+    // Cache for 30 minutes
     if (env.BILLING_CACHE) {
-      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 300 }).catch(() => {});
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 1800 }).catch(() => {});
     }
 
     return result as any;
@@ -846,7 +846,7 @@ async function fetchOrgConscienceValuesForGateway(
 
 /**
  * Fetch org card template for an agent (Phase 3c).
- * Uses KV cache (5-min TTL) → Supabase RPC. Fail-open: returns null on error.
+ * Uses KV cache (30-min TTL) → Supabase RPC. Fail-open: returns null on error.
  */
 async function fetchOrgCardTemplateForAgent(
   agentId: string,
@@ -880,9 +880,9 @@ async function fetchOrgCardTemplateForAgent(
 
     const result = await response.json() as Record<string, unknown>;
 
-    // Cache for 5 minutes
+    // Cache for 30 minutes
     if (env.BILLING_CACHE) {
-      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 300 }).catch(() => {});
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 1800 }).catch(() => {});
     }
 
     return result as any;
