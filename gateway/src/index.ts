@@ -109,7 +109,7 @@ export interface Env {
   // Phase 1 VIE: Ed25519 checkpoint attestation
   ED25519_SIGNING_KEY?: string;         // 64-char hex secret key
   ED25519_KEY_ID?: string;              // Key identifier (e.g. "key-001")
-  // Phase 3: ZK proving via RISC Zero
+  // Phase 3: ZK proving via SP1
   PROVER_URL?: string;                  // e.g. "https://prover.mnemom.ai"
   PROVER_API_KEY?: string;              // Shared secret for prover auth
 }
@@ -1124,7 +1124,7 @@ function shouldProve(
 /**
  * Request a ZK proof for a checkpoint's verdict derivation.
  * Inserts a pending row in verdict_proofs, then fire-and-forget POSTs
- * to the external RISC Zero prover service. Fail-open throughout.
+ * to the external SP1 prover service. Fail-open throughout.
  */
 async function requestProof(
   checkpointId: string,
