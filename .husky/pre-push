@@ -1,0 +1,14 @@
+# Pre-push type check: catches errors locally in seconds vs. waiting for CI
+
+# Get files changed compared to remote tracking branch
+changed=$(git diff --name-only @{push} 2>/dev/null || git diff --name-only HEAD~3..HEAD 2>/dev/null || echo "")
+
+if echo "$changed" | grep -q "^gateway/"; then
+  echo "Type-checking gateway..."
+  (cd gateway && npx tsc --noEmit) || exit 1
+fi
+
+if echo "$changed" | grep -q "^observer/"; then
+  echo "Type-checking observer..."
+  (cd observer && npx tsc --noEmit) || exit 1
+fi
