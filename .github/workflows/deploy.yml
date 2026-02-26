@@ -1,8 +1,6 @@
-name: Deploy Production
+name: Deploy Production (manual fallback)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
