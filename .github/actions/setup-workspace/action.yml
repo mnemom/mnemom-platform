@@ -1,0 +1,31 @@
+name: "Setup Workspace"
+description: "Setup Node.js with npm cache and install dependencies"
+
+inputs:
+  workspace:
+    description: "Package directory (e.g., gateway, observer, cli)"
+    required: true
+  node-version:
+    description: "Node.js version"
+    required: false
+    default: "20"
+  registry-url:
+    description: "npm registry URL (for publishing)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Node.js ${{ inputs.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: "npm"
+        cache-dependency-path: ${{ inputs.workspace }}/package-lock.json
+        registry-url: ${{ inputs.registry-url }}
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.workspace }}
+      run: npm ci
