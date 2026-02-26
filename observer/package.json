@@ -9,6 +9,7 @@
     "test": "vitest"
   },
   "dependencies": {
+    "@mnemom/policy-engine": "file:../shared/policy-engine",
     "@mnemom/agent-alignment-protocol": "^0.1.8",
     "@mnemom/aip-otel-exporter": "^0.1.0",
     "stripe": "^20.3.1"
