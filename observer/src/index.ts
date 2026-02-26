@@ -29,6 +29,13 @@ import {
 
 import { createWorkersExporter, type WorkersOTelExporter } from '@mnemom/aip-otel-exporter/workers';
 import { mergeOrgAndAgentCard } from './card-merge';
+import {
+  evaluatePolicy,
+  mergePolicies,
+  type Policy,
+  type EvaluationResult,
+  type ToolReference,
+} from '@mnemom/policy-engine';
 
 // ============================================================================
 // Types
@@ -326,8 +333,11 @@ async function processLog(
     `[observer] Extracted: thinking=${!!context.thinking}, tools=${context.toolCalls.length}, query=${!!context.userQuery}`
   );
 
-  // Fetch card FIRST so we can pass values to Haiku
-  const card = await fetchCard(agent_id, env);
+  // Fetch card and policy data in parallel
+  const [card, policyData] = await Promise.all([
+    fetchCard(agent_id, env),
+    fetchPolicyForAgent(agent_id, env),
+  ]);
 
   // Analyze reasoning with Claude Haiku (card-aware)
   const analysis = await analyzeWithHaiku(context, env, card);
@@ -342,8 +352,35 @@ async function processLog(
     otelExporter.recordVerification(verification);
   }
 
+  // Policy evaluation (additive — agents without policies get current behavior)
+  let policyResult: EvaluationResult | null = null;
+  if (policyData && card) {
+    const merged = mergePolicies(
+      policyData.orgPolicy,
+      policyData.agentPolicy,
+      policyData.exempt
+    );
+    if (merged) {
+      const tools = extractToolsFromTrace(trace);
+      if (tools.length > 0) {
+        policyResult = evaluatePolicy({
+          context: 'observer',
+          policy: merged,
+          card: card as any,
+          tools,
+        });
+        console.log(`[observer/policy] Agent ${agent_id}: verdict=${policyResult.verdict}, violations=${policyResult.violations.length}, warnings=${policyResult.warnings.length}`);
+      }
+    }
+  }
+
   // Submit trace to Supabase (trace + verification stored separately)
   await submitTrace(trace, verification, log, env);
+
+  // Store policy evaluation result (non-blocking)
+  if (policyResult && policyData?.dbPolicyId) {
+    ctx.waitUntil(submitPolicyEvaluation(policyResult, agent_id, trace.trace_id, policyData.dbPolicyId, policyData.dbPolicyVersion ?? 1, env));
+  }
 
   // Submit usage event for admin tracking (non-blocking)
   ctx.waitUntil(submitUsageEvent(trace, log, env));
@@ -1316,6 +1353,108 @@ async function submitTrace(
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Failed to submit trace: ${response.status} - ${errorText}`);
+  }
+}
+
+// ============================================================================
+// Policy Engine Functions (CLPI Phase 1)
+// ============================================================================
+
+/**
+ * Fetch policy data for an agent from Supabase RPC.
+ * Fail-open: returns null on error so agents without policies continue normally.
+ */
+async function fetchPolicyForAgent(
+  agentId: string,
+  env: Env
+): Promise<{ orgPolicy: Policy | null; agentPolicy: Policy | null; exempt: boolean; dbPolicyId: string | null; dbPolicyVersion: number | null } | null> {
+  try {
+    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ p_agent_id: agentId }),
+    });
+
+    if (!response.ok) {
+      console.warn(`[observer/policy] RPC failed for ${agentId}: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json() as Record<string, unknown> | null;
+    if (!data) return null;
+
+    return {
+      orgPolicy: (data.org_policy as Policy) ?? null,
+      agentPolicy: (data.agent_policy as Policy) ?? null,
+      exempt: (data.exempt as boolean) ?? false,
+      dbPolicyId: ((data.agent_policy_id ?? data.org_policy_id) as string) ?? null,
+      dbPolicyVersion: ((data.agent_policy_version ?? data.org_policy_version) as number) ?? null,
+    };
+  } catch (error) {
+    console.warn('[observer/policy] fetchPolicyForAgent failed (fail-open):', error);
+    return null;
+  }
+}
+
+/**
+ * Extract tool references from a trace for policy evaluation.
+ */
+function extractToolsFromTrace(trace: APTrace): ToolReference[] {
+  const action = trace.action as Record<string, any> | undefined;
+  const toolCalls: any[] = action?.tool_calls ?? [];
+  return toolCalls
+    .map((tc: any) => ({ name: (tc.tool_name || tc.name) as string }))
+    .filter((t: ToolReference) => t.name);
+}
+
+/**
+ * Submit a policy evaluation result to Supabase.
+ * Non-blocking, fail-open.
+ */
+async function submitPolicyEvaluation(
+  result: EvaluationResult,
+  agentId: string,
+  traceId: string,
+  dbPolicyId: string,
+  dbPolicyVersion: number,
+  env: Env
+): Promise<void> {
+  try {
+    const evalId = `pe-${crypto.randomUUID().slice(0, 8)}`;
+    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/policy_evaluations`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        id: evalId,
+        policy_id: dbPolicyId,
+        policy_version: dbPolicyVersion,
+        agent_id: agentId,
+        trace_id: traceId,
+        context: result.context,
+        verdict: result.verdict,
+        violations: result.violations,
+        warnings: result.warnings,
+        coverage: result.coverage,
+        duration_ms: result.duration_ms,
+        dry_run: false,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.warn(`[observer/policy] Failed to store evaluation: ${response.status} - ${errorText}`);
+    }
+  } catch (error) {
+    console.warn('[observer/policy] submitPolicyEvaluation failed (fail-open):', error);
   }
 }
 
