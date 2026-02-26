@@ -1,8 +1,6 @@
-name: Deploy Staging
+name: Deploy Staging (manual fallback)
 
 on:
-  push:
-    branches: [staging]
   workflow_dispatch:
 
 concurrency:
