@@ -5,28 +5,53 @@ on:
     branches: [main, staging]
   pull_request:
     branches: [main, staging]
+  merge_group:
   workflow_call:
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Weekly Monday 6am UTC - Node.js compat test
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  cli:
-    name: CLI (Node ${{ matrix.node-version }})
+  changes:
+    name: Detect Changes
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: ["18", "20", "22"]
-
+    permissions:
+      pull-requests: read
+    outputs:
+      gateway: ${{ steps.filter.outputs.gateway }}
+      observer: ${{ steps.filter.outputs.observer }}
+      cli: ${{ steps.filter.outputs.cli }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
         with:
-          node-version: ${{ matrix.node-version }}
+          filters: |
+            gateway:
+              - 'gateway/**'
+              - 'shared/**'
+            observer:
+              - 'observer/**'
+              - 'shared/**'
+            cli:
+              - 'cli/**'
+              - 'shared/**'
 
-      - name: Install dependencies
-        working-directory: cli
-        run: npm ci
+  cli:
+    name: CLI
+    needs: changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.cli == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-workspace
+        with:
+          workspace: cli
 
       - name: Build
         working-directory: cli
@@ -38,19 +63,14 @@ jobs:
 
   gateway:
     name: Gateway
+    needs: changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.gateway == 'true')
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: ./.github/actions/setup-workspace
         with:
-          node-version: "20"
-
-      - name: Install dependencies
-        working-directory: gateway
-        run: npm ci
+          workspace: gateway
 
       - name: Type check
         working-directory: gateway
@@ -62,21 +82,39 @@ jobs:
 
   observer:
     name: Observer
+    needs: changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.observer == 'true')
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: ./.github/actions/setup-workspace
         with:
-          node-version: "20"
-
-      - name: Install dependencies
-        working-directory: observer
-        run: npm ci
+          workspace: observer
 
       - name: Type check
         working-directory: observer
         run: npx tsc --noEmit
 
+  # Weekly Node.js compatibility matrix for CLI (18, 22)
+  # Node 20 is tested on every push/PR above
+  cli-compat:
+    name: CLI Compat (Node ${{ matrix.node-version }})
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ["18", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-workspace
+        with:
+          workspace: cli
+          node-version: ${{ matrix.node-version }}
+
+      - name: Build
+        working-directory: cli
+        run: npm run build
+
+      - name: Run tests
+        working-directory: cli
+        run: npm test -- --run
