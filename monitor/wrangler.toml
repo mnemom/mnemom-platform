@@ -1,9 +1,23 @@
-name = "smoltbot-monitor"
+# ─── Shared / Inheritable ─────────────────────────────────────────────────────
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-[triggers]
+# ─── Production ───────────────────────────────────────────────────────────────
+[env.production]
+name = "smoltbot-monitor"
+
+[env.production.triggers]
 crons = ["*/5 * * * *"]
 
-# Secrets (set via wrangler secret put):
-# MONITOR_SECRET      (shared secret for HTTP trigger endpoint)
+# Secrets (set via: wrangler secret put <NAME> --env production):
+# MONITOR_SECRET
+
+# ─── Staging ──────────────────────────────────────────────────────────────────
+[env.staging]
+name = "smoltbot-monitor-staging"
+
+[env.staging.triggers]
+crons = ["*/15 * * * *"]
+
+# Secrets (set via: wrangler secret put <NAME> --env staging):
+# MONITOR_SECRET

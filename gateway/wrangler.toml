@@ -1,41 +1,55 @@
-name = "smoltbot-gateway"
+# ─── Shared / Inheritable ─────────────────────────────────────────────────────
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Custom domain
+# ─── Production ───────────────────────────────────────────────────────────────
+[env.production]
+name = "smoltbot-gateway"
+
 routes = [
   { pattern = "gateway.mnemom.ai", custom_domain = true }
 ]
 
 workers_dev = true
 
-[vars]
+[env.production.vars]
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "true"
 
-# Billing quota cache — create with: wrangler kv:namespace create BILLING_CACHE
-# Then fill in the id below. Preview namespace: wrangler kv:namespace create BILLING_CACHE --preview
-[[kv_namespaces]]
+[[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
 id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 
-# Secrets (set via wrangler secret put):
-# SUPABASE_URL
-# SUPABASE_KEY
-# CF_AI_GATEWAY_URL
-# OTLP_ENDPOINT  (Grafana Cloud / OTel collector)
-# OTLP_AUTH       (e.g. "Basic <base64>")
+# Secrets (set via: wrangler secret put <NAME> --env production):
+# SUPABASE_URL, SUPABASE_KEY, CF_AI_GATEWAY_URL
+# ANTHROPIC_API_KEY, CF_AIG_TOKEN
+# OTLP_ENDPOINT, OTLP_AUTH
+# MNEMOM_ANALYZE_URL, MNEMOM_API_KEY, MNEMOM_LICENSE_JWT
+# ED25519_SIGNING_KEY, ED25519_KEY_ID
+# PROVER_URL, PROVER_API_KEY
 
-# Phase 7: Self-hosted deployment (optional, only set for self-hosted gateways)
-# MNEMOM_ANALYZE_URL  (e.g. "https://api.mnemom.ai/v1/analyze")
-# MNEMOM_API_KEY      (mnm_ key with analyze scope)
-# MNEMOM_LICENSE_JWT  (Enterprise license JWT)
+# ─── Staging ──────────────────────────────────────────────────────────────────
+[env.staging]
+name = "smoltbot-gateway-staging"
 
-# Phase 1 VIE: Ed25519 checkpoint attestation (set via wrangler secret put)
-# ED25519_SIGNING_KEY  (64-char hex Ed25519 secret key)
-# ED25519_KEY_ID       (Key identifier, e.g. "key-001")
+routes = [
+  { pattern = "gateway-staging.mnemom.ai", custom_domain = true }
+]
 
-# Phase 3: ZK proving via SP1 on Modal GPU (set via wrangler secret put)
-# PROVER_URL      (Modal endpoint, e.g. "https://mnemom--mnemom-prover-prover-service.modal.run")
-# PROVER_API_KEY  (shared secret for prover auth)
+workers_dev = true
+
+[env.staging.vars]
+GATEWAY_VERSION = "2.0.0"
+BILLING_ENFORCEMENT_ENABLED = "false"
+
+[[env.staging.kv_namespaces]]
+binding = "BILLING_CACHE"
+id = "2310e7878a364496b397b88540923c1f"
+
+# Secrets (set via: wrangler secret put <NAME> --env staging):
+# SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
+# CF_AI_GATEWAY_URL (smoltbot-staging gateway)
+# ANTHROPIC_API_KEY, CF_AIG_TOKEN
+# OTLP_ENDPOINT, OTLP_AUTH
+# ED25519_SIGNING_KEY, ED25519_KEY_ID

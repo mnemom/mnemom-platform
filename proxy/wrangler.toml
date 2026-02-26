@@ -1,11 +1,27 @@
-name = "smoltbot-proxy"
+# ─── Shared / Inheritable ─────────────────────────────────────────────────────
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
+# ─── Production ───────────────────────────────────────────────────────────────
+[env.production]
+name = "smoltbot-proxy"
+
 workers_dev = true
 
-[vars]
+[env.production.vars]
 ALLOWED_TARGETS = "rentahuman.ai"
 
-# Secrets (set via wrangler secret put):
-# PROXY_TOKEN - shared secret for auth
+# Secrets (set via: wrangler secret put <NAME> --env production):
+# PROXY_TOKEN
+
+# ─── Staging ──────────────────────────────────────────────────────────────────
+[env.staging]
+name = "smoltbot-proxy-staging"
+
+workers_dev = true
+
+[env.staging.vars]
+ALLOWED_TARGETS = "rentahuman.ai"
+
+# Secrets (set via: wrangler secret put <NAME> --env staging):
+# PROXY_TOKEN

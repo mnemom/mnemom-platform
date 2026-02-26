@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { getGatewayUrl } from "./config.js";
 
 // OpenClaw paths
 export const OPENCLAW_DIR = path.join(os.homedir(), ".openclaw");
@@ -19,23 +20,16 @@ export const AUTH_PROFILES_FILE = path.join(
 
 export type Provider = "anthropic" | "openai" | "gemini";
 
-export const PROVIDER_ROUTES: Record<
-  Provider,
-  { baseUrl: string; apiType: string }
-> = {
-  anthropic: {
-    baseUrl: "https://gateway.mnemom.ai/anthropic",
-    apiType: "anthropic-messages",
-  },
-  openai: {
-    baseUrl: "https://gateway.mnemom.ai/openai",
-    apiType: "openai-chat",
-  },
-  gemini: {
-    baseUrl: "https://gateway.mnemom.ai/gemini",
-    apiType: "gemini-messages",
-  },
-};
+function buildProviderRoutes(): Record<Provider, { baseUrl: string; apiType: string }> {
+  const gw = getGatewayUrl();
+  return {
+    anthropic: { baseUrl: `${gw}/anthropic`, apiType: "anthropic-messages" },
+    openai: { baseUrl: `${gw}/openai`, apiType: "openai-chat" },
+    gemini: { baseUrl: `${gw}/gemini`, apiType: "gemini-messages" },
+  };
+}
+
+export const PROVIDER_ROUTES = buildProviderRoutes();
 
 /**
  * Smoltbot provider key names in OpenClaw config.

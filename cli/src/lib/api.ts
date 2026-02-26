@@ -1,4 +1,6 @@
-export const API_BASE = "https://api.mnemom.ai";
+import { getApiUrl } from "./config.js";
+
+export const API_BASE = getApiUrl();
 
 export interface Agent {
   id: string;

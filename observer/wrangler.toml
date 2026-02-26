@@ -1,16 +1,38 @@
-name = "smoltbot-observer"
+# ─── Shared / Inheritable ─────────────────────────────────────────────────────
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-[triggers]
+# ─── Production ───────────────────────────────────────────────────────────────
+[env.production]
+name = "smoltbot-observer"
+
+[env.production.triggers]
 crons = ["* * * * *"]
 
-[vars]
+[env.production.vars]
 GATEWAY_ID = "smoltbot"
 
-# Secrets (set via wrangler secret put):
-# OTLP_ENDPOINT      (Grafana Cloud / OTel collector)
-# OTLP_AUTH           (e.g. "Basic <base64>")
-# STRIPE_SECRET_KEY   (Stripe API secret key, for daily usage reporting)
-# TRIGGER_SECRET      (shared secret for /trigger and /status HTTP endpoints)
+# Secrets (set via: wrangler secret put <NAME> --env production):
+# SUPABASE_URL, SUPABASE_KEY
+# CF_ACCOUNT_ID, CF_API_TOKEN, CF_AI_GATEWAY_URL
+# ANTHROPIC_API_KEY, ANALYSIS_API_KEY
+# OTLP_ENDPOINT, OTLP_AUTH
+# STRIPE_SECRET_KEY, TRIGGER_SECRET
+
+# ─── Staging ──────────────────────────────────────────────────────────────────
+[env.staging]
+name = "smoltbot-observer-staging"
+
+[env.staging.triggers]
+crons = ["*/5 * * * *"]
+
+[env.staging.vars]
+GATEWAY_ID = "smoltbot-staging"
+
+# Secrets (set via: wrangler secret put <NAME> --env staging):
+# SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
+# CF_ACCOUNT_ID, CF_API_TOKEN, CF_AI_GATEWAY_URL (smoltbot-staging)
+# ANTHROPIC_API_KEY, ANALYSIS_API_KEY
+# OTLP_ENDPOINT, OTLP_AUTH
+# TRIGGER_SECRET

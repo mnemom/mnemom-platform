@@ -1,4 +1,4 @@
-name: Deploy
+name: Deploy Production
 
 on:
   workflow_dispatch:
@@ -49,6 +49,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: gateway
+          command: deploy --env production
 
   deploy-observer:
     name: Deploy Observer
@@ -73,6 +74,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: observer
+          command: deploy --env production
 
   publish-cli:
     name: Publish CLI
