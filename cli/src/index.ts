@@ -7,6 +7,13 @@ import { integrityCommand } from "./commands/integrity.js";
 import { logsCommand } from "./commands/logs.js";
 import { licenseActivateCommand, licenseStatusCommand, licenseDeactivateCommand } from "./commands/license.js";
 import { cardShowCommand, cardPublishCommand, cardValidateCommand } from "./commands/card.js";
+import {
+  policyInitCommand,
+  policyValidateCommand,
+  policyPublishCommand,
+  policyListCommand,
+  policyTestCommand,
+} from "./commands/policy.js";
 import { registerCommand } from "./commands/register.js";
 import { agentsListCommand, agentsDefaultCommand, agentsRemoveCommand } from "./commands/agents.js";
 
@@ -156,6 +163,77 @@ cardCmd
   .action(async (file: string) => {
     try {
       await cardValidateCommand(file);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+const policyCmd = program
+  .command("policy")
+  .description("Manage policy engine");
+
+policyCmd
+  .command("init")
+  .description("Scaffold a policy.json template")
+  .action(async () => {
+    try {
+      await policyInitCommand();
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command("validate")
+  .argument("<file>", "Path to policy JSON file")
+  .description("Validate policy locally")
+  .action(async (file: string) => {
+    try {
+      await policyValidateCommand(file);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command("publish")
+  .argument("<file>", "Path to policy JSON file")
+  .description("Validate and publish policy to API")
+  .action(async (file: string) => {
+    try {
+      const opts = program.opts();
+      await policyPublishCommand(file, opts.agent);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command("list")
+  .description("List active policy for current agent")
+  .action(async () => {
+    try {
+      const opts = program.opts();
+      await policyListCommand(opts.agent);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command("test")
+  .argument("<file>", "Path to policy JSON file")
+  .option("--against-traces", "Test against historical traces")
+  .description("Dry-run policy against historical traces")
+  .action(async (file: string) => {
+    try {
+      const opts = program.opts();
+      await policyTestCommand(file, opts.agent);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);

@@ -162,3 +162,85 @@ export async function reverifyAgent(
 
   return response.json() as Promise<{ reverified: number }>;
 }
+
+// ============================================================================
+// Policy API
+// ============================================================================
+
+export interface PolicyResponse {
+  id: string;
+  name: string;
+  description: string | null;
+  policy_json: Record<string, unknown>;
+  version: number;
+  created_by: string;
+  created_at: string;
+}
+
+export interface PolicyListResponse {
+  agent_id: string;
+  policy: PolicyResponse | null;
+}
+
+export async function getPolicy(agentId: string): Promise<PolicyListResponse | null> {
+  try {
+    return await fetchApi<PolicyListResponse>(`/v1/agents/${agentId}/policy`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("404") || message.includes("not found")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function publishPolicy(
+  agentId: string,
+  policyJson: Record<string, unknown>
+): Promise<{ id: string; version: number; created: boolean }> {
+  const url = `${API_BASE}/v1/agents/${agentId}/policy`;
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ policy_json: policyJson }),
+  });
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `Policy publish failed: ${response.status}`);
+  }
+
+  return response.json() as Promise<{ id: string; version: number; created: boolean }>;
+}
+
+export async function testPolicyHistorical(
+  agentId: string,
+  policyJson: Record<string, unknown>,
+  limit: number = 50
+): Promise<{
+  agent_id: string;
+  policy_name: string;
+  total_traces: number;
+  results: any[];
+  summary: { pass: number; warn: number; fail: number; skipped: number };
+}> {
+  const url = `${API_BASE}/v1/policies/evaluate/historical`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agent_id: agentId, policy_json: policyJson, limit }),
+  });
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `Historical evaluation failed: ${response.status}`);
+  }
+
+  return response.json() as Promise<any>;
+}
