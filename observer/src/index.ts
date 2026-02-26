@@ -378,8 +378,8 @@ async function processLog(
   await submitTrace(trace, verification, log, env);
 
   // Store policy evaluation result (non-blocking)
-  if (policyResult) {
-    ctx.waitUntil(submitPolicyEvaluation(policyResult, agent_id, trace.trace_id, env));
+  if (policyResult && policyData?.dbPolicyId) {
+    ctx.waitUntil(submitPolicyEvaluation(policyResult, agent_id, trace.trace_id, policyData.dbPolicyId, policyData.dbPolicyVersion ?? 1, env));
   }
 
   // Submit usage event for admin tracking (non-blocking)
@@ -1367,7 +1367,7 @@ async function submitTrace(
 async function fetchPolicyForAgent(
   agentId: string,
   env: Env
-): Promise<{ orgPolicy: Policy | null; agentPolicy: Policy | null; exempt: boolean } | null> {
+): Promise<{ orgPolicy: Policy | null; agentPolicy: Policy | null; exempt: boolean; dbPolicyId: string | null; dbPolicyVersion: number | null } | null> {
   try {
     const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
       method: 'POST',
@@ -1391,6 +1391,8 @@ async function fetchPolicyForAgent(
       orgPolicy: (data.org_policy as Policy) ?? null,
       agentPolicy: (data.agent_policy as Policy) ?? null,
       exempt: (data.exempt as boolean) ?? false,
+      dbPolicyId: ((data.agent_policy_id ?? data.org_policy_id) as string) ?? null,
+      dbPolicyVersion: ((data.agent_policy_version ?? data.org_policy_version) as number) ?? null,
     };
   } catch (error) {
     console.warn('[observer/policy] fetchPolicyForAgent failed (fail-open):', error);
@@ -1417,6 +1419,8 @@ async function submitPolicyEvaluation(
   result: EvaluationResult,
   agentId: string,
   traceId: string,
+  dbPolicyId: string,
+  dbPolicyVersion: number,
   env: Env
 ): Promise<void> {
   try {
@@ -1431,8 +1435,8 @@ async function submitPolicyEvaluation(
       },
       body: JSON.stringify({
         id: evalId,
-        policy_id: result.policy_id,
-        policy_version: result.policy_version,
+        policy_id: dbPolicyId,
+        policy_version: dbPolicyVersion,
         agent_id: agentId,
         trace_id: traceId,
         context: result.context,
