@@ -56,7 +56,7 @@ export async function requireAccessToken(): Promise<string> {
 export async function loginWithBrowser(): Promise<AuthTokens> {
   const state = crypto.randomBytes(16).toString("hex");
 
-  const { port, tokenPromise, close } = startCallbackServer(state);
+  const { port, tokenPromise, close } = await startCallbackServer(state);
   const loginUrl = `${getApiUrl()}/v1/auth/cli?port=${port}&state=${state}`;
 
   console.log("Opening browser to authenticate...");
@@ -77,11 +77,11 @@ export async function loginWithBrowser(): Promise<AuthTokens> {
  * Start a local HTTP server that listens for the auth callback POST.
  * Returns the assigned port, a promise that resolves with tokens, and a close function.
  */
-function startCallbackServer(expectedState: string): {
+async function startCallbackServer(expectedState: string): Promise<{
   port: number;
   tokenPromise: Promise<AuthTokens>;
   close: () => void;
-} {
+}> {
   let resolveTokens: (tokens: AuthTokens) => void;
   let rejectTokens: (err: Error) => void;
   const tokenPromise = new Promise<AuthTokens>((resolve, reject) => {
@@ -167,9 +167,12 @@ function startCallbackServer(expectedState: string): {
     });
   });
 
-  // Listen on port 0 to get an OS-assigned available port
-  server.listen(0, "127.0.0.1");
-  const addr = server.address() as { port: number };
+  // Listen on port 0, wait for the server to be ready before reading the address
+  const port = await new Promise<number>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve((server.address() as { port: number }).port);
+    });
+  });
 
   // Auto-timeout after 5 minutes
   const timeout = setTimeout(() => {
@@ -178,7 +181,7 @@ function startCallbackServer(expectedState: string): {
   }, 5 * 60 * 1000);
 
   return {
-    port: addr.port,
+    port,
     tokenPromise,
     close: () => {
       clearTimeout(timeout);
