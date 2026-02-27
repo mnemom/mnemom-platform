@@ -72,6 +72,10 @@ jobs:
         with:
           workspace: gateway
 
+      - name: Build policy-engine
+        working-directory: shared/policy-engine
+        run: npm ci && npm run build
+
       - name: Type check
         working-directory: gateway
         run: npx tsc --noEmit
@@ -90,6 +94,10 @@ jobs:
       - uses: ./.github/actions/setup-workspace
         with:
           workspace: observer
+
+      - name: Build policy-engine
+        working-directory: shared/policy-engine
+        run: npm ci && npm run build
 
       - name: Type check
         working-directory: observer

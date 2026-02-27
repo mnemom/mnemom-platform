@@ -1,4 +1,5 @@
 import { getApiUrl } from "./config.js";
+import { getAccessToken } from "./auth.js";
 
 export const API_BASE = getApiUrl();
 
@@ -49,6 +50,16 @@ async function fetchApi<T>(endpoint: string): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+/**
+ * Build auth headers if a token is available.
+ * Returns empty object when unauthenticated (read-only calls).
+ */
+async function authHeaders(): Promise<Record<string, string>> {
+  const token = await getAccessToken();
+  if (!token) return {};
+  return { Authorization: `Bearer ${token}` };
 }
 
 export async function getAgent(id: string): Promise<Agent> {
@@ -128,7 +139,7 @@ export async function updateCard(
   const url = `${API_BASE}/v1/agents/${agentId}/card`;
   const response = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ card_json: cardJson }),
   });
 
@@ -149,7 +160,7 @@ export async function reverifyAgent(
   const url = `${API_BASE}/v1/agents/${agentId}/reverify`;
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
   });
 
   if (!response.ok) {
@@ -201,7 +212,7 @@ export async function publishPolicy(
   const url = `${API_BASE}/v1/agents/${agentId}/policy`;
   const response = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ policy_json: policyJson }),
   });
 
@@ -230,7 +241,7 @@ export async function testPolicyHistorical(
   const url = `${API_BASE}/v1/policies/evaluate/historical`;
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ agent_id: agentId, policy_json: policyJson, limit }),
   });
 

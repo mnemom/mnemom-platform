@@ -71,6 +71,14 @@ export interface AgentConfig {
   configuredAt?: string;
 }
 
+export interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;  // unix seconds
+  userId: string;
+  email: string;
+}
+
 export interface ConfigV2 {
   version: 2;
   defaultAgent: string;
@@ -78,6 +86,7 @@ export interface ConfigV2 {
   mnemomApiKey?: string;
   licenseJwt?: string;
   agents: Record<string, AgentConfig>;
+  auth?: AuthTokens;
 }
 
 /** Backward-compatible alias so existing imports keep working. */
@@ -209,4 +218,29 @@ export function deriveAgentIdWithName(apiKey: string, name: string): string {
     .update(`${apiKey}|${name}`)
     .digest("hex");
   return `smolt-${hash.slice(0, 8)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Auth token helpers
+// ---------------------------------------------------------------------------
+
+export function saveAuthTokens(tokens: AuthTokens): void {
+  const config = loadConfig();
+  if (!config) {
+    throw new Error("Config not initialized. Run `smoltbot init` first.");
+  }
+  config.auth = tokens;
+  saveConfig(config);
+}
+
+export function clearAuthTokens(): void {
+  const config = loadConfig();
+  if (!config) return;
+  delete config.auth;
+  saveConfig(config);
+}
+
+export function getAuthInfo(): AuthTokens | null {
+  const config = loadConfig();
+  return config?.auth ?? null;
 }
