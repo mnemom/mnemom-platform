@@ -8,6 +8,7 @@ import {
   type AlignmentCard,
   type CardResponse,
 } from "../lib/api.js";
+import { requireAccessToken } from "../lib/auth.js";
 import { fmt } from "../lib/format.js";
 import { askYesNo, isInteractive } from "../lib/prompt.js";
 
@@ -394,6 +395,9 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
     console.log(fmt.error("Validation failed. Fix the errors above before publishing.") + "\n");
     process.exit(1);
   }
+
+  // Require authentication
+  await requireAccessToken();
 
   // Confirm with user
   if (isInteractive()) {

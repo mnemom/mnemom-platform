@@ -17,6 +17,7 @@ import {
 } from "./commands/policy.js";
 import { registerCommand } from "./commands/register.js";
 import { agentsListCommand, agentsDefaultCommand, agentsRemoveCommand } from "./commands/agents.js";
+import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
 
 program
   .name("smoltbot")
@@ -309,6 +310,43 @@ agentsCmd
   .action(async (name: string) => {
     try {
       await agentsRemoveCommand(name);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("login")
+  .description("Authenticate with your Mnemom account")
+  .option("--no-browser", "Use email/password prompt instead of browser")
+  .action(async (options) => {
+    try {
+      await loginCommand({ noBrowser: options.browser === false });
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logout")
+  .description("Clear stored authentication credentials")
+  .action(async () => {
+    try {
+      await logoutCommand();
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("whoami")
+  .description("Show current authentication status")
+  .action(async () => {
+    try {
+      await whoamiCommand();
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
