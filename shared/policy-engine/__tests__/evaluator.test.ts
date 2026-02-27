@@ -214,6 +214,55 @@ describe('evaluatePolicy', () => {
     });
   });
 
+  describe('card_gaps', () => {
+    it('populates card_gaps for capability_exceeded in observer context', () => {
+      const result = evaluatePolicy(makeInput({
+        context: 'observer',
+        card: makeCard({
+          autonomy_envelope: {
+            bounded_actions: ['file_read'],  // missing code_execution
+          },
+        }),
+        tools: [{ name: 'Bash' }],
+      }));
+      expect(result.card_gaps).toHaveLength(1);
+      expect(result.card_gaps[0].tool).toBe('Bash');
+      expect(result.card_gaps[0].capability).toBe('code_execution');
+      expect(result.card_gaps[0].missing_card_actions).toContain('code_execution');
+    });
+
+    it('returns empty card_gaps in gateway context', () => {
+      const result = evaluatePolicy(makeInput({
+        context: 'gateway',
+        card: makeCard({
+          autonomy_envelope: {
+            bounded_actions: ['file_read'],  // missing code_execution
+          },
+        }),
+        tools: [{ name: 'Bash' }],
+      }));
+      expect(result.card_gaps).toHaveLength(0);
+    });
+
+    it('returns empty card_gaps in cicd context', () => {
+      const result = evaluatePolicy(makeInput({
+        context: 'cicd',
+        card: makeCard({
+          autonomy_envelope: {
+            bounded_actions: ['file_read'],
+          },
+        }),
+        tools: [{ name: 'Bash' }],
+      }));
+      expect(result.card_gaps).toHaveLength(0);
+    });
+
+    it('returns empty card_gaps when no capability violations', () => {
+      const result = evaluatePolicy(makeInput({ context: 'observer' }));
+      expect(result.card_gaps).toHaveLength(0);
+    });
+  });
+
   describe('result metadata', () => {
     it('includes policy name and context', () => {
       const result = evaluatePolicy(makeInput({ context: 'gateway' }));

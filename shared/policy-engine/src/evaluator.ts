@@ -4,6 +4,7 @@ import type {
   EvaluationResult,
   PolicyViolation,
   PolicyWarning,
+  CardGap,
   CoverageReport,
   CapabilityMapping,
 } from './types.js';
@@ -18,6 +19,7 @@ export function evaluatePolicy(input: EvaluationInput): EvaluationResult {
 
   const violations: PolicyViolation[] = [];
   const warnings: PolicyWarning[] = [];
+  const cardGaps: CardGap[] = [];
   const boundedActions = new Set(card.autonomy_envelope?.bounded_actions ?? []);
 
   for (const tool of tools) {
@@ -52,6 +54,16 @@ export function evaluatePolicy(input: EvaluationInput): EvaluationResult {
           reason: `Tool "${toolName}" maps to capability "${mapping.capabilityName}" which requires card actions [${missingActions.join(', ')}] not in bounded_actions`,
           severity: 'high',
         });
+
+        // In observer context, record card gaps for Phase 3 remediation
+        if (context === 'observer') {
+          cardGaps.push({
+            tool: toolName,
+            capability: mapping.capabilityName,
+            missing_card_actions: missingActions,
+            reason: `Card missing actions [${missingActions.join(', ')}] required by capability "${mapping.capabilityName}"`,
+          });
+        }
       }
     } else {
       // Tool is unmapped — apply defaults
@@ -118,6 +130,7 @@ export function evaluatePolicy(input: EvaluationInput): EvaluationResult {
     verdict,
     violations,
     warnings,
+    card_gaps: cardGaps,
     coverage,
     policy_id: policy.meta.name,
     policy_version: 1,

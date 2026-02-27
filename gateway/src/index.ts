@@ -45,6 +45,14 @@ import {
 } from './attestation';
 import { readStreamToText, parseSSEEvents } from './sse-parser';
 import { mergeOrgAndAgentCard } from './card-merge';
+import {
+  evaluatePolicy,
+  mergePolicies,
+  mergeTransactionGuardrails,
+  type Policy,
+  type EvaluationResult,
+  type ToolReference,
+} from '@mnemom/policy-engine';
 
 // ============================================================================
 // Analysis Helpers
@@ -112,6 +120,8 @@ export interface Env {
   // Phase 3: ZK proving via SP1
   PROVER_URL?: string;                  // e.g. "https://prover.mnemom.ai"
   PROVER_API_KEY?: string;              // Shared secret for prover auth
+  // Phase 4: Transaction guardrails KV cache
+  KV?: KVNamespace;
 }
 
 interface Agent {
@@ -2434,6 +2444,323 @@ function injectThinkingForProvider(
   }
 }
 
+// ============================================================================
+// Policy Engine Functions (CLPI Phase 2)
+// ============================================================================
+
+/**
+ * Extract tool names from request body for policy evaluation.
+ * Handles all three provider formats.
+ */
+function extractToolsFromRequest(
+  requestBody: Record<string, any> | null,
+  provider: GatewayProvider
+): ToolReference[] {
+  if (!requestBody) return [];
+
+  const tools: string[] = [];
+
+  switch (provider) {
+    case 'anthropic': {
+      // Anthropic: tools[].name
+      const anthropicTools = requestBody.tools;
+      if (Array.isArray(anthropicTools)) {
+        for (const t of anthropicTools) {
+          if (t?.name) tools.push(t.name);
+        }
+      }
+      break;
+    }
+    case 'openai': {
+      // OpenAI: tools[].function.name
+      const openaiTools = requestBody.tools;
+      if (Array.isArray(openaiTools)) {
+        for (const t of openaiTools) {
+          if (t?.function?.name) tools.push(t.function.name);
+        }
+      }
+      break;
+    }
+    case 'gemini': {
+      // Gemini: tools[].functionDeclarations[].name + flat tools[].name
+      const geminiTools = requestBody.tools;
+      if (Array.isArray(geminiTools)) {
+        for (const t of geminiTools) {
+          if (t?.functionDeclarations && Array.isArray(t.functionDeclarations)) {
+            for (const fd of t.functionDeclarations) {
+              if (fd?.name) tools.push(fd.name);
+            }
+          }
+          if (t?.name) tools.push(t.name);
+        }
+      }
+      break;
+    }
+  }
+
+  return tools.map((name) => ({ name }));
+}
+
+/**
+ * Fetch policy data for an agent from Supabase RPC.
+ * Fail-open: returns null on error so agents without policies continue normally.
+ */
+async function fetchPolicyForAgent(
+  agentId: string,
+  env: Env
+): Promise<{
+  orgPolicy: Policy | null;
+  agentPolicy: Policy | null;
+  exempt: boolean;
+  dbPolicyId: string | null;
+  dbPolicyVersion: number | null;
+} | null> {
+  try {
+    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ p_agent_id: agentId }),
+    });
+
+    if (!response.ok) {
+      console.warn(`[gateway/policy] RPC failed for ${agentId}: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json() as Record<string, unknown> | null;
+    if (!data) return null;
+
+    return {
+      orgPolicy: (data.org_policy as Policy) ?? null,
+      agentPolicy: (data.agent_policy as Policy) ?? null,
+      exempt: (data.exempt as boolean) ?? false,
+      dbPolicyId: ((data.agent_policy_id ?? data.org_policy_id) as string) ?? null,
+      dbPolicyVersion: ((data.agent_policy_version ?? data.org_policy_version) as number) ?? null,
+    };
+  } catch (error) {
+    console.warn('[gateway/policy] fetchPolicyForAgent failed (fail-open):', error);
+    return null;
+  }
+}
+
+/**
+ * Fetch transaction-scoped guardrails for an agent.
+ * Fail-open: returns null on error so requests proceed without guardrails.
+ */
+async function fetchTransactionGuardrails(
+  agentId: string,
+  transactionId: string,
+  env: Env
+): Promise<{ policy: Policy; conscience_values: Array<{ id: string; content: string; type: string }> } | null> {
+  try {
+    // Check KV cache first
+    const cacheKey = `txn:${transactionId}:agent:${agentId}`;
+    const cached = env.KV ? await env.KV.get(cacheKey, 'json') as {
+      policy: Policy;
+      conscience_values: Array<{ id: string; content: string; type: string }>;
+      expires_at: string;
+    } | null : null;
+
+    if (cached) {
+      // Check if expired
+      if (cached.expires_at && new Date(cached.expires_at).getTime() < Date.now()) {
+        return null;
+      }
+      return { policy: cached.policy, conscience_values: cached.conscience_values };
+    }
+
+    // Fall back to Supabase RPC
+    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_transaction_guardrails`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ p_transaction_id: transactionId, p_agent_id: agentId }),
+    });
+
+    if (!response.ok) {
+      console.warn(`[gateway/policy] Transaction guardrails RPC failed for txn=${transactionId} agent=${agentId}: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json() as {
+      policy: Policy;
+      conscience_values: Array<{ id: string; content: string; type: string }>;
+      expires_at: string;
+    } | null;
+
+    if (!data) return null;
+
+    // Check if expired
+    if (data.expires_at && new Date(data.expires_at).getTime() < Date.now()) {
+      return null;
+    }
+
+    // Cache in KV with 5min TTL
+    if (env.KV) {
+      await env.KV.put(cacheKey, JSON.stringify(data), { expirationTtl: 300 });
+    }
+
+    return { policy: data.policy, conscience_values: data.conscience_values };
+  } catch (error) {
+    console.warn('[gateway/policy] fetchTransactionGuardrails failed (fail-open):', error);
+    return null;
+  }
+}
+
+/**
+ * Submit a gateway policy evaluation result to Supabase.
+ * Non-blocking, fail-open.
+ */
+async function submitGatewayPolicyEvaluation(
+  result: EvaluationResult,
+  agentId: string,
+  dbPolicyId: string,
+  dbPolicyVersion: number,
+  env: Env,
+  transactionId?: string | null
+): Promise<void> {
+  try {
+    const evalId = `pe-${crypto.randomUUID().slice(0, 8)}`;
+    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/policy_evaluations`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        id: evalId,
+        policy_id: dbPolicyId,
+        policy_version: dbPolicyVersion,
+        agent_id: agentId,
+        trace_id: null,
+        context: 'gateway',
+        verdict: result.verdict,
+        violations: result.violations,
+        warnings: result.warnings,
+        card_gaps: result.card_gaps,
+        coverage: result.coverage,
+        duration_ms: result.duration_ms,
+        dry_run: false,
+        ...(transactionId ? { transaction_id: transactionId } : {}),
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.warn(`[gateway/policy] Failed to store evaluation: ${response.status} - ${errorText}`);
+    }
+  } catch (error) {
+    console.warn('[gateway/policy] submitGatewayPolicyEvaluation failed (fail-open):', error);
+  }
+}
+
+/**
+ * Fetch tool_first_seen records for an agent and apply grace period logic.
+ * Returns updated violations array with in-grace tools downgraded to warnings.
+ */
+async function applyGracePeriod(
+  agentId: string,
+  violations: EvaluationResult['violations'],
+  warnings: EvaluationResult['warnings'],
+  gracePeriodHours: number,
+  env: Env
+): Promise<{ violations: EvaluationResult['violations']; warnings: EvaluationResult['warnings'] }> {
+  if (violations.length === 0 || gracePeriodHours <= 0) {
+    return { violations, warnings };
+  }
+
+  const violatingTools = [...new Set(violations.map((v) => v.tool))];
+
+  // Batch-fetch tool_first_seen records for this agent
+  let firstSeenMap = new Map<string, string>(); // tool_name -> first_seen_at
+  try {
+    const toolFilter = violatingTools.map((t) => `"${t}"`).join(',');
+    const resp = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_first_seen?agent_id=eq.${agentId}&tool_name=in.(${toolFilter})`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+    if (resp.ok) {
+      const rows = (await resp.json()) as Array<{ tool_name: string; first_seen_at: string }>;
+      for (const row of rows) {
+        firstSeenMap.set(row.tool_name, row.first_seen_at);
+      }
+    }
+  } catch {
+    // Fail-open: no grace period data → violations stand
+    return { violations, warnings };
+  }
+
+  const now = Date.now();
+  const graceMs = gracePeriodHours * 60 * 60 * 1000;
+  const remainingViolations: EvaluationResult['violations'] = [];
+  const newWarnings = [...warnings];
+  const newTools: string[] = [];
+
+  for (const v of violations) {
+    const firstSeen = firstSeenMap.get(v.tool);
+
+    if (!firstSeen) {
+      // New tool — mark as in-grace, downgrade to warning
+      newTools.push(v.tool);
+      newWarnings.push({
+        type: 'unmapped_tool',
+        tool: v.tool,
+        reason: `${v.reason} (in grace period — first seen now)`,
+      });
+    } else if (now - new Date(firstSeen).getTime() < graceMs) {
+      // Still within grace period — downgrade to warning
+      newWarnings.push({
+        type: 'unmapped_tool',
+        tool: v.tool,
+        reason: `${v.reason} (in grace period — first seen ${firstSeen})`,
+      });
+    } else {
+      // Grace period expired — violation stands
+      remainingViolations.push(v);
+    }
+  }
+
+  // Insert new tools (idempotent — ON CONFLICT DO NOTHING)
+  if (newTools.length > 0) {
+    try {
+      const inserts = newTools.map((t) => ({
+        id: `tfs-${crypto.randomUUID().slice(0, 12)}`,
+        agent_id: agentId,
+        tool_name: t,
+        source: 'gateway',
+      }));
+      await fetch(`${env.SUPABASE_URL}/rest/v1/tool_first_seen`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal,resolution=ignore-duplicates',
+        },
+        body: JSON.stringify(inserts),
+      });
+    } catch {
+      // Fail-open: insert errors don't block the request
+    }
+  }
+
+  return { violations: remainingViolations, warnings: newWarnings };
+}
+
 /**
  * Handle provider API proxy requests (multi-provider).
  *
@@ -2536,8 +2863,16 @@ export async function handleProviderProxy(
       }
     }
 
+    // Read transaction ID from request header (used for transaction-scoped guardrails)
+    const transactionId = request.headers.get('x-transaction-id');
+
     // Always resolve quota context — agent_settings needed for feature gating
-    const quotaContext = await resolveQuotaContext(agent.id, env, mnemomKeyHash);
+    // Policy fetch runs in parallel with quota resolution (zero added latency)
+    const [quotaContext, policyData, txnGuardrails] = await Promise.all([
+      resolveQuotaContext(agent.id, env, mnemomKeyHash),
+      fetchPolicyForAgent(agent.id, env),
+      transactionId ? fetchTransactionGuardrails(agent.id, transactionId, env) : Promise.resolve(null),
+    ]);
     const agentSettings = quotaContext.agent_settings;
 
     if (billingEnabled) {
@@ -2595,6 +2930,136 @@ export async function handleProviderProxy(
       console.warn(`[gateway] Request body is not valid JSON, forwarding as-is (provider: ${provider})`);
     }
 
+    // ====================================================================
+    // CLPI Phase 2: Gateway policy evaluation (pre-action checkpoint)
+    // ====================================================================
+    let policyVerdict: string | null = null;
+
+    if (policyData) {
+      try {
+        const mergedPolicy = mergePolicies(
+          policyData.orgPolicy,
+          policyData.agentPolicy,
+          policyData.exempt
+        );
+
+        // Apply transaction-scoped guardrails (intersection semantics — can only restrict)
+        let finalPolicy = mergedPolicy;
+        if (txnGuardrails?.policy && finalPolicy) {
+          finalPolicy = mergeTransactionGuardrails(finalPolicy, txnGuardrails.policy);
+        }
+
+        if (finalPolicy) {
+          // Resolve enforcement mode: agent_settings > policy defaults > 'warn'
+          const enforcementMode: string =
+            (agentSettings as any)?.policy_enforcement_mode ??
+            finalPolicy.defaults.enforcement_mode ??
+            'warn';
+
+          if (enforcementMode !== 'off') {
+            // Extract tools from request body
+            const requestTools = extractToolsFromRequest(requestBody, provider);
+
+            if (requestTools.length > 0) {
+              // Fetch alignment card for this agent (lightweight — reuse existing pattern)
+              let cardContent: Record<string, any> = {};
+              try {
+                const cardResp = await fetch(
+                  `${env.SUPABASE_URL}/rest/v1/alignment_cards?agent_id=eq.${agent.id}&is_active=eq.true&limit=1`,
+                  {
+                    headers: {
+                      apikey: env.SUPABASE_KEY,
+                      Authorization: `Bearer ${env.SUPABASE_KEY}`,
+                    },
+                  }
+                );
+                if (cardResp.ok) {
+                  const cards = (await cardResp.json()) as Array<{ card_json: Record<string, any> }>;
+                  if (cards.length > 0 && cards[0].card_json) {
+                    cardContent = cards[0].card_json;
+                  }
+                }
+              } catch {
+                // Fail-open: proceed without card
+              }
+
+              let evalResult = evaluatePolicy({
+                context: 'gateway',
+                policy: finalPolicy,
+                card: cardContent,
+                tools: requestTools,
+              });
+
+              // Apply grace period if there are violations
+              if (evalResult.violations.length > 0) {
+                const gracePeriodHours = finalPolicy.defaults.grace_period_hours ?? 24;
+                const graceResult = await applyGracePeriod(
+                  agent.id,
+                  evalResult.violations,
+                  evalResult.warnings,
+                  gracePeriodHours,
+                  env
+                );
+
+                // Recompute verdict after grace period filtering
+                const hasCriticalOrHigh = graceResult.violations.some(
+                  (v) => v.severity === 'critical' || v.severity === 'high'
+                );
+                const hasAnyViolation = graceResult.violations.length > 0;
+                let newVerdict: 'pass' | 'fail' | 'warn';
+                if (hasCriticalOrHigh) {
+                  newVerdict = 'fail';
+                } else if (hasAnyViolation || graceResult.warnings.length > 0) {
+                  newVerdict = 'warn';
+                } else {
+                  newVerdict = 'pass';
+                }
+
+                evalResult = {
+                  ...evalResult,
+                  violations: graceResult.violations,
+                  warnings: graceResult.warnings,
+                  verdict: newVerdict,
+                };
+              }
+
+              policyVerdict = evalResult.verdict;
+
+              // Store evaluation (non-blocking)
+              if (policyData.dbPolicyId && policyData.dbPolicyVersion != null) {
+                ctx.waitUntil(
+                  submitGatewayPolicyEvaluation(
+                    evalResult,
+                    agent.id,
+                    policyData.dbPolicyId,
+                    policyData.dbPolicyVersion,
+                    env,
+                    transactionId
+                  )
+                );
+              }
+
+              // Enforce mode: reject on fail
+              if (enforcementMode === 'enforce' && evalResult.verdict === 'fail') {
+                return new Response(JSON.stringify({
+                  error: 'Request blocked by policy',
+                  type: 'policy_violation',
+                  verdict: evalResult.verdict,
+                  violations: evalResult.violations,
+                }), {
+                  status: 403,
+                  headers: { 'Content-Type': 'application/json' },
+                });
+              }
+            }
+          }
+        }
+      } catch (error) {
+        // Fail-open: policy evaluation errors never block requests
+        console.warn('[gateway/policy] Evaluation failed (fail-open):', error);
+      }
+    }
+
     // Build the forwarding URL — strip provider prefix, forward to CF AI Gateway
     // CF AI Gateway requires provider in URL: .../gateway_name/provider/api_path
     // Strip any trailing provider from base URL, then add the correct one
@@ -2630,6 +3095,16 @@ export async function handleProviderProxy(
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set('x-smoltbot-agent', agent.id);
     responseHeaders.set('x-smoltbot-session', sessionId);
+
+    // Add policy verdict header if evaluation ran
+    if (policyVerdict) {
+      responseHeaders.set('X-Policy-Verdict', policyVerdict);
+    }
+
+    // Echo transaction ID back to caller
+    if (transactionId) {
+      responseHeaders.set('X-Transaction-Id', transactionId);
+    }
 
     // Add nudge headers if any were injected, and mark them delivered
     if (injectedNudgeIds.length > 0) {

@@ -1,5 +1,5 @@
 export { evaluatePolicy } from './evaluator.js';
-export { mergePolicies } from './merge.js';
+export { mergePolicies, mergeTransactionGuardrails } from './merge.js';
 export { validatePolicySchema } from './validator.js';
 export { toolMatchesPattern, toolMatchesAny } from './glob.js';
 
@@ -16,6 +16,7 @@ export type {
   EvaluationResult,
   PolicyViolation,
   PolicyWarning,
+  CardGap,
   CoverageReport,
   PolicyData,
   ValidationResult,

@@ -183,4 +183,17 @@ function validateDefaults(defaults: unknown, errors: ValidationError[]): void {
   if (typeof d.fail_open !== 'boolean') {
     errors.push({ path: 'defaults.fail_open', message: 'must be a boolean' });
   }
+
+  if (d.enforcement_mode !== undefined) {
+    const validModes = ['warn', 'enforce', 'off'];
+    if (typeof d.enforcement_mode !== 'string' || !validModes.includes(d.enforcement_mode)) {
+      errors.push({ path: 'defaults.enforcement_mode', message: `must be one of: ${validModes.join(', ')}` });
+    }
+  }
+
+  if (d.grace_period_hours !== undefined) {
+    if (typeof d.grace_period_hours !== 'number' || d.grace_period_hours < 0) {
+      errors.push({ path: 'defaults.grace_period_hours', message: 'must be a non-negative number' });
+    }
+  }
 }
