@@ -54,6 +54,8 @@ interface Env {
   OTLP_AUTH?: string;
   STRIPE_SECRET_KEY?: string;
   TRIGGER_SECRET: string;
+  PROVER_URL?: string;
+  PROVER_API_KEY?: string;
 }
 
 interface GatewayLog {
@@ -388,7 +390,7 @@ async function processLog(
   // Link gateway-created checkpoint to this trace, then detect AIP/observer disagreements
   ctx.waitUntil(
     linkCheckpointToTrace(agent_id, session_id, trace.trace_id, env)
-      .then(() => detectDisagreement(agent_id, session_id, trace.trace_id, verification, env))
+      .then(() => detectDisagreement(agent_id, session_id, trace.trace_id, verification, env, otelExporter))
   );
 
   // Check for behavioral drift (runs in background)
@@ -1443,6 +1445,7 @@ async function submitPolicyEvaluation(
         verdict: result.verdict,
         violations: result.violations,
         warnings: result.warnings,
+        card_gaps: result.card_gaps,
         coverage: result.coverage,
         duration_ms: result.duration_ms,
         dry_run: false,
@@ -1642,7 +1645,8 @@ async function detectDisagreement(
   sessionId: string,
   traceId: string,
   verification: VerificationResult | null,
-  env: Env
+  env: Env,
+  otelExporter?: WorkersOTelExporter | null
 ): Promise<void> {
   try {
     // Skip if no verification result (no card = nothing to compare)
@@ -1746,7 +1750,7 @@ async function detectDisagreement(
 
     // If mode supports reconciliation, run it
     if (ddrMode === 'auto-suggest' || ddrMode === 'auto-apply') {
-      await runReconciliation(reviewId, agentId, checkpoint, traceId, verification, ddrMode, env);
+      await runReconciliation(reviewId, agentId, checkpoint, traceId, verification, ddrMode, env, otelExporter);
     }
   } catch (error) {
     // Fail-open: DDR is best-effort
@@ -1765,7 +1769,8 @@ async function runReconciliation(
   traceId: string,
   verification: VerificationResult,
   ddrMode: string,
-  env: Env
+  env: Env,
+  otelExporter?: WorkersOTelExporter | null
 ): Promise<void> {
   const startTime = Date.now();
 
@@ -1935,7 +1940,15 @@ ${JSON.stringify(cardJson, null, 2)}
 
       // Auto-apply card amendment if mode is auto-apply and outcome is card_gap
       if (result.outcome === 'card_gap' && ddrMode === 'auto-apply' && result.proposed_amendment) {
-        await applyCardAmendment(agentId, result.proposed_amendment, env);
+        await applyCardAmendment(
+          agentId,
+          { tool_name: result.proposed_amendment.action, description: result.proposed_amendment.description },
+          env,
+          checkpoint.checkpoint_id,
+          traceId,
+          reviewId,
+          otelExporter
+        );
       }
     } finally {
       clearTimeout(timeoutId);
@@ -1961,20 +1974,29 @@ ${JSON.stringify(cardJson, null, 2)}
 
 /**
  * Apply a proposed card amendment from DDR reconciliation.
- * Adds the proposed action to the alignment card's bounded_actions.
+ * Adds the proposed action to the alignment card's bounded_actions,
+ * then runs the Phase 3 trust recovery chain: audit trail, reclassify,
+ * recompute score, OTel span, and re-proofing.
  */
 async function applyCardAmendment(
   agentId: string,
-  amendment: { type: string; action: string; description: string },
-  env: Env
+  amendment: { tool_name: string; description: string },
+  env: Env,
+  checkpointId: string,
+  traceId: string,
+  reviewId: string,
+  otelExporter?: WorkersOTelExporter | null
 ): Promise<void> {
   try {
+    const supabaseUrl = env.SUPABASE_URL;
+    const supabaseKey = env.SUPABASE_KEY;
+
     const cardResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/alignment_cards?agent_id=eq.${agentId}&is_active=eq.true&limit=1`,
+      `${supabaseUrl}/rest/v1/alignment_cards?agent_id=eq.${agentId}&is_active=eq.true&limit=1`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: supabaseKey,
+          Authorization: `Bearer ${supabaseKey}`,
         },
       }
     );
@@ -1990,27 +2012,216 @@ async function applyCardAmendment(
 
     const currentBounded: string[] = cardJson.autonomy_envelope?.bounded_actions || [];
 
-    if (!currentBounded.includes(amendment.action)) {
-      currentBounded.push(amendment.action);
+    if (!currentBounded.includes(amendment.tool_name)) {
+      // Capture before snapshot BEFORE mutating
+      const beforeSnapshot = JSON.parse(JSON.stringify(cardJson));
+
+      currentBounded.push(amendment.tool_name);
       if (!cardJson.autonomy_envelope) {
         cardJson.autonomy_envelope = {};
       }
       cardJson.autonomy_envelope.bounded_actions = currentBounded;
 
       await fetch(
-        `${env.SUPABASE_URL}/rest/v1/alignment_cards?id=eq.${cardId}`,
+        `${supabaseUrl}/rest/v1/alignment_cards?id=eq.${cardId}`,
         {
           method: 'PATCH',
           headers: {
-            apikey: env.SUPABASE_KEY,
-            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            apikey: supabaseKey,
+            Authorization: `Bearer ${supabaseKey}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ card_json: cardJson, issued_at: new Date().toISOString() }),
         }
       );
 
-      console.log(`[observer/ddr] Auto-applied card amendment: ${amendment.action} for agent ${agentId}`);
+      console.log(`[observer/ddr] Auto-applied card amendment: ${amendment.tool_name} for agent ${agentId}`);
+
+      // --- Trust Recovery Chain (Phase 3) ---
+      try {
+        // 1. Insert card_amendments row
+        const amendmentId = 'ca-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+        const amendRes = await fetch(`${supabaseUrl}/rest/v1/card_amendments`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: supabaseKey,
+            Authorization: `Bearer ${supabaseKey}`,
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({
+            id: amendmentId,
+            agent_id: agentId,
+            amendment_type: 'bounded_action_added',
+            before_snapshot: beforeSnapshot,
+            after_snapshot: JSON.parse(JSON.stringify(cardJson)),
+            diff_summary: `Added bounded action for tool: ${amendment.tool_name}`,
+            reason: amendment.description,
+            source: 'ddr_auto',
+            ddr_review_id: reviewId,
+          }),
+        });
+        if (!amendRes.ok) {
+          console.error('[applyCardAmendment] card_amendments insert failed:', await amendRes.text());
+        }
+
+        // 2. Call reclassify_checkpoint RPC
+        const reclRes = await fetch(`${supabaseUrl}/rest/v1/rpc/reclassify_checkpoint`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: supabaseKey,
+            Authorization: `Bearer ${supabaseKey}`,
+          },
+          body: JSON.stringify({
+            p_checkpoint_id: checkpointId,
+            p_agent_id: agentId,
+            p_reason: `Card gap resolved: added bounded action for ${amendment.tool_name}`,
+            p_card_amendment_id: amendmentId,
+            p_ddr_review_id: reviewId,
+          }),
+        });
+        let reclData: any = null;
+        if (reclRes.ok) {
+          reclData = await reclRes.json();
+        } else {
+          console.error('[applyCardAmendment] reclassify_checkpoint failed:', await reclRes.text());
+        }
+
+        // 3. PATCH policy_evaluations: set re_evaluated_at for same agent+trace with card_gaps
+        if (traceId) {
+          const peUrl = new URL(`${supabaseUrl}/rest/v1/policy_evaluations`);
+          peUrl.searchParams.set('agent_id', `eq.${agentId}`);
+          peUrl.searchParams.set('trace_id', `eq.${traceId}`);
+          peUrl.searchParams.set('card_gaps', 'neq.[]');
+          await fetch(peUrl.toString(), {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              apikey: supabaseKey,
+              Authorization: `Bearer ${supabaseKey}`,
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ re_evaluated_at: new Date().toISOString() }),
+          });
+        }
+
+        // 4. Trigger compute_reputation_score RPC for immediate recompute
+        const scoreRes = await fetch(`${supabaseUrl}/rest/v1/rpc/compute_reputation_score`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: supabaseKey,
+            Authorization: `Bearer ${supabaseKey}`,
+          },
+          body: JSON.stringify({ p_agent_id: agentId }),
+        });
+        let scoreAfter: number | null = null;
+        if (scoreRes.ok) {
+          const scoreData = await scoreRes.json() as any;
+          scoreAfter = scoreData?.score ?? null;
+
+          // 5. Update reclassification score_after
+          if (reclData?.reclassification_id && scoreAfter !== null) {
+            const reclUrl = new URL(`${supabaseUrl}/rest/v1/reclassifications`);
+            reclUrl.searchParams.set('id', `eq.${reclData.reclassification_id}`);
+            await fetch(reclUrl.toString(), {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json',
+                apikey: supabaseKey,
+                Authorization: `Bearer ${supabaseKey}`,
+                Prefer: 'return=minimal',
+              },
+              body: JSON.stringify({ score_after: scoreAfter }),
+            });
+
+            // Also update the reputation_event score_after
+            if (reclData.event_id) {
+              const evUrl = new URL(`${supabaseUrl}/rest/v1/reputation_events`);
+              evUrl.searchParams.set('id', `eq.${reclData.event_id}`);
+              await fetch(evUrl.toString(), {
+                method: 'PATCH',
+                headers: {
+                  'Content-Type': 'application/json',
+                  apikey: supabaseKey,
+                  Authorization: `Bearer ${supabaseKey}`,
+                  Prefer: 'return=minimal',
+                },
+                body: JSON.stringify({ score_after: scoreAfter }),
+              });
+            }
+          }
+        }
+
+        // 6. Emit OTel reclassification span
+        if ((otelExporter as any)?.recordReclassification) {
+          (otelExporter as any).recordReclassification({
+            agent_id: agentId,
+            checkpoint_id: checkpointId,
+            trace_id: traceId,
+            before_verdict: reclData?.before_verdict ?? 'unknown',
+            after_classification: 'clear',
+            reason: `Card gap resolved: ${amendment.tool_name}`,
+            score_before: reclData?.score_before ?? undefined,
+            score_after: scoreAfter ?? undefined,
+          });
+        }
+
+        // 7. Request re-proofing (fire-and-forget)
+        if (env.PROVER_URL && env.PROVER_API_KEY) {
+          try {
+            // Check for existing completed verdict_proof for this checkpoint
+            const proofUrl = new URL(`${supabaseUrl}/rest/v1/verdict_proofs`);
+            proofUrl.searchParams.set('checkpoint_id', `eq.${checkpointId}`);
+            proofUrl.searchParams.set('status', 'eq.completed');
+            proofUrl.searchParams.set('select', 'id,analysis_json,thinking_hash,card_hash,values_hash,model');
+            proofUrl.searchParams.set('limit', '1');
+            proofUrl.searchParams.set('order', 'created_at.desc');
+            const proofRes = await fetch(proofUrl.toString(), {
+              headers: {
+                apikey: supabaseKey,
+                Authorization: `Bearer ${supabaseKey}`,
+              },
+            });
+            if (proofRes.ok) {
+              const proofs = await proofRes.json() as any[];
+              if (proofs.length > 0) {
+                const proof = proofs[0];
+                // Compute new card hash from amended card
+                const cardBytes = new TextEncoder().encode(JSON.stringify(cardJson));
+                const cardHashBuf = await crypto.subtle.digest('SHA-256', cardBytes);
+                const newCardHash = Array.from(new Uint8Array(cardHashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+                fetch(`${env.PROVER_URL}/prove/reproof`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': env.PROVER_API_KEY,
+                  },
+                  body: JSON.stringify({
+                    proof_id: 'vp-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16),
+                    original_proof_id: proof.id,
+                    checkpoint_id: checkpointId,
+                    reclassification_id: reclData?.reclassification_id,
+                    analysis_json: proof.analysis_json,
+                    thinking_hash: proof.thinking_hash,
+                    card_hash: newCardHash,
+                    values_hash: proof.values_hash,
+                    model: proof.model,
+                  }),
+                }).catch(err => console.error('[applyCardAmendment] reproof request failed:', err));
+              }
+            }
+          } catch (reproofErr) {
+            console.error('[applyCardAmendment] reproof check failed:', reproofErr);
+          }
+        }
+
+        console.log(`[applyCardAmendment] Trust recovery chain completed for checkpoint ${checkpointId}`);
+      } catch (recoveryErr) {
+        console.error('[applyCardAmendment] Trust recovery chain failed (non-blocking):', recoveryErr);
+      }
     }
   } catch (error) {
     console.warn('[observer/ddr] Failed to apply card amendment:', error);

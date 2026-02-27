@@ -13,6 +13,7 @@ import {
   policyPublishCommand,
   policyListCommand,
   policyTestCommand,
+  policyEvaluateCommand,
 } from "./commands/policy.js";
 import { registerCommand } from "./commands/register.js";
 import { agentsListCommand, agentsDefaultCommand, agentsRemoveCommand } from "./commands/agents.js";
@@ -234,6 +235,23 @@ policyCmd
     try {
       const opts = program.opts();
       await policyTestCommand(file, opts.agent);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command("evaluate")
+  .argument("<file>", "Path to policy JSON file")
+  .option("--card <file>", "Path to alignment card JSON file")
+  .option("--tools <tools>", "Comma-separated list of tool names")
+  .option("--tool-manifest <file>", "Path to tool manifest JSON file")
+  .option("--strict", "Exit with code 1 on warnings (not just failures)")
+  .description("Evaluate policy against tools locally (for CI/CD)")
+  .action(async (file: string, options: { card?: string; tools?: string; toolManifest?: string; strict?: boolean }) => {
+    try {
+      await policyEvaluateCommand(file, options);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
