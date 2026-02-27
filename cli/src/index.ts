@@ -13,9 +13,11 @@ import {
   policyPublishCommand,
   policyListCommand,
   policyTestCommand,
+  policyEvaluateCommand,
 } from "./commands/policy.js";
 import { registerCommand } from "./commands/register.js";
 import { agentsListCommand, agentsDefaultCommand, agentsRemoveCommand } from "./commands/agents.js";
+import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
 
 program
   .name("smoltbot")
@@ -240,6 +242,23 @@ policyCmd
     }
   });
 
+policyCmd
+  .command("evaluate")
+  .argument("<file>", "Path to policy JSON file")
+  .option("--card <file>", "Path to alignment card JSON file")
+  .option("--tools <tools>", "Comma-separated list of tool names")
+  .option("--tool-manifest <file>", "Path to tool manifest JSON file")
+  .option("--strict", "Exit with code 1 on warnings (not just failures)")
+  .description("Evaluate policy against tools locally (for CI/CD)")
+  .action(async (file: string, options: { card?: string; tools?: string; toolManifest?: string; strict?: boolean }) => {
+    try {
+      await policyEvaluateCommand(file, options);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
 program
   .command("register <name>")
   .description("Register a new named agent")
@@ -291,6 +310,42 @@ agentsCmd
   .action(async (name: string) => {
     try {
       await agentsRemoveCommand(name);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("login")
+  .description("Authenticate with your Mnemom account")
+  .action(async () => {
+    try {
+      await loginCommand();
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logout")
+  .description("Clear stored authentication credentials")
+  .action(async () => {
+    try {
+      await logoutCommand();
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("whoami")
+  .description("Show current authentication status")
+  .action(async () => {
+    try {
+      await whoamiCommand();
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);

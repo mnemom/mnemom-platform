@@ -4,7 +4,14 @@ import { configExists, loadConfig, getActiveAgent } from "../lib/config.js";
 import { fmt } from "../lib/format.js";
 import { askYesNo, isInteractive } from "../lib/prompt.js";
 import { getPolicy, publishPolicy, type PolicyResponse } from "../lib/api.js";
-import { validatePolicySchema, type ValidationResult } from "@mnemom/policy-engine";
+import { requireAccessToken } from "../lib/auth.js";
+import {
+  validatePolicySchema,
+  evaluatePolicy,
+  type ValidationResult,
+  type Policy,
+  type EvaluationResult,
+} from "@mnemom/policy-engine";
 
 // ============================================================================
 // YAML parsing (minimal — parse structured YAML without external dep)
@@ -309,6 +316,9 @@ export async function policyPublishCommand(
   console.log(fmt.success("Policy schema is valid"));
   console.log();
 
+  // Require authentication
+  await requireAccessToken();
+
   // Confirm
   if (isInteractive()) {
     const meta = (parsed as any).meta;
@@ -443,6 +453,9 @@ export async function policyTestCommand(
     process.exit(1);
   }
 
+  // Require authentication
+  await requireAccessToken();
+
   console.log(`\nTesting policy against historical traces for agent ${agent.agentId}...\n`);
 
   try {
@@ -478,6 +491,169 @@ export async function policyTestCommand(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.log("\n" + fmt.error(`Failed to test policy: ${message}`) + "\n");
+    process.exit(1);
+  }
+}
+
+/**
+ * smoltbot policy evaluate <policy-file> --card <card-file> --tools <tools> — local CI/CD evaluation
+ *
+ * Runs entirely locally using the embedded policy engine. No API key needed.
+ */
+export async function policyEvaluateCommand(
+  file: string,
+  options: { card?: string; tools?: string; toolManifest?: string; strict?: boolean }
+): Promise<void> {
+  // 1. Read + validate policy file
+  const policyPath = path.resolve(file);
+  if (!fs.existsSync(policyPath)) {
+    console.log("\n" + fmt.error(`Policy file not found: ${policyPath}`) + "\n");
+    process.exit(1);
+  }
+
+  let policyRaw: string;
+  try {
+    policyRaw = fs.readFileSync(policyPath, "utf-8");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.log("\n" + fmt.error(`Could not read policy file: ${msg}`) + "\n");
+    process.exit(1);
+  }
+
+  let policyParsed: Record<string, unknown>;
+  try {
+    policyParsed = parsePolicyFile(policyRaw, policyPath);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.log("\n" + fmt.error(msg) + "\n");
+    process.exit(1);
+  }
+
+  const validation = validatePolicySchema(policyParsed);
+  if (!validation.valid) {
+    console.log(fmt.error("Policy validation failed:"));
+    for (const error of validation.errors) {
+      console.log(fmt.error(`  ${error.path}: ${error.message}`));
+    }
+    console.log();
+    process.exit(1);
+  }
+
+  // 2. Read + parse card file
+  let cardContent: Record<string, unknown> = {};
+  if (options.card) {
+    const cardPath = path.resolve(options.card);
+    if (!fs.existsSync(cardPath)) {
+      console.log("\n" + fmt.error(`Card file not found: ${cardPath}`) + "\n");
+      process.exit(1);
+    }
+    try {
+      const cardRaw = fs.readFileSync(cardPath, "utf-8");
+      cardContent = JSON.parse(cardRaw);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log("\n" + fmt.error(`Could not read card file: ${msg}`) + "\n");
+      process.exit(1);
+    }
+  }
+
+  // 3. Parse tool list from --tools or --tool-manifest
+  let tools: { name: string }[] = [];
+  if (options.tools) {
+    tools = options.tools.split(",").map((t) => ({ name: t.trim() })).filter((t) => t.name);
+  } else if (options.toolManifest) {
+    const manifestPath = path.resolve(options.toolManifest);
+    if (!fs.existsSync(manifestPath)) {
+      console.log("\n" + fmt.error(`Tool manifest file not found: ${manifestPath}`) + "\n");
+      process.exit(1);
+    }
+    try {
+      const manifestRaw = fs.readFileSync(manifestPath, "utf-8");
+      const manifest = JSON.parse(manifestRaw);
+      if (Array.isArray(manifest)) {
+        tools = manifest.map((t: string | { name: string }) =>
+          typeof t === "string" ? { name: t } : { name: t.name }
+        );
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log("\n" + fmt.error(`Could not read tool manifest: ${msg}`) + "\n");
+      process.exit(1);
+    }
+  }
+
+  if (tools.length === 0) {
+    console.log("\n" + fmt.error("No tools specified. Use --tools or --tool-manifest") + "\n");
+    process.exit(1);
+  }
+
+  // 4. Run evaluation
+  const result: EvaluationResult = evaluatePolicy({
+    context: "cicd",
+    policy: policyParsed as unknown as Policy,
+    card: cardContent,
+    tools,
+  });
+
+  // 5. Display results
+  console.log(fmt.header("Policy Evaluation Report"));
+  console.log();
+  console.log(fmt.label("  Policy:", ` ${(policyParsed as any).meta?.name ?? "unknown"}`));
+  console.log(fmt.label("  Context:", " cicd"));
+  console.log(fmt.label("  Tools:", ` ${tools.length} (${tools.map((t) => t.name).join(", ")})`));
+  console.log();
+
+  // Verdict
+  if (result.verdict === "pass") {
+    console.log(fmt.success("PASS — all tools comply with policy"));
+  } else if (result.verdict === "warn") {
+    console.log(fmt.warn("WARN — policy warnings detected"));
+  } else {
+    console.log(fmt.error("FAIL — policy violations detected"));
+  }
+  console.log();
+
+  // Violations
+  if (result.violations.length > 0) {
+    console.log(fmt.section("Violations"));
+    console.log();
+    for (const v of result.violations) {
+      console.log(fmt.error(`  ${v.tool} [${v.severity}] — ${v.type}`));
+      console.log(`    ${v.reason}`);
+    }
+  }
+
+  // Warnings
+  if (result.warnings.length > 0) {
+    console.log(fmt.section("Warnings"));
+    console.log();
+    for (const w of result.warnings) {
+      console.log(fmt.warn(`  ${w.tool} — ${w.type}`));
+      console.log(`    ${w.reason}`);
+    }
+  }
+
+  // Coverage
+  const cov = result.coverage;
+  console.log(fmt.section("Coverage"));
+  console.log();
+  console.log(fmt.label("  Card actions:", ` ${cov.total_card_actions}`));
+  console.log(fmt.label("  Mapped:      ", ` ${cov.mapped_card_actions.length}`));
+  console.log(fmt.label("  Unmapped:    ", ` ${cov.unmapped_card_actions.length}`));
+  console.log(fmt.label("  Coverage:    ", ` ${cov.coverage_pct.toFixed(1)}%`));
+  if (cov.unmapped_card_actions.length > 0) {
+    console.log(fmt.label("  Unmapped list:", ` ${cov.unmapped_card_actions.join(", ")}`));
+  }
+
+  console.log();
+  console.log(fmt.label("  Duration:", ` ${result.duration_ms}ms`));
+  console.log();
+
+  // 6. Exit code
+  if (result.verdict === "fail") {
+    process.exit(1);
+  }
+  if (options.strict && result.verdict === "warn") {
     process.exit(1);
   }
 }

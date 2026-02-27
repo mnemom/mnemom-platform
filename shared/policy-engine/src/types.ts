@@ -31,6 +31,8 @@ export interface PolicyDefaults {
   unmapped_tool_action: 'allow' | 'deny' | 'warn';
   unmapped_severity: 'critical' | 'high' | 'medium' | 'low';
   fail_open: boolean;
+  enforcement_mode?: 'warn' | 'enforce' | 'off';
+  grace_period_hours?: number;
 }
 
 export interface Policy {
@@ -108,10 +110,18 @@ export interface CoverageReport {
   coverage_pct: number;
 }
 
+export interface CardGap {
+  tool: string;
+  capability: string;
+  missing_card_actions: string[];
+  reason: string;
+}
+
 export interface EvaluationResult {
   verdict: 'pass' | 'fail' | 'warn';
   violations: PolicyViolation[];
   warnings: PolicyWarning[];
+  card_gaps: CardGap[];
   coverage: CoverageReport;
   policy_id: string;
   policy_version: number;

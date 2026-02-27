@@ -451,6 +451,12 @@ describe('handleAnthropicProxy', () => {
       }),
     });
 
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
+    });
+
     // Forward request — must be a real Response so .text() works
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ id: 'msg_123' }), {
@@ -472,9 +478,9 @@ describe('handleAnthropicProxy', () => {
     await handleAnthropicProxy(request, env, ctx);
 
     // Verify forward request was made
-    // Calls: 1) agent lookup, 2) quota context RPC, 3) forward to CF gateway
-    expect(mockFetch.mock.calls.length).toBeGreaterThanOrEqual(3);
-    const forwardCall = mockFetch.mock.calls[2];
+    // Calls: 1) agent lookup, 2) quota context RPC, 3) policy fetch RPC, 4) forward to CF gateway
+    expect(mockFetch.mock.calls.length).toBeGreaterThanOrEqual(4);
+    const forwardCall = mockFetch.mock.calls[3];
     expect(forwardCall[0].url).toContain(env.CF_AI_GATEWAY_URL);
   });
 
@@ -511,6 +517,12 @@ describe('handleAnthropicProxy', () => {
       }),
     });
 
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
+    });
+
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -527,7 +539,7 @@ describe('handleAnthropicProxy', () => {
 
     await handleAnthropicProxy(request, env, ctx);
 
-    const forwardCall = mockFetch.mock.calls[2];
+    const forwardCall = mockFetch.mock.calls[3];
     expect(forwardCall[0].url).toBe(`${env.CF_AI_GATEWAY_URL}/anthropic/v1/messages`);
   });
 
@@ -564,6 +576,12 @@ describe('handleAnthropicProxy', () => {
       }),
     });
 
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
+    });
+
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -580,7 +598,7 @@ describe('handleAnthropicProxy', () => {
 
     await handleAnthropicProxy(request, env, ctx);
 
-    const forwardCall = mockFetch.mock.calls[2];
+    const forwardCall = mockFetch.mock.calls[3];
     const forwardRequest = forwardCall[0] as Request;
     const metadataHeader = forwardRequest.headers.get('cf-aig-metadata');
 
@@ -622,6 +640,12 @@ describe('handleAnthropicProxy', () => {
         agent_settings: null,
         per_proof_price: 0,
       }),
+    });
+
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
     });
 
     // Must be a real Response so .text() works when the AIP pipeline buffers it
@@ -672,6 +696,12 @@ describe('handleAnthropicProxy', () => {
         agent_settings: null,
         per_proof_price: 0,
       }),
+    });
+
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
     });
 
     mockFetch.mockResolvedValueOnce({
@@ -745,6 +775,12 @@ describe('handleAnthropicProxy', () => {
       }),
     });
 
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
+    });
+
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -761,7 +797,7 @@ describe('handleAnthropicProxy', () => {
 
     await handleAnthropicProxy(request, env, ctx);
 
-    const forwardCall = mockFetch.mock.calls[2];
+    const forwardCall = mockFetch.mock.calls[3];
     expect(forwardCall[0].url).toContain('?stream=true');
   });
 });
@@ -889,6 +925,12 @@ describe('Request handler integration', () => {
       }),
     });
 
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
+    });
+
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -944,6 +986,12 @@ describe('Request handler integration', () => {
         agent_settings: null,
         per_proof_price: 0,
       }),
+    });
+
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
     });
 
     mockFetch.mockResolvedValueOnce({
@@ -1590,6 +1638,13 @@ describe('Billing enforcement integration', () => {
 
     mockAgentLookupAndForward();
 
+    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
+    });
+
     // resolveQuotaContext RPC (no mnemom key, uses agent hash cache key)
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -1630,6 +1685,13 @@ describe('Billing enforcement integration', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve({ valid: true, account_id: 'ba-acct-valid' }),
+    });
+
+    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
     });
 
     // resolveQuotaContext RPC
@@ -1684,6 +1746,13 @@ describe('Billing enforcement integration', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve({ valid: true, account_id: 'ba-acct-overdue' }),
+    });
+
+    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
     });
 
     // resolveQuotaContext RPC — return a past_due context that triggers rejection
@@ -1792,6 +1861,12 @@ describe('Billing enforcement integration', () => {
       }),
     });
 
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
+    });
+
     // Forward request
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ id: 'msg_789' }), {
@@ -1830,6 +1905,13 @@ describe('Billing enforcement integration', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve({ valid: true, account_id: 'ba-acct-warn' }),
+    });
+
+    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
+    // Policy fetch RPC (returns null — no policy)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(null),
     });
 
     // resolveQuotaContext — team plan at 85% usage
