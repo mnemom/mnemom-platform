@@ -1,29 +1,35 @@
 import { configExists, getAuthInfo, clearAuthTokens } from "../lib/config.js";
-import { login } from "../lib/auth.js";
+import { loginWithBrowser, loginWithPassword } from "../lib/auth.js";
 import { fmt } from "../lib/format.js";
 import { askInput } from "../lib/prompt.js";
 
-export async function loginCommand(): Promise<void> {
+export async function loginCommand(options: { noBrowser?: boolean } = {}): Promise<void> {
   if (!configExists()) {
     console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
     console.log("Run `smoltbot init` to get started.\n");
     process.exit(1);
   }
 
-  const email = await askInput("Email:");
-  if (!email) {
-    console.log(fmt.error("Email is required."));
-    process.exit(1);
-  }
-
-  const password = await askInput("Password:", true);
-  if (!password) {
-    console.log(fmt.error("Password is required."));
-    process.exit(1);
-  }
-
   try {
-    const tokens = await login(email, password);
+    let tokens;
+    if (options.noBrowser) {
+      const email = await askInput("Email:");
+      if (!email) {
+        console.log(fmt.error("Email is required."));
+        process.exit(1);
+      }
+
+      const password = await askInput("Password:", true);
+      if (!password) {
+        console.log(fmt.error("Password is required."));
+        process.exit(1);
+      }
+
+      tokens = await loginWithPassword(email, password);
+    } else {
+      tokens = await loginWithBrowser();
+    }
+
     console.log();
     console.log(fmt.success("Logged in successfully!"));
     console.log(fmt.label("  Email:  ", ` ${tokens.email}`));

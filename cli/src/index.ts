@@ -319,9 +319,10 @@ agentsCmd
 program
   .command("login")
   .description("Authenticate with your Mnemom account")
-  .action(async () => {
+  .option("--no-browser", "Use email/password prompt instead of browser")
+  .action(async (options) => {
     try {
-      await loginCommand();
+      await loginCommand({ noBrowser: options.browser === false });
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
