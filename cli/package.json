@@ -7,7 +7,7 @@
     "smoltbot": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build --prefix ../shared/policy-engine && tsc",
     "dev": "tsx src/index.ts",
     "test": "vitest"
   },

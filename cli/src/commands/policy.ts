@@ -4,6 +4,7 @@ import { configExists, loadConfig, getActiveAgent } from "../lib/config.js";
 import { fmt } from "../lib/format.js";
 import { askYesNo, isInteractive } from "../lib/prompt.js";
 import { getPolicy, publishPolicy, type PolicyResponse } from "../lib/api.js";
+import { requireAccessToken } from "../lib/auth.js";
 import {
   validatePolicySchema,
   evaluatePolicy,
@@ -315,6 +316,9 @@ export async function policyPublishCommand(
   console.log(fmt.success("Policy schema is valid"));
   console.log();
 
+  // Require authentication
+  await requireAccessToken();
+
   // Confirm
   if (isInteractive()) {
     const meta = (parsed as any).meta;
@@ -448,6 +452,9 @@ export async function policyTestCommand(
     console.log();
     process.exit(1);
   }
+
+  // Require authentication
+  await requireAccessToken();
 
   console.log(`\nTesting policy against historical traces for agent ${agent.agentId}...\n`);
 
