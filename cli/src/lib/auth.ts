@@ -1,3 +1,6 @@
+import * as http from "node:http";
+import * as crypto from "node:crypto";
+import { exec } from "node:child_process";
 import { getApiUrl, getAuthInfo, saveAuthTokens, type AuthTokens } from "./config.js";
 
 /**
@@ -42,9 +45,167 @@ export async function requireAccessToken(): Promise<string> {
 }
 
 /**
- * Authenticate with email + password via the API auth proxy.
+ * Authenticate via browser-based login flow.
+ *
+ * 1. Start a local HTTP server on a random port
+ * 2. Generate a random `state` nonce for CSRF protection
+ * 3. Open the browser to the API's CLI login page
+ * 4. Wait for the login page to POST tokens back to localhost
+ * 5. Verify state, store tokens, and close the server
  */
-export async function login(
+export async function loginWithBrowser(): Promise<AuthTokens> {
+  const state = crypto.randomBytes(16).toString("hex");
+
+  const { port, tokenPromise, close } = startCallbackServer(state);
+  const loginUrl = `${getApiUrl()}/v1/auth/cli?port=${port}&state=${state}`;
+
+  console.log("Opening browser to authenticate...");
+  console.log(`If the browser doesn't open, visit:\n  ${loginUrl}\n`);
+  openBrowser(loginUrl);
+
+  console.log("Waiting for authentication...");
+  try {
+    const tokens = await tokenPromise;
+    saveAuthTokens(tokens);
+    return tokens;
+  } finally {
+    close();
+  }
+}
+
+/**
+ * Start a local HTTP server that listens for the auth callback POST.
+ * Returns the assigned port, a promise that resolves with tokens, and a close function.
+ */
+function startCallbackServer(expectedState: string): {
+  port: number;
+  tokenPromise: Promise<AuthTokens>;
+  close: () => void;
+} {
+  let resolveTokens: (tokens: AuthTokens) => void;
+  let rejectTokens: (err: Error) => void;
+  const tokenPromise = new Promise<AuthTokens>((resolve, reject) => {
+    resolveTokens = resolve;
+    rejectTokens = reject;
+  });
+
+  const server = http.createServer((req, res) => {
+    // Handle CORS preflight for the POST from the browser page
+    if (req.method === "OPTIONS") {
+      res.writeHead(200, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      });
+      res.end();
+      return;
+    }
+
+    if (req.method !== "POST" || req.url !== "/callback") {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not found");
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // Limit body size to prevent abuse
+      if (body.length > 1_000_000) {
+        req.destroy();
+        rejectTokens(new Error("Callback body too large"));
+      }
+    });
+
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body) as {
+          access_token: string;
+          refresh_token: string;
+          expires_in: number;
+          user_id: string;
+          user_email: string;
+          state: string;
+        };
+
+        if (data.state !== expectedState) {
+          res.writeHead(403, {
+            "Content-Type": "text/html",
+            "Access-Control-Allow-Origin": "*",
+          });
+          res.end("<html><body><h2>Authentication failed</h2><p>State mismatch. Please try again.</p></body></html>");
+          rejectTokens(new Error("State mismatch — possible CSRF attack"));
+          return;
+        }
+
+        const tokens: AuthTokens = {
+          accessToken: data.access_token,
+          refreshToken: data.refresh_token,
+          expiresAt: Math.floor(Date.now() / 1000) + data.expires_in,
+          userId: data.user_id,
+          email: data.user_email,
+        };
+
+        res.writeHead(200, {
+          "Content-Type": "text/html",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px">
+<h2>Authenticated!</h2>
+<p>You can close this tab and return to the terminal.</p>
+</body></html>`);
+
+        resolveTokens(tokens);
+      } catch {
+        res.writeHead(400, {
+          "Content-Type": "text/html",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end("<html><body><h2>Authentication failed</h2><p>Invalid callback data.</p></body></html>");
+        rejectTokens(new Error("Invalid callback data"));
+      }
+    });
+  });
+
+  // Listen on port 0 to get an OS-assigned available port
+  server.listen(0, "127.0.0.1");
+  const addr = server.address() as { port: number };
+
+  // Auto-timeout after 5 minutes
+  const timeout = setTimeout(() => {
+    rejectTokens(new Error("Login timed out. Please try again."));
+    server.close();
+  }, 5 * 60 * 1000);
+
+  return {
+    port: addr.port,
+    tokenPromise,
+    close: () => {
+      clearTimeout(timeout);
+      server.close();
+    },
+  };
+}
+
+/**
+ * Open a URL in the user's default browser.
+ */
+function openBrowser(url: string): void {
+  const cmd =
+    process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "start"
+        : "xdg-open";
+
+  exec(`${cmd} ${JSON.stringify(url)}`);
+}
+
+/**
+ * Authenticate with email + password via the API auth proxy.
+ * Used by --no-browser fallback.
+ */
+export async function loginWithPassword(
   email: string,
   password: string
 ): Promise<AuthTokens> {
