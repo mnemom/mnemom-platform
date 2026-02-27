@@ -24,6 +24,12 @@ const GATEWAY_URLS: Record<Environment, string> = {
   local: "http://localhost:8787",
 };
 
+const WEBSITE_URLS: Record<Environment, string> = {
+  production: "https://www.mnemom.ai",
+  staging: "https://staging.mnemom.ai",
+  local: "http://localhost:5173",
+};
+
 /**
  * Resolve the active environment.
  *
@@ -43,6 +49,10 @@ export function getApiUrl(): string {
 
 export function getGatewayUrl(): string {
   return GATEWAY_URLS[getEnvironment()];
+}
+
+export function getWebsiteUrl(): string {
+  return WEBSITE_URLS[getEnvironment()];
 }
 
 // ---------------------------------------------------------------------------
