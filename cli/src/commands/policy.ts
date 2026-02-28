@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { configExists, loadConfig, getActiveAgent } from "../lib/config.js";
+import { requireAgent } from "../lib/config.js";
 import { fmt } from "../lib/format.js";
 import { askYesNo, isInteractive } from "../lib/prompt.js";
 import { getPolicy, publishPolicy, type PolicyResponse } from "../lib/api.js";
@@ -254,25 +254,7 @@ export async function policyPublishCommand(
   file: string,
   agentName?: string
 ): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
-    process.exit(1);
-  }
-
-  const config = loadConfig();
-  if (!config) {
-    console.log("\n" + fmt.error("Failed to load configuration") + "\n");
-    process.exit(1);
-  }
-
-  const agent = getActiveAgent(agentName);
-  if (!agent) {
-    console.log(
-      "\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n"
-    );
-    process.exit(1);
-  }
+  const agent = requireAgent(agentName);
 
   const filePath = path.resolve(file);
   if (!fs.existsSync(filePath)) {
@@ -350,25 +332,7 @@ export async function policyPublishCommand(
  * smoltbot policy list — list active policies for current agent
  */
 export async function policyListCommand(agentName?: string): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
-    process.exit(1);
-  }
-
-  const config = loadConfig();
-  if (!config) {
-    console.log("\n" + fmt.error("Failed to load configuration") + "\n");
-    process.exit(1);
-  }
-
-  const agent = getActiveAgent(agentName);
-  if (!agent) {
-    console.log(
-      "\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n"
-    );
-    process.exit(1);
-  }
+  const agent = requireAgent(agentName);
 
   console.log("\nFetching policy...\n");
 
@@ -398,25 +362,7 @@ export async function policyTestCommand(
   file: string,
   agentName?: string
 ): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
-    process.exit(1);
-  }
-
-  const config = loadConfig();
-  if (!config) {
-    console.log("\n" + fmt.error("Failed to load configuration") + "\n");
-    process.exit(1);
-  }
-
-  const agent = getActiveAgent(agentName);
-  if (!agent) {
-    console.log(
-      "\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n"
-    );
-    process.exit(1);
-  }
+  const agent = requireAgent(agentName);
 
   const filePath = path.resolve(file);
   if (!fs.existsSync(filePath)) {
