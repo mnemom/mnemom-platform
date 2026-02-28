@@ -179,11 +179,11 @@ export function saveConfig(config: ConfigV2): void {
  * Resolve the active agent config.
  *
  * Resolution order:
- *  1. Explicit `agentName` parameter
+ *  1. Explicit `agentName` parameter (--agent flag)
  *  2. `SMOLTBOT_AGENT` environment variable
- *  3. `config.defaultAgent`
  *
- * Returns `null` if the config doesn't exist or the agent is not found.
+ * Returns `null` if no agent is specified or the agent is not found.
+ * Callers must require --agent or SMOLTBOT_AGENT for agent-scoped commands.
  */
 export function getActiveAgent(agentName?: string): AgentConfig | null {
   const config = loadConfig();
@@ -193,10 +193,45 @@ export function getActiveAgent(agentName?: string): AgentConfig | null {
 
   const name =
     agentName ??
-    process.env.SMOLTBOT_AGENT ??
-    config.defaultAgent;
+    process.env.SMOLTBOT_AGENT;
+
+  if (!name) {
+    return null;
+  }
 
   return config.agents[name] ?? null;
+}
+
+/**
+ * Require an explicit agent selection. Exits with a helpful error if
+ * no agent was specified via --agent or SMOLTBOT_AGENT.
+ */
+export function requireAgent(agentName?: string): AgentConfig {
+  if (!configExists()) {
+    console.error("\nsmoltbot is not initialized. Run `smoltbot init` first.\n");
+    process.exit(1);
+  }
+
+  const agent = getActiveAgent(agentName);
+  if (!agent) {
+    if (!agentName && !process.env.SMOLTBOT_AGENT) {
+      console.error("\nAgent required. Use --agent <name> or set SMOLTBOT_AGENT.\n");
+      console.error("Available agents:");
+
+      const config = loadConfig();
+      if (config) {
+        for (const [name, a] of Object.entries(config.agents)) {
+          console.error(`  ${name} (${a.agentId})`);
+        }
+      }
+      console.error();
+    } else {
+      console.error(`\nAgent not found: ${agentName || process.env.SMOLTBOT_AGENT}\n`);
+    }
+    process.exit(1);
+  }
+
+  return agent;
 }
 
 // ---------------------------------------------------------------------------

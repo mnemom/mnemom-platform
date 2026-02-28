@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { configExists, loadConfig, getActiveAgent } from "../lib/config.js";
+import { configExists, loadConfig, requireAgent } from "../lib/config.js";
 import {
   getCard,
   updateCard,
@@ -314,7 +314,7 @@ export async function cardShowCommand(agentName?: string): Promise<void> {
     process.exit(1);
   }
 
-  const agent = getActiveAgent(agentName);
+  const agent = requireAgent(agentName);
   if (!agent) {
     console.log("\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
     process.exit(1);
@@ -353,7 +353,7 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
     process.exit(1);
   }
 
-  const agent = getActiveAgent(agentName);
+  const agent = requireAgent(agentName);
   if (!agent) {
     console.log("\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
     process.exit(1);
