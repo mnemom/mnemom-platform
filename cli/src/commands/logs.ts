@@ -1,4 +1,4 @@
-import { configExists, loadConfig, getActiveAgent } from "../lib/config.js";
+import { requireAgent, loadConfig } from "../lib/config.js";
 import { getTraces, type Trace } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
@@ -8,23 +8,8 @@ export interface LogsOptions {
 }
 
 export async function logsCommand(options: LogsOptions = {}): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
-    process.exit(1);
-  }
-
-  const config = loadConfig();
-  if (!config) {
-    console.log("\n" + fmt.error("Failed to load configuration") + "\n");
-    process.exit(1);
-  }
-
-  const agent = getActiveAgent(options.agentName);
-  if (!agent) {
-    console.log("\n" + fmt.error(`Agent not found${options.agentName ? `: ${options.agentName}` : ""}`) + "\n");
-    process.exit(1);
-  }
+  const agent = requireAgent(options.agentName);
+  const config = loadConfig()!;
 
   const limit = options.limit || 10;
 

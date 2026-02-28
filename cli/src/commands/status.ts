@@ -1,4 +1,4 @@
-import { configExists, loadConfig, getActiveAgent, type AgentConfig } from "../lib/config.js";
+import { configExists, loadConfig, requireAgent, type AgentConfig } from "../lib/config.js";
 import { getAgent, getIntegrity, getTraces, API_BASE } from "../lib/api.js";
 import {
   detectOpenClaw,
@@ -52,12 +52,7 @@ export async function statusCommand(agentName?: string): Promise<void> {
   }
 
   const config = loadConfig()!;
-  const agent = getActiveAgent(agentName);
-  if (!agent) {
-    console.log(fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
-    console.log("Run `smoltbot register <name>` to register a new agent.\n");
-    process.exit(1);
-  }
+  const agent = requireAgent(agentName);
 
   // 2. Check OpenClaw configuration
   const openclawCheck = checkOpenClawConfig();
