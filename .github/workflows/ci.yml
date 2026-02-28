@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, staging]
+    branches: [main]
   pull_request:
-    branches: [main, staging]
+    branches: [main]
   merge_group:
   workflow_call:
   workflow_dispatch:
@@ -129,7 +129,7 @@ jobs:
             {
               "repo": "${{ github.event.repository.name }}",
               "sha": "${{ github.sha }}",
-              "environment": "${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}"
+              "environment": "staging"
             }
 
   # Weekly Node.js compatibility matrix for CLI (18, 22)
