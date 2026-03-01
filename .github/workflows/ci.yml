@@ -132,6 +132,32 @@ jobs:
               "environment": "staging"
             }
 
+  deploy-context:
+    name: Deploy Context
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.DEPLOY_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          owner: mnemom
+      - uses: actions/checkout@v4
+        with:
+          repository: mnemom/deploy
+          path: .deploy-actions
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: .github/actions/pr-deploy-context
+      - uses: ./.deploy-actions/.github/actions/pr-deploy-context
+        with:
+          repo-name: ${{ github.event.repository.name }}
+          github-token: ${{ github.token }}
+
   # Weekly Node.js compatibility matrix for CLI (18, 22)
   # Node 20 is tested on every push/PR above
   cli-compat:
