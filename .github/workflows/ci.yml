@@ -156,7 +156,7 @@ jobs:
       - uses: ./.deploy-actions/.github/actions/pr-deploy-context
         with:
           repo-name: ${{ github.event.repository.name }}
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ github.token }}
 
   # Weekly Node.js compatibility matrix for CLI (18, 22)
   # Node 20 is tested on every push/PR above
