@@ -45,7 +45,7 @@ jobs:
           fi
 
       - name: Publish
-        if: steps.check.outputs.skip \!= 'true'
+        if: steps.check.outputs.skip != 'true'
         working-directory: ${{ inputs.npm-directory }}
         run: npm publish --access public
         env:
