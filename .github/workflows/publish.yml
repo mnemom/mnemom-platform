@@ -1,0 +1,52 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dispatch-id:
+        description: "Correlation ID from deploy orchestrator"
+        required: false
+        type: string
+      npm-directory:
+        description: "Directory containing package.json to publish"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install and build
+        working-directory: ${{ inputs.npm-directory }}
+        run: |
+          npm ci || npm install
+          npm run build --if-present
+
+      - name: Check if already published
+        id: check
+        working-directory: ${{ inputs.npm-directory }}
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          PUBLISHED=$(npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null || echo "")
+          if [ "$PUBLISHED" = "$PKG_VERSION" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$PKG_NAME@$PKG_VERSION already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Will publish $PKG_NAME@$PKG_VERSION"
+          fi
+
+      - name: Publish
+        if: steps.check.outputs.skip \!= 'true'
+        working-directory: ${{ inputs.npm-directory }}
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
