@@ -76,8 +76,9 @@ interface GatewayMetadata {
   agent_id: string;
   agent_hash: string;
   session_id: string;
-  timestamp: string;
+  timestamp?: string; // No longer sent — CF log created_at is used instead
   gateway_version: string;
+  agent_name?: string;
 }
 
 interface HaikuAnalysis {
