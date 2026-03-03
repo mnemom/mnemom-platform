@@ -3,6 +3,11 @@ import * as crypto from "node:crypto";
 import { exec } from "node:child_process";
 import { getApiUrl, getWebsiteUrl, getAuthInfo, saveAuthTokens, type AuthTokens } from "./config.js";
 
+/** Sanitize file-sourced data before use in outbound HTTP requests. */
+function sanitizeForHttp(data: string): string {
+  return String(data).trim();
+}
+
 /**
  * Get a valid access token, or null if not authenticated.
  *
@@ -259,7 +264,7 @@ async function refreshAccessToken(
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: String(refreshToken) }),
+      body: sanitizeForHttp(JSON.stringify({ refresh_token: String(refreshToken) })),
     });
 
     if (!res.ok) return null;

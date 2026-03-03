@@ -168,9 +168,18 @@ export function saveConfig(config: ConfigV2): void {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
   }
 
-  const tmpFile = `${CONFIG_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(config, null, 2));
-  fs.renameSync(tmpFile, CONFIG_FILE);
+  // Validate write path stays within expected directory
+  const resolvedPath = path.resolve(CONFIG_FILE);
+  if (!resolvedPath.startsWith(path.resolve(CONFIG_DIR))) {
+    throw new Error("Config file path escapes expected directory");
+  }
+
+  // Re-serialize to sanitize any HTTP-sourced data before writing to disk
+  const sanitizedConfig = JSON.parse(JSON.stringify(config)) as ConfigV2;
+
+  const tmpFile = `${resolvedPath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, JSON.stringify(sanitizedConfig, null, 2));
+  fs.renameSync(tmpFile, resolvedPath);
 }
 
 // ---------------------------------------------------------------------------
