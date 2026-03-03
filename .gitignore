@@ -7,6 +7,9 @@ dist/
 *.tsbuildinfo
 target/
 
+# Coverage reports
+coverage/
+
 # Proxy
 proxy/package-lock.json
 
