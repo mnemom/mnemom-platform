@@ -37,6 +37,9 @@ import {
   type ToolReference,
 } from '@mnemom/policy-engine';
 
+const AAP_VERSION = '1.0';
+const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -423,6 +426,9 @@ async function processLog(
 
   // Check for behavioral drift (runs in background)
   ctx.waitUntil(checkForDrift(agent_id, card, env, otelExporter));
+
+  // Deliver AAP webhooks (runs in background)
+  ctx.waitUntil(deliverAAPWebhooks(trace, verification, policyResult, env));
 
   // Delete processed log for privacy
   await deleteLog(log.id, env);
@@ -2790,6 +2796,233 @@ async function expireStaleNudges(env: Env): Promise<void> {
     }
   } catch (error) {
     console.error('[observer/nudge] Error expiring nudges:', error);
+  }
+}
+
+// ============================================================================
+// AAP Webhook Delivery
+// ============================================================================
+
+async function hmacSign(secret: string, payload: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function determineAAPEventTypes(
+  trace: APTrace,
+  verification: VerificationResult | null,
+  policyResult: EvaluationResult | null
+): string[] {
+  const events: string[] = ['trace.created'];
+
+  if (verification) {
+    if (verification.passed) {
+      events.push('trace.verified');
+    } else {
+      events.push('trace.failed');
+    }
+  }
+
+  if (trace.escalation?.required) {
+    events.push('trace.escalation_required');
+  }
+
+  if (policyResult?.verdict === 'deny') {
+    events.push('policy.violation');
+  }
+
+  return events;
+}
+
+async function deliverAAPWebhooks(
+  trace: APTrace,
+  verification: VerificationResult | null,
+  policyResult: EvaluationResult | null,
+  env: Env
+): Promise<void> {
+  const timeoutMs = 25000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    // 1. Determine event types for this trace
+    const eventTypes = determineAAPEventTypes(trace, verification, policyResult);
+
+    // 2. Fetch webhook registrations for this agent
+    const regResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?agent_id=eq.${trace.agent_id}&select=*`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+        signal: controller.signal,
+      }
+    );
+
+    if (!regResponse.ok) {
+      console.warn(`[observer/webhook] Failed to fetch registrations: ${regResponse.status}`);
+      return;
+    }
+
+    const registrations = (await regResponse.json()) as Array<{
+      registration_id: string;
+      agent_id: string;
+      callback_url: string;
+      secret: string;
+      events: string[];
+      failure_count: number;
+    }>;
+
+    if (registrations.length === 0) return;
+
+    // 3. Filter registrations by matching event types
+    const matchingRegistrations = registrations.filter(reg => {
+      return reg.events.some(regEvent =>
+        regEvent === '*' ||
+        regEvent === 'trace.*' ||
+        eventTypes.includes(regEvent)
+      );
+    });
+
+    if (matchingRegistrations.length === 0) return;
+
+    // 4. Build webhook payload
+    const webhookPayload = {
+      event: eventTypes[eventTypes.length - 1], // most specific event
+      all_events: eventTypes,
+      timestamp: new Date().toISOString(),
+      trace: {
+        trace_id: trace.trace_id,
+        agent_id: trace.agent_id,
+        session_id: trace.context?.session_id ?? null,
+        decision: trace.decision ? {
+          reasoning: trace.decision.reasoning_summary,
+          alternatives_count: trace.decision.alternatives?.length ?? 0,
+        } : null,
+        verification: verification ? {
+          passed: verification.passed,
+          concerns: verification.concerns ?? [],
+        } : null,
+        escalation: trace.escalation ?? null,
+        policy: policyResult ? {
+          verdict: policyResult.verdict,
+          violations: policyResult.violations?.length ?? 0,
+          warnings: policyResult.warnings?.length ?? 0,
+        } : null,
+      },
+    };
+
+    const payloadString = JSON.stringify(webhookPayload);
+
+    // 5. Deliver to each matching registration
+    for (const reg of matchingRegistrations) {
+      if (controller.signal.aborted) break;
+
+      let delivered = false;
+      let lastError: string | null = null;
+      const retryDelays = [...AAP_WEBHOOK_RETRY_DELAYS_MS];
+
+      const signature = await hmacSign(reg.secret, payloadString);
+
+      for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+        if (controller.signal.aborted) break;
+
+        try {
+          const webhookResponse = await fetch(reg.callback_url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-AAP-Signature': `sha256=${signature}`,
+              'X-AAP-Version': AAP_VERSION,
+            },
+            body: payloadString,
+            signal: controller.signal,
+          });
+
+          if (webhookResponse.ok) {
+            delivered = true;
+            break;
+          }
+
+          lastError = `HTTP ${webhookResponse.status}`;
+        } catch (error) {
+          if (controller.signal.aborted) break;
+          lastError = error instanceof Error ? error.message : String(error);
+        }
+
+        if (attempt < retryDelays.length) {
+          await new Promise(resolve => setTimeout(resolve, retryDelays[attempt]));
+        }
+      }
+
+      // 6. Record delivery
+      try {
+        await fetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
+          method: 'POST',
+          headers: {
+            apikey: env.SUPABASE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({
+            id: `del-${randomHex(12)}`,
+            registration_id: reg.registration_id,
+            checkpoint_id: null,
+            trace_id: trace.trace_id,
+            event_type: eventTypes[eventTypes.length - 1],
+            status: delivered ? 'success' : 'failed',
+            attempts: delivered ? 1 : retryDelays.length + 1,
+            last_attempt_at: new Date().toISOString(),
+            error_message: lastError,
+          }),
+          signal: controller.signal,
+        });
+      } catch (error) {
+        console.warn(`[observer/webhook] Failed to record delivery:`, error);
+      }
+
+      // 7. Increment failure_count if all retries exhausted
+      if (!delivered) {
+        console.warn(`[observer/webhook] All retries exhausted for ${reg.registration_id} -> ${reg.callback_url}`);
+        try {
+          await fetch(
+            `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?registration_id=eq.${reg.registration_id}`,
+            {
+              method: 'PATCH',
+              headers: {
+                apikey: env.SUPABASE_KEY,
+                Authorization: `Bearer ${env.SUPABASE_KEY}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                failure_count: reg.failure_count + 1,
+              }),
+              signal: controller.signal,
+            }
+          );
+        } catch (error) {
+          console.warn(`[observer/webhook] Failed to increment failure_count:`, error);
+        }
+      }
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      console.warn('[observer/webhook] AAP webhook delivery timed out (25s limit)');
+    } else {
+      console.error('[observer/webhook] AAP webhook delivery failed:', error);
+    }
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
