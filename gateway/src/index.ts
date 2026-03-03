@@ -644,6 +644,10 @@ export async function updateLastSeen(agentId: string, env: Env): Promise<void> {
 /**
  * Build the CF AI Gateway metadata header.
  * This metadata is attached to requests for tracing and analysis.
+ *
+ * IMPORTANT: CF AI Gateway enforces a max of 5 key-value pairs.
+ * We omit `timestamp` (redundant with CF's own `created_at` on the log)
+ * so that named agents (with `agent_name`) stay within the limit.
  */
 export function buildMetadataHeader(
   agentId: string,
@@ -656,7 +660,6 @@ export function buildMetadataHeader(
     agent_id: agentId,
     agent_hash: agentHash,
     session_id: sessionId,
-    timestamp: new Date().toISOString(),
     gateway_version: gatewayVersion,
     ...(agentName ? { agent_name: agentName } : {}),
   };

@@ -314,14 +314,18 @@ describe('buildMetadataHeader', () => {
     expect(parsed).toHaveProperty('agent_hash', 'hash123');
     expect(parsed).toHaveProperty('session_id', 'session-456');
     expect(parsed).toHaveProperty('gateway_version', '2.0.0');
-    expect(parsed).toHaveProperty('timestamp');
+    expect(parsed).not.toHaveProperty('timestamp');
   });
 
-  it('should include ISO timestamp', () => {
-    const result = buildMetadataHeader('agent-123', 'hash123', 'session-456', '2.0.0');
-    const parsed = JSON.parse(result);
+  it('should stay within CF AI Gateway 5-pair metadata limit', () => {
+    // Without agent name: 4 pairs
+    const withoutName = JSON.parse(buildMetadataHeader('a', 'h', 's', 'v'));
+    expect(Object.keys(withoutName).length).toBeLessThanOrEqual(5);
 
-    expect(parsed.timestamp).toBe('2024-01-15T10:30:00.000Z');
+    // With agent name: 5 pairs (at limit)
+    const withName = JSON.parse(buildMetadataHeader('a', 'h', 's', 'v', 'blackbeard'));
+    expect(Object.keys(withName).length).toBeLessThanOrEqual(5);
+    expect(withName).toHaveProperty('agent_name', 'blackbeard');
   });
 
   it('should handle special characters in inputs', () => {
@@ -606,7 +610,7 @@ describe('handleAnthropicProxy', () => {
     const metadata = JSON.parse(metadataHeader!);
     expect(metadata).toHaveProperty('agent_id', 'agent-uuid-123');
     expect(metadata).toHaveProperty('session_id');
-    expect(metadata).toHaveProperty('timestamp');
+    expect(Object.keys(metadata).length).toBeLessThanOrEqual(5);
   });
 
   it('should add x-smoltbot-agent and x-smoltbot-session headers to response', async () => {
