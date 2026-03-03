@@ -30,9 +30,9 @@ interface Env {
 }
 
 interface EvaluationResult {
-  verdict: 'allow' | 'deny' | 'warn';
-  violations: Array<{ rule: string; message: string }>;
-  warnings: Array<{ rule: string; message: string }>;
+  verdict: 'pass' | 'fail' | 'warn';
+  violations: Array<{ type: string; tool: string; reason: string; severity: string }>;
+  warnings: Array<{ type: string; tool: string; reason: string }>;
 }
 
 // ============================================================================
@@ -64,7 +64,7 @@ function determineAAPEventTypes(
   const events: string[] = ['trace.created'];
 
   if (verification) {
-    if (verification.passed) {
+    if (verification.verified) {
       events.push('trace.verified');
     } else {
       events.push('trace.failed');
@@ -75,7 +75,7 @@ function determineAAPEventTypes(
     events.push('trace.escalation_required');
   }
 
-  if (policyResult?.verdict === 'deny') {
+  if (policyResult?.verdict === 'fail') {
     events.push('policy.violation');
   }
 
@@ -150,12 +150,12 @@ async function deliverAAPWebhooks(
         agent_id: trace.agent_id,
         session_id: trace.context?.session_id ?? null,
         decision: trace.decision ? {
-          reasoning: trace.decision.reasoning_summary,
-          alternatives_count: trace.decision.alternatives?.length ?? 0,
+          reasoning: trace.decision.selection_reasoning,
+          alternatives_count: trace.decision.alternatives_considered?.length ?? 0,
         } : null,
         verification: verification ? {
-          passed: verification.passed,
-          concerns: verification.concerns ?? [],
+          verified: verification.verified,
+          warnings: verification.warnings ?? [],
         } : null,
         escalation: trace.escalation ?? null,
         policy: policyResult ? {
@@ -291,7 +291,6 @@ function createMockTrace(overrides: Partial<APTrace> = {}): APTrace {
       selection_reasoning: 'Test reasoning',
       values_applied: ['helpfulness'],
       confidence: 0.9,
-      reasoning_summary: 'Test summary',
     },
     escalation: {
       evaluated: true,
@@ -309,8 +308,16 @@ function createMockTrace(overrides: Partial<APTrace> = {}): APTrace {
 
 function createMockVerification(overrides: Partial<VerificationResult> = {}): VerificationResult {
   return {
-    passed: true,
-    concerns: [],
+    verified: true,
+    trace_id: 'tr-mock',
+    card_id: 'ac-mock',
+    timestamp: new Date().toISOString(),
+    violations: [],
+    warnings: [],
+    verification_metadata: {
+      algorithm_version: '1.2.0',
+      checks_performed: ['autonomy', 'escalation', 'values', 'forbidden'],
+    },
     ...overrides,
   } as VerificationResult;
 }
@@ -352,7 +359,7 @@ describe('determineAAPEventTypes', () => {
 
   it('includes trace.verified when verification passed', () => {
     const trace = createMockTrace();
-    const verification = createMockVerification({ passed: true });
+    const verification = createMockVerification({ verified: true });
     const events = determineAAPEventTypes(trace, verification, null);
     expect(events).toContain('trace.created');
     expect(events).toContain('trace.verified');
@@ -361,7 +368,7 @@ describe('determineAAPEventTypes', () => {
 
   it('includes trace.failed when verification failed', () => {
     const trace = createMockTrace();
-    const verification = createMockVerification({ passed: false });
+    const verification = createMockVerification({ verified: false });
     const events = determineAAPEventTypes(trace, verification, null);
     expect(events).toContain('trace.created');
     expect(events).toContain('trace.failed');
@@ -380,11 +387,11 @@ describe('determineAAPEventTypes', () => {
     expect(events).toContain('trace.escalation_required');
   });
 
-  it('includes policy.violation when policy verdict is deny', () => {
+  it('includes policy.violation when policy verdict is fail', () => {
     const trace = createMockTrace();
     const policyResult: EvaluationResult = {
-      verdict: 'deny',
-      violations: [{ rule: 'no-pii', message: 'PII detected' }],
+      verdict: 'fail',
+      violations: [{ type: 'forbidden', tool: 'pii-tool', reason: 'PII detected', severity: 'high' }],
       warnings: [],
     };
     const events = determineAAPEventTypes(trace, null, policyResult);
@@ -399,10 +406,10 @@ describe('determineAAPEventTypes', () => {
         reason: 'Sensitive content',
       },
     });
-    const verification = createMockVerification({ passed: false });
+    const verification = createMockVerification({ verified: false });
     const policyResult: EvaluationResult = {
-      verdict: 'deny',
-      violations: [{ rule: 'test', message: 'test' }],
+      verdict: 'fail',
+      violations: [{ type: 'forbidden', tool: 'test', reason: 'test', severity: 'high' }],
       warnings: [],
     };
     const events = determineAAPEventTypes(trace, verification, policyResult);

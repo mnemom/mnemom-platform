@@ -2824,7 +2824,7 @@ function determineAAPEventTypes(
   const events: string[] = ['trace.created'];
 
   if (verification) {
-    if (verification.passed) {
+    if (verification.verified) {
       events.push('trace.verified');
     } else {
       events.push('trace.failed');
@@ -2835,7 +2835,7 @@ function determineAAPEventTypes(
     events.push('trace.escalation_required');
   }
 
-  if (policyResult?.verdict === 'deny') {
+  if (policyResult?.verdict === 'fail') {
     events.push('policy.violation');
   }
 
@@ -2905,12 +2905,12 @@ async function deliverAAPWebhooks(
         agent_id: trace.agent_id,
         session_id: trace.context?.session_id ?? null,
         decision: trace.decision ? {
-          reasoning: trace.decision.reasoning_summary,
-          alternatives_count: trace.decision.alternatives?.length ?? 0,
+          reasoning: trace.decision.selection_reasoning,
+          alternatives_count: trace.decision.alternatives_considered?.length ?? 0,
         } : null,
         verification: verification ? {
-          passed: verification.passed,
-          concerns: verification.concerns ?? [],
+          verified: verification.verified,
+          warnings: verification.warnings ?? [],
         } : null,
         escalation: trace.escalation ?? null,
         policy: policyResult ? {
