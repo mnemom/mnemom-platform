@@ -370,15 +370,7 @@ async function processLog(
   const trace = buildTrace(log, metadata, context, analysis, card);
 
   // Verify trace against alignment card using AAP SDK
-  // Ensure 'inference' is always a valid bounded action (it's a fundamental capability).
-  // Some cards have tool-specific bounded_actions but omit 'inference', causing all
-  // inference-only responses to fail verification with unbounded_action.
-  const verificationCard = card ? structuredClone(card) : null;
-  if (verificationCard?.autonomy_envelope?.bounded_actions &&
-      !verificationCard.autonomy_envelope.bounded_actions.includes('inference')) {
-    verificationCard.autonomy_envelope.bounded_actions.push('inference');
-  }
-  const verification = verificationCard ? verifyTrace(trace, verificationCard) : null;
+  const verification = card ? verifyTrace(trace, card) : null;
 
   if (verification && otelExporter) {
     otelExporter.recordVerification(verification);
