@@ -55,6 +55,26 @@ import {
 } from '@mnemom/policy-engine';
 
 // ============================================================================
+// Bootstrapping Defaults
+// ============================================================================
+
+/**
+ * Default declared values for new alignment cards during agent registration.
+ * These serve as initial card values when no org template exists. The org card
+ * merge system overrides them at runtime — the observer always uses the merged
+ * card from the DB at verification time, not these defaults.
+ */
+const DEFAULT_DECLARED_VALUES = [
+  'transparency',
+  'accuracy',
+  'helpfulness',
+  'safety',
+  'autonomy',
+  'honesty',
+  'quality',
+] as const;
+
+// ============================================================================
 // Analysis Helpers
 // ============================================================================
 
@@ -577,7 +597,7 @@ export async function ensureAlignmentCard(
       relationship: 'delegated_authority',
     },
     values: {
-      declared: ['transparency', 'accuracy', 'helpfulness', 'safety', 'autonomy', 'honesty', 'quality'],
+      declared: [...DEFAULT_DECLARED_VALUES],
     },
     autonomy_envelope: {
       bounded_actions: [

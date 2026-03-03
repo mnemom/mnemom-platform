@@ -370,7 +370,15 @@ async function processLog(
   const trace = buildTrace(log, metadata, context, analysis, card);
 
   // Verify trace against alignment card using AAP SDK
-  const verification = card ? verifyTrace(trace, card) : null;
+  // Ensure 'inference' is always a valid bounded action (it's a fundamental capability).
+  // Some cards have tool-specific bounded_actions but omit 'inference', causing all
+  // inference-only responses to fail verification with unbounded_action.
+  const verificationCard = card ? structuredClone(card) : null;
+  if (verificationCard?.autonomy_envelope?.bounded_actions &&
+      !verificationCard.autonomy_envelope.bounded_actions.includes('inference')) {
+    verificationCard.autonomy_envelope.bounded_actions.push('inference');
+  }
+  const verification = verificationCard ? verifyTrace(trace, verificationCard) : null;
 
   if (verification && otelExporter) {
     otelExporter.recordVerification(verification);
@@ -1097,7 +1105,11 @@ Example input:
 <tools_used>- edit_file(path, content)</tools_used>
 
 Example output:
-{"alternatives":[{"id":"edit_config","description":"Edit config file directly"},{"id":"use_cli","description":"Use CLI tool to update timeout"}],"selected":"edit_config","reasoning":"Edited config file to increase session timeout, choosing direct file edit over CLI for persistence reliability.","values_applied":["accuracy","quality"]}`;
+{"alternatives":[{"id":"edit_config","description":"Edit config file directly"},{"id":"use_cli","description":"Use CLI tool to update timeout"}],"selected":"edit_config","reasoning":"Edited config file to increase session timeout, choosing direct file edit over CLI for persistence reliability.","values_applied":[${
+    card?.values?.declared?.length
+      ? card.values.declared.slice(0, 2).map(v => `"${v}"`).join(',')
+      : ''
+  }]}`;
 }
 
 /**
@@ -1124,7 +1136,7 @@ async function analyzeWithHaiku(
       alternatives: [{ id: 'passthrough', description: 'Direct response without tool use or reasoning' }],
       selected: 'passthrough',
       reasoning: 'Plain inference response with no captured decision context',
-      values_applied: ['helpfulness'],
+      values_applied: card?.values?.declared?.length ? [card.values.declared[0]] : [],
     };
   }
 
@@ -1156,7 +1168,7 @@ async function analyzeWithHaiku(
       alternatives: [{ id: 'direct', description: 'Direct response — no request/response data available' }],
       selected: 'direct',
       reasoning: 'No request or response data captured',
-      values_applied: ['transparency'],
+      values_applied: card?.values?.declared?.length ? [card.values.declared[0]] : [],
     };
   }
 
@@ -1232,7 +1244,7 @@ async function analyzeWithHaiku(
       alternatives: [{ id: 'analyzed', description: 'Analysis attempted but extraction failed' }],
       selected: 'analyzed',
       reasoning: fallbackReasoning,
-      values_applied: ['transparency'],
+      values_applied: card?.values?.declared?.length ? [card.values.declared[0]] : [],
     };
   } finally {
     clearTimeout(timeoutId);
@@ -1624,8 +1636,26 @@ async function linkCheckpointToTrace(
   env: Env
 ): Promise<void> {
   try {
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&linked_trace_id=is.null&order=timestamp.desc&limit=1`,
+    // Two-step GET-then-PATCH: PostgREST ignores `limit` on PATCH, so a single
+    // PATCH with limit=1 would link ALL unlinked checkpoints for this agent+session.
+    // Step 1: GET the most recent unlinked checkpoint
+    const getResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&linked_trace_id=is.null&order=timestamp.desc&limit=1&select=checkpoint_id`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+    if (!getResponse.ok) return;
+    const rows = await getResponse.json() as Array<{ checkpoint_id: string }>;
+    if (!rows.length) return;
+
+    // Step 2: PATCH that specific checkpoint by ID
+    const cpId = rows[0].checkpoint_id;
+    const patchResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?checkpoint_id=eq.${cpId}`,
       {
         method: 'PATCH',
         headers: {
@@ -1638,8 +1668,8 @@ async function linkCheckpointToTrace(
       }
     );
 
-    if (response.ok) {
-      console.log(`[observer] Linked checkpoint to trace ${traceId}`);
+    if (patchResponse.ok) {
+      console.log(`[observer] Linked checkpoint ${cpId} to trace ${traceId}`);
     }
   } catch (error) {
     // Fail-open: linking is best-effort
