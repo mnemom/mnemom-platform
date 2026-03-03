@@ -161,7 +161,8 @@ export default {
       return Response.json({
         status: 'ok',
         service: 'smoltbot-observer',
-        version: '2.0.0',
+        version: '2.1.0',
+        build: '2026-03-03-trace-fix',
       });
     }
 
@@ -259,7 +260,8 @@ async function processAllLogs(
 
   try {
     const logs = await fetchLogs(env);
-    console.log(`[observer] Found ${logs.length} logs to process`);
+    const withMeta = logs.filter((l) => l.metadata != null).length;
+    console.log(`[observer] Found ${logs.length} logs to process (${withMeta} with metadata)`);
 
     for (const log of logs) {
       try {
@@ -293,18 +295,26 @@ async function processLog(
   ctx: ExecutionContext,
   otelExporter?: WorkersOTelExporter | null
 ): Promise<boolean> {
-  // Extract metadata from log. CF AI Gateway may return the cf-aig-metadata
-  // value as either a parsed object or a JSON string depending on API version.
+  // Extract metadata from log. CF AI Gateway returns the cf-aig-metadata
+  // header value as a JSON string in the metadata field.
   let metadata: GatewayMetadata | undefined;
   if (typeof log.metadata === 'string') {
     try {
-      metadata = JSON.parse(log.metadata) as GatewayMetadata;
+      let parsed = JSON.parse(log.metadata);
+      // Handle double-encoded strings (CF may stringify twice)
+      if (typeof parsed === 'string') {
+        parsed = JSON.parse(parsed);
+      }
+      metadata = parsed as GatewayMetadata;
     } catch {
+      console.warn(`[observer] Failed to parse metadata for ${log.id}: ${String(log.metadata).substring(0, 200)}`);
       metadata = undefined;
     }
-  } else {
-    metadata = log.metadata as GatewayMetadata | undefined;
+  } else if (log.metadata && typeof log.metadata === 'object') {
+    metadata = log.metadata as unknown as GatewayMetadata;
   }
+
+  console.log(`[observer] Log ${log.id}: metadata_type=${typeof log.metadata}, has_agent_id=${!!metadata?.agent_id}, provider=${log.provider}, success=${log.success}`);
 
   // Fallback: if CF AI Gateway didn't preserve metadata (e.g. unknown headers
   // in the forwarded request cause it to drop cf-aig-metadata), recover
@@ -389,7 +399,13 @@ async function processLog(
   }
 
   // Submit trace to Supabase (trace + verification stored separately)
-  await submitTrace(trace, verification, log, env);
+  try {
+    await submitTrace(trace, verification, log, env);
+  } catch (error) {
+    console.error(`[observer] submitTrace FAILED for ${log.id} agent=${metadata.agent_id} trace=${trace.trace_id}:`, error);
+    // Re-throw so the log is NOT deleted and will be retried next cron tick
+    throw error;
+  }
 
   // Store policy evaluation result (non-blocking)
   if (policyResult && policyData?.dbPolicyId) {
@@ -1537,44 +1553,59 @@ async function recoverMetadataFromCheckpoint(
   log: GatewayLog,
   env: Env
 ): Promise<GatewayMetadata | null> {
-  try {
-    const logTime = new Date(log.created_at);
-    const windowStart = new Date(logTime.getTime() - 60_000).toISOString();
-    const windowEnd = new Date(logTime.getTime() + 60_000).toISOString();
+  // Try up to 2 times — checkpoint may not be written yet (ctx.waitUntil race)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 2000)); // Wait 2s before retry
+      }
 
-    const url = `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints` +
-      `?linked_trace_id=is.null` +
-      `&created_at=gte.${windowStart}` +
-      `&created_at=lte.${windowEnd}` +
-      `&select=agent_id,session_id` +
-      `&order=created_at.desc&limit=1`;
+      const logTime = new Date(log.created_at);
+      const windowStart = new Date(logTime.getTime() - 60_000).toISOString();
+      const windowEnd = new Date(logTime.getTime() + 60_000).toISOString();
 
-    const response = await fetch(url, {
-      headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
-      },
-    });
+      // Query by time window only — don't filter on linked_trace_id because
+      // another log in the same batch may have already linked the checkpoint
+      // via ctx.waitUntil(linkCheckpointToTrace(...)).
+      const url = `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints` +
+        `?created_at=gte.${windowStart}` +
+        `&created_at=lte.${windowEnd}` +
+        `&select=agent_id,session_id` +
+        `&order=created_at.desc&limit=1`;
 
-    if (!response.ok) return null;
+      const response = await fetch(url, {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      });
 
-    const rows = (await response.json()) as Array<{ agent_id: string; session_id: string }>;
-    if (rows.length === 0) return null;
+      if (!response.ok) {
+        console.warn(`[observer] Checkpoint fallback query failed for ${log.id}: ${response.status}`);
+        continue;
+      }
 
-    const { agent_id, session_id } = rows[0];
-    console.log(`[observer] Recovered metadata from checkpoint: agent=${agent_id} session=${session_id}`);
+      const rows = (await response.json()) as Array<{ agent_id: string; session_id: string }>;
+      if (rows.length === 0) {
+        console.log(`[observer] No checkpoint found for ${log.id} (attempt ${attempt + 1})`);
+        continue;
+      }
 
-    return {
-      agent_id,
-      agent_hash: 'recovered',
-      session_id,
-      timestamp: log.created_at,
-      gateway_version: 'unknown',
-    };
-  } catch (error) {
-    console.warn(`[observer] Checkpoint fallback failed for ${log.id}:`, error);
-    return null;
+      const { agent_id, session_id } = rows[0];
+      console.log(`[observer] Recovered metadata from checkpoint: agent=${agent_id} session=${session_id}`);
+
+      return {
+        agent_id,
+        agent_hash: 'recovered',
+        session_id,
+        gateway_version: 'unknown',
+      };
+    } catch (error) {
+      console.warn(`[observer] Checkpoint fallback error for ${log.id} (attempt ${attempt + 1}):`, error);
+    }
   }
+
+  return null;
 }
 
 // ============================================================================
