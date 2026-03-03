@@ -44,10 +44,77 @@ jobs:
               - 'cli/**'
               - 'shared/**'
 
-  cli:
+  # ============================================================
+  # Per-workspace typecheck jobs
+  # ============================================================
+
+  cli-typecheck:
     permissions:
       contents: read
-    name: CLI
+    name: CLI Typecheck
+    needs: changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.cli == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-workspace
+        with:
+          workspace: cli
+
+      - name: Build (typecheck)
+        working-directory: cli
+        run: npm run build
+
+  gateway-typecheck:
+    permissions:
+      contents: read
+    name: Gateway Typecheck
+    needs: changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.gateway == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-workspace
+        with:
+          workspace: gateway
+
+      - name: Build policy-engine
+        working-directory: shared/policy-engine
+        run: npm ci && npm run build
+
+      - name: Type check
+        working-directory: gateway
+        run: npx tsc --noEmit
+
+  observer-typecheck:
+    permissions:
+      contents: read
+    name: Observer Typecheck
+    needs: changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.observer == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-workspace
+        with:
+          workspace: observer
+
+      - name: Build policy-engine
+        working-directory: shared/policy-engine
+        run: npm ci && npm run build
+
+      - name: Type check
+        working-directory: observer
+        run: npx tsc --noEmit
+
+  # ============================================================
+  # Per-workspace test jobs
+  # ============================================================
+
+  cli-test:
+    permissions:
+      contents: read
+    name: CLI Test
     needs: changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.cli == 'true')
     runs-on: ubuntu-latest
@@ -73,10 +140,10 @@ jobs:
           directory: cli/coverage
           fail_ci_if_error: false
 
-  gateway:
+  gateway-test:
     permissions:
       contents: read
-    name: Gateway
+    name: Gateway Test
     needs: changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.gateway == 'true')
     runs-on: ubuntu-latest
@@ -90,10 +157,6 @@ jobs:
         working-directory: shared/policy-engine
         run: npm ci && npm run build
 
-      - name: Type check
-        working-directory: gateway
-        run: npx tsc --noEmit
-
       - name: Run tests
         working-directory: gateway
         run: npm test -- --run --coverage
@@ -106,10 +169,10 @@ jobs:
           directory: gateway/coverage
           fail_ci_if_error: false
 
-  observer:
+  observer-test:
     permissions:
       contents: read
-    name: Observer
+    name: Observer Test
     needs: changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.observer == 'true')
     runs-on: ubuntu-latest
@@ -123,20 +186,58 @@ jobs:
         working-directory: shared/policy-engine
         run: npm ci && npm run build
 
-      - name: Type check
-        working-directory: observer
-        run: npx tsc --noEmit
-
       - name: Run tests
         working-directory: observer
         run: npx vitest run --exclude '**/aip-integration.test.ts'
+
+  # ============================================================
+  # Roll-up jobs — branch protection requires these names
+  # ============================================================
+
+  typecheck:
+    name: Typecheck
+    needs: [cli-typecheck, gateway-typecheck, observer-typecheck]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check typecheck results
+        run: |
+          results=("${{ needs.cli-typecheck.result }}" "${{ needs.gateway-typecheck.result }}" "${{ needs.observer-typecheck.result }}")
+          for r in "${results[@]}"; do
+            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
+              echo "Typecheck failed: $r"
+              exit 1
+            fi
+          done
+          echo "All typecheck jobs passed or were skipped"
+
+  test:
+    name: Test
+    needs: [cli-test, gateway-test, observer-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check test results
+        run: |
+          results=("${{ needs.cli-test.result }}" "${{ needs.gateway-test.result }}" "${{ needs.observer-test.result }}")
+          for r in "${results[@]}"; do
+            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
+              echo "Test failed: $r"
+              exit 1
+            fi
+          done
+          echo "All test jobs passed or were skipped"
+
+  # ============================================================
+  # Deploy dispatch + context
+  # ============================================================
 
   # Notify deploy orchestrator on main/staging push
   dispatch-deploy:
     permissions:
       contents: read
     name: Trigger Deploy
-    needs: [cli, gateway, observer]
+    needs: [typecheck, test]
     if: >-
       always() &&
       github.event_name == 'push' &&
