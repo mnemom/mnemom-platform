@@ -182,7 +182,9 @@ export async function policyInitCommand(): Promise<void> {
     },
   };
 
-  fs.writeFileSync(outputPath, JSON.stringify(scaffold, null, 2) + "\n");
+  const tmpPath = `${outputPath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(scaffold, null, 2) + "\n");
+  fs.renameSync(tmpPath, outputPath);
   console.log(fmt.success(`Created policy.json`));
   console.log(fmt.label("  Path:", ` ${outputPath}`));
   console.log("\nEdit the file, then validate with:\n");

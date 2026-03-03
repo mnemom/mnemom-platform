@@ -44,8 +44,15 @@ export function installFetchInterceptor(): void {
       input instanceof Request ? input : new Request(input, init);
     const url = request.url;
 
-    // Fast path: not targeting the sentinel
-    if (!url.startsWith(AI_GATEWAY_SENTINEL)) {
+    // Fast path: not targeting the sentinel — use URL parsing for safe comparison
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      return originalFetch(input, init);
+    }
+    const sentinelOrigin = new URL(AI_GATEWAY_SENTINEL).origin;
+    if (parsedUrl.origin !== sentinelOrigin) {
       return originalFetch(input, init);
     }
 

@@ -44,23 +44,45 @@ const originalConsole = {
 };
 
 // ---------------------------------------------------------------------------
+// Sensitive data redaction
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_PATTERNS = [
+  /\b(sk-ant-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]*/g,
+  /\b(sk-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]{14,}/g,
+  /\b(AIza[A-Za-z0-9_-]{6})[A-Za-z0-9_-]*/g,
+  /\b(mnm_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]*/g,
+  /\b(eyJ[A-Za-z0-9_-]{4})[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+];
+
+function redactSensitive(text: string): string {
+  let result = text;
+  for (const pattern of SENSITIVE_PATTERNS) {
+    result = result.replace(pattern, '$1***');
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Core write function
 // ---------------------------------------------------------------------------
 
 function writeLog(level: LogLevel, args: unknown[]): void {
   if (LOG_LEVELS[level] < LOG_LEVELS[currentLevel]) return;
 
-  const message = args
-    .map((a) => {
-      if (typeof a === 'string') return a;
-      if (a instanceof Error) return `${a.message}\n${a.stack ?? ''}`;
-      try {
-        return JSON.stringify(a);
-      } catch {
-        return String(a);
-      }
-    })
-    .join(' ');
+  const message = redactSensitive(
+    args
+      .map((a) => {
+        if (typeof a === 'string') return a;
+        if (a instanceof Error) return `${a.message}\n${a.stack ?? ''}`;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(' '),
+  );
 
   const entry: Record<string, unknown> = {
     timestamp: new Date().toISOString(),

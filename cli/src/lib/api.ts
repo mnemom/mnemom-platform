@@ -3,6 +3,15 @@ import { getAccessToken } from "./auth.js";
 
 export const API_BASE = getApiUrl();
 
+/** Validate a URL before use in HTTP requests to prevent injection. */
+function validateUrl(url: string): string {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`Invalid URL protocol: ${parsed.protocol}`);
+  }
+  return parsed.href;
+}
+
 export interface Agent {
   id: string;
   gateway: string;
@@ -38,7 +47,7 @@ export interface ApiError {
 }
 
 async function fetchApi<T>(endpoint: string): Promise<T> {
-  const url = `${API_BASE}${endpoint}`;
+  const url = validateUrl(`${API_BASE}${endpoint}`);
   const response = await fetch(url);
 
   if (!response.ok) {
@@ -136,7 +145,7 @@ export async function updateCard(
   agentId: string,
   cardJson: AlignmentCard
 ): Promise<{ updated: boolean; card_id: string }> {
-  const url = `${API_BASE}/v1/agents/${agentId}/card`;
+  const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/card`);
   const response = await fetch(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", ...(await authHeaders()) },
@@ -157,7 +166,7 @@ export async function updateCard(
 export async function reverifyAgent(
   agentId: string
 ): Promise<{ reverified: number }> {
-  const url = `${API_BASE}/v1/agents/${agentId}/reverify`;
+  const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/reverify`);
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(await authHeaders()) },
@@ -209,7 +218,7 @@ export async function publishPolicy(
   agentId: string,
   policyJson: Record<string, unknown>
 ): Promise<{ id: string; version: number; created: boolean }> {
-  const url = `${API_BASE}/v1/agents/${agentId}/policy`;
+  const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/policy`);
   const response = await fetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...(await authHeaders()) },
@@ -238,7 +247,7 @@ export async function testPolicyHistorical(
   results: any[];
   summary: { pass: number; warn: number; fail: number; skipped: number };
 }> {
-  const url = `${API_BASE}/v1/policies/evaluate/historical`;
+  const url = validateUrl(`${API_BASE}/v1/policies/evaluate/historical`);
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(await authHeaders()) },

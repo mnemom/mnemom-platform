@@ -222,8 +222,12 @@ describe("config", () => {
       saveConfig(config);
 
       expect(fs.writeFileSync).toHaveBeenCalledWith(
-        CONFIG_FILE,
+        expect.stringContaining("config.json"),
         JSON.stringify(config, null, 2)
+      );
+      expect(fs.renameSync).toHaveBeenCalledWith(
+        expect.stringContaining(".tmp"),
+        CONFIG_FILE
       );
     });
 
@@ -240,9 +244,9 @@ describe("config", () => {
 
       saveConfig(config);
 
-      expect(fs.writeFileSync).toHaveBeenCalledWith(
-        "/home/testuser/.smoltbot/config.json",
-        expect.any(String)
+      expect(fs.renameSync).toHaveBeenCalledWith(
+        expect.any(String),
+        "/home/testuser/.smoltbot/config.json"
       );
     });
 

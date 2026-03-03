@@ -165,8 +165,12 @@ describe("billing", () => {
       saveConfig(config);
 
       expect(fs.writeFileSync).toHaveBeenCalledWith(
-        CONFIG_FILE,
+        expect.stringContaining("config.json"),
         JSON.stringify(config, null, 2)
+      );
+      expect(fs.renameSync).toHaveBeenCalledWith(
+        expect.stringContaining(".tmp"),
+        CONFIG_FILE
       );
     });
   });

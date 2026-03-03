@@ -43,6 +43,10 @@ function loadCache(): ModelCache | null {
  * Save model registry to disk cache.
  */
 function saveCache(models: Record<Provider, Record<string, ModelDefinition>>): void {
+  if (!models || typeof models !== "object") {
+    return;
+  }
+
   // Ensure directory exists
   if (!fs.existsSync(SMOLTBOT_DIR)) {
     fs.mkdirSync(SMOLTBOT_DIR, { recursive: true });
@@ -53,7 +57,10 @@ function saveCache(models: Record<Provider, Record<string, ModelDefinition>>): v
     models,
   };
 
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
+  // Atomic write: temp file + rename to prevent corruption
+  const tmpFile = `${CACHE_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, JSON.stringify(cache, null, 2));
+  fs.renameSync(tmpFile, CACHE_FILE);
 }
 
 /**
