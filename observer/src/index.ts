@@ -67,7 +67,9 @@ interface GatewayLog {
   tokens_in: number;
   tokens_out: number;
   duration: number;
-  metadata?: Record<string, string>;
+  // CF AI Gateway returns metadata as a JSON string, not a parsed object.
+  // Must be parsed before accessing fields like agent_id.
+  metadata?: string | Record<string, string>;
 }
 
 interface GatewayMetadata {
@@ -290,9 +292,18 @@ async function processLog(
   ctx: ExecutionContext,
   otelExporter?: WorkersOTelExporter | null
 ): Promise<boolean> {
-  // Extract metadata from log - CF AI Gateway parses cf-aig-metadata header
-  // and returns it directly as the metadata object (not nested under a key)
-  let metadata = log.metadata as GatewayMetadata | undefined;
+  // Extract metadata from log. CF AI Gateway may return the cf-aig-metadata
+  // value as either a parsed object or a JSON string depending on API version.
+  let metadata: GatewayMetadata | undefined;
+  if (typeof log.metadata === 'string') {
+    try {
+      metadata = JSON.parse(log.metadata) as GatewayMetadata;
+    } catch {
+      metadata = undefined;
+    }
+  } else {
+    metadata = log.metadata as GatewayMetadata | undefined;
+  }
 
   // Fallback: if CF AI Gateway didn't preserve metadata (e.g. unknown headers
   // in the forwarded request cause it to drop cf-aig-metadata), recover
@@ -412,7 +423,7 @@ async function processLog(
  * Fetch logs from Cloudflare AI Gateway
  */
 async function fetchLogs(env: Env, limit: number = 50): Promise<GatewayLog[]> {
-  const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai-gateway/gateways/${env.GATEWAY_ID}/logs?per_page=${limit}&order=asc`;
+  const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai-gateway/gateways/${env.GATEWAY_ID}/logs?per_page=${limit}&order_by=created_at&order_by_direction=asc&meta_info=true`;
 
   const response = await fetch(url, {
     headers: {
