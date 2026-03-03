@@ -18,12 +18,30 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@vitest/coverage-v8": "^1.6.1",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3",
     "vitest": "^1.2.0"
   },
-  "files": ["dist", "!dist/__tests__", "README.md", "LICENSE"],
-  "keywords": ["ai", "agent", "transparency", "aap", "alignment", "tracing", "observability", "openai", "gemini", "multi-provider", "gpt-5"],
+  "files": [
+    "dist",
+    "!dist/__tests__",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "transparency",
+    "aap",
+    "alignment",
+    "tracing",
+    "observability",
+    "openai",
+    "gemini",
+    "multi-provider",
+    "gpt-5"
+  ],
   "author": "Mnemom.ai",
   "license": "Apache-2.0",
   "repository": {
