@@ -11,6 +11,8 @@ on:
   schedule:
     - cron: "0 6 * * 1" # Weekly Monday 6am UTC - Node.js compat test
 
+
+permissions: {}
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -27,8 +29,8 @@ jobs:
       observer: ${{ steps.filter.outputs.observer }}
       cli: ${{ steps.filter.outputs.cli }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
         id: filter
         with:
           filters: |
@@ -43,12 +45,14 @@ jobs:
               - 'shared/**'
 
   cli:
+    permissions:
+      contents: read
     name: CLI
     needs: changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.cli == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-workspace
         with:
           workspace: cli
@@ -62,7 +66,7 @@ jobs:
         run: npm test -- --run --coverage
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: cli
@@ -70,12 +74,14 @@ jobs:
           fail_ci_if_error: false
 
   gateway:
+    permissions:
+      contents: read
     name: Gateway
     needs: changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.gateway == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-workspace
         with:
           workspace: gateway
@@ -93,7 +99,7 @@ jobs:
         run: npm test -- --run --coverage
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: gateway
@@ -101,12 +107,14 @@ jobs:
           fail_ci_if_error: false
 
   observer:
+    permissions:
+      contents: read
     name: Observer
     needs: changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.observer == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-workspace
         with:
           workspace: observer
@@ -125,6 +133,8 @@ jobs:
 
   # Notify deploy orchestrator on main/staging push
   dispatch-deploy:
+    permissions:
+      contents: read
     name: Trigger Deploy
     needs: [cli, gateway, observer]
     if: >-
@@ -133,14 +143,14 @@ jobs:
       !contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
         id: app-token
         with:
           app-id: ${{ secrets.DEPLOY_APP_ID }}
           private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
           owner: mnemom
 
-      - uses: peter-evans/repository-dispatch@v3
+      - uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
         with:
           token: ${{ steps.app-token.outputs.token }}
           repository: mnemom/deploy
@@ -160,14 +170,14 @@ jobs:
       pull-requests: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
         id: app-token
         with:
           app-id: ${{ secrets.DEPLOY_APP_ID }}
           private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
           owner: mnemom
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: mnemom/deploy
           path: .deploy-actions
@@ -181,6 +191,8 @@ jobs:
   # Weekly Node.js compatibility matrix for CLI (18, 22)
   # Node 20 is tested on every push/PR above
   cli-compat:
+    permissions:
+      contents: read
     name: CLI Compat (Node ${{ matrix.node-version }})
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -188,7 +200,7 @@ jobs:
       matrix:
         node-version: ["18", "22"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-workspace
         with:
           workspace: cli
@@ -203,10 +215,12 @@ jobs:
         run: npm test -- --run
 
   lint:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
       - run: npm ci
