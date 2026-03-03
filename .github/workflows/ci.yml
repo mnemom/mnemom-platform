@@ -159,7 +159,7 @@ jobs:
             {
               "repo": "${{ github.event.repository.name }}",
               "sha": "${{ github.sha }}",
-              "environment": "staging"
+              "environment": "${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}"
             }
 
   deploy-context:
