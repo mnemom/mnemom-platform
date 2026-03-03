@@ -103,6 +103,10 @@ jobs:
         working-directory: observer
         run: npx tsc --noEmit
 
+      - name: Run tests
+        working-directory: observer
+        run: npx vitest run --exclude '**/aip-integration.test.ts'
+
   # Notify deploy orchestrator on main/staging push
   dispatch-deploy:
     name: Trigger Deploy
