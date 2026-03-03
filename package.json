@@ -1,9 +1,15 @@
 {
   "private": true,
   "scripts": {
-    "prepare": "husky"
+    "prepare": "husky",
+    "lint": "eslint . && prettier --check ."
   },
   "devDependencies": {
-    "husky": "^9.1.0"
+    "husky": "^9.1.0",
+    "eslint": "^9.0.0",
+    "@eslint/js": "^9.0.0",
+    "typescript-eslint": "^8.0.0",
+    "eslint-config-prettier": "^10.0.0",
+    "prettier": "^3.0.0"
   }
 }
