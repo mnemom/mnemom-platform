@@ -1,0 +1,7 @@
+# Default owner for all files
+* @alexgarden
+
+# Critical paths get extra scrutiny
+.github/workflows/ @alexgarden
+deploy/ @alexgarden
+cli/src/lib/config.ts @alexgarden
