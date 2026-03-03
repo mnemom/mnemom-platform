@@ -256,20 +256,24 @@ export function generateAgentId(): string {
 
 /**
  * Derive agent ID deterministically from an API key.
- * Uses the same SHA-256 hashing as the gateway so IDs match.
+ * Uses SHA-256 to match the gateway's hashApiKey (Web Crypto SHA-256, first 16 hex chars).
+ * The agent ID is "smolt-" + first 8 hex chars of the SHA-256 digest.
  */
 export function deriveAgentId(apiKey: string): string {
-  const derived = crypto.scryptSync(apiKey, "smoltbot-agent-id", 16);
-  return `smolt-${derived.toString("hex").slice(0, 8)}`;
+  // eslint-disable-next-line -- not password hashing: deterministic ID derivation must match gateway SHA-256
+  const hash = crypto.createHash("sha256").update(apiKey).digest("hex");
+  return `smolt-${hash.slice(0, 8)}`;
 }
 
 /**
  * Derive agent ID deterministically from an API key *and* a name.
  * Allows multiple named agents to share one API key with distinct IDs.
+ * Uses SHA-256 to match the gateway's hashApiKey(apiKey + '|' + name).
  */
 export function deriveAgentIdWithName(apiKey: string, name: string): string {
-  const derived = crypto.scryptSync(`${apiKey}|${name}`, "smoltbot-agent-id", 16);
-  return `smolt-${derived.toString("hex").slice(0, 8)}`;
+  // eslint-disable-next-line -- not password hashing: deterministic ID derivation must match gateway SHA-256
+  const hash = crypto.createHash("sha256").update(`${apiKey}|${name}`).digest("hex");
+  return `smolt-${hash.slice(0, 8)}`;
 }
 
 // ---------------------------------------------------------------------------

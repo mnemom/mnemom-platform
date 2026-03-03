@@ -257,8 +257,9 @@ export async function registerCommand(
   // Include hash proof in URL so the website can auto-fill it
   // Hash proof must match how the gateway computed agent_hash:
   // named agents use hash(apiKey + '|' + name), default uses hash(apiKey)
+  // eslint-disable-next-line -- not password hashing: hash proof must match website's SHA-256 verification
   const hashInput = apiKey + "|" + name;
-  const hashProof = crypto.scryptSync(hashInput, "smoltbot-hash-proof", 32).toString("hex");
+  const hashProof = crypto.createHash("sha256").update(hashInput).digest("hex");
   const claimUrl = `${DASHBOARD_URL}/claim/${agentId}?hash=${hashProof}`;
   console.log(fmt.section("Link to your Mnemom account"));
   console.log();

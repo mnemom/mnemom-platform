@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import * as realCrypto from "node:crypto";
 
 // Use vi.hoisted to ensure mocks are set up before module imports
 const mockHomedir = vi.hoisted(() => vi.fn(() => "/home/testuser"));
@@ -11,9 +12,13 @@ vi.mock("node:fs");
 vi.mock("node:os", () => ({
   homedir: mockHomedir,
 }));
-vi.mock("node:crypto", () => ({
-  randomBytes: mockRandomBytes,
-}));
+vi.mock("node:crypto", async () => {
+  const actual = await vi.importActual<typeof import("node:crypto")>("node:crypto");
+  return {
+    ...actual,
+    randomBytes: mockRandomBytes,
+  };
+});
 
 // Import fs after mocking (for type-safe mock access)
 import * as fs from "node:fs";
@@ -24,6 +29,8 @@ import {
   loadConfig,
   saveConfig,
   generateAgentId,
+  deriveAgentId,
+  deriveAgentIdWithName,
   CONFIG_DIR,
   CONFIG_FILE,
 } from "../lib/config.js";
@@ -65,6 +72,75 @@ describe("config", () => {
       const agentId = generateAgentId();
 
       expect(agentId).toBe("smolt-12345678");
+    });
+  });
+
+  describe("deriveAgentId", () => {
+    it("should derive a deterministic agent ID from an API key using SHA-256", () => {
+      const id = deriveAgentId("test-api-key");
+      // SHA-256("test-api-key") starts with 4c806362...
+      expect(id).toBe("smolt-4c806362");
+    });
+
+    it("should produce the same ID for the same input", () => {
+      const id1 = deriveAgentId("test-api-key");
+      const id2 = deriveAgentId("test-api-key");
+      expect(id1).toBe(id2);
+    });
+
+    it("should produce different IDs for different inputs", () => {
+      const id1 = deriveAgentId("key-a");
+      const id2 = deriveAgentId("key-b");
+      expect(id1).not.toBe(id2);
+    });
+
+    it("should match the gateway SHA-256 algorithm", () => {
+      // Verify our output matches: SHA-256 hex digest, first 8 chars, prefixed with "smolt-"
+      const input = "test-api-key";
+      const expectedHash = realCrypto.createHash("sha256").update(input).digest("hex");
+      const expectedId = `smolt-${expectedHash.slice(0, 8)}`;
+      expect(deriveAgentId(input)).toBe(expectedId);
+    });
+  });
+
+  describe("deriveAgentIdWithName", () => {
+    it("should derive a deterministic agent ID from API key and name using SHA-256", () => {
+      const id = deriveAgentIdWithName("test-api-key", "test");
+      // SHA-256("test-api-key|test") starts with 9131dd88...
+      expect(id).toBe("smolt-9131dd88");
+    });
+
+    it("should produce the same ID for the same inputs", () => {
+      const id1 = deriveAgentIdWithName("test-api-key", "test");
+      const id2 = deriveAgentIdWithName("test-api-key", "test");
+      expect(id1).toBe(id2);
+    });
+
+    it("should produce different IDs for different agent names", () => {
+      const idA = deriveAgentIdWithName("test-api-key", "agent-a");
+      const idB = deriveAgentIdWithName("test-api-key", "agent-b");
+      expect(idA).not.toBe(idB);
+      // SHA-256("test-api-key|agent-a") starts with f2cfc889
+      expect(idA).toBe("smolt-f2cfc889");
+      // SHA-256("test-api-key|agent-b") starts with 4fc16314
+      expect(idB).toBe("smolt-4fc16314");
+    });
+
+    it("should match the gateway SHA-256 algorithm (apiKey + '|' + name)", () => {
+      // Gateway computes: hashApiKey(apiKey + '|' + name) where hashApiKey = SHA-256 first 16 hex
+      // Then agentId = "smolt-" + hash.slice(0, 8)
+      const apiKey = "sk-ant-test-key-12345";
+      const name = "my-agent";
+      const gatewayInput = `${apiKey}|${name}`;
+      const expectedHash = realCrypto.createHash("sha256").update(gatewayInput).digest("hex");
+      const expectedId = `smolt-${expectedHash.slice(0, 8)}`;
+      expect(deriveAgentIdWithName(apiKey, name)).toBe(expectedId);
+    });
+
+    it("should differ from deriveAgentId for the same API key", () => {
+      const idDefault = deriveAgentId("test-api-key");
+      const idNamed = deriveAgentIdWithName("test-api-key", "default");
+      expect(idDefault).not.toBe(idNamed);
     });
   });
 
