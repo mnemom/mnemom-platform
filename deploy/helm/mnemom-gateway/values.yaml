@@ -146,8 +146,8 @@ postgresql:
   auth:
     database: mnemom
     username: mnemom
-    # -- Password for the internal PostgreSQL instance
-    password: ""
+    # -- Password for the internal PostgreSQL instance (REQUIRED: override via --set postgresql.auth.password=<value>)
+    password: "CHANGEME-override-in-deployment"
     existingSecret: ""
 
 # -------------------------------------------------------------------

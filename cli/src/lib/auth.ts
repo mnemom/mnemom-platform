@@ -251,12 +251,15 @@ export async function loginWithPassword(
 async function refreshAccessToken(
   refreshToken: string
 ): Promise<AuthTokens | null> {
-  const url = `${getApiUrl()}/v1/auth/refresh`;
+  if (!refreshToken || typeof refreshToken !== "string") {
+    return null;
+  }
+  const url = new URL(`${getApiUrl()}/v1/auth/refresh`).href;
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      body: JSON.stringify({ refresh_token: String(refreshToken) }),
     });
 
     if (!res.ok) return null;

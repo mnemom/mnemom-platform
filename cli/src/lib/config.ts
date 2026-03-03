@@ -168,7 +168,9 @@ export function saveConfig(config: ConfigV2): void {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
   }
 
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  const tmpFile = `${CONFIG_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, JSON.stringify(config, null, 2));
+  fs.renameSync(tmpFile, CONFIG_FILE);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,9 +250,8 @@ export function generateAgentId(): string {
  * Uses the same SHA-256 hashing as the gateway so IDs match.
  */
 export function deriveAgentId(apiKey: string): string {
-  const hash = crypto.createHash("sha256").update(apiKey).digest("hex");
-  const agentHash = hash.substring(0, 16);
-  return `smolt-${agentHash.slice(0, 8)}`;
+  const derived = crypto.scryptSync(apiKey, "smoltbot-agent-id", 16);
+  return `smolt-${derived.toString("hex").slice(0, 8)}`;
 }
 
 /**
@@ -258,11 +259,8 @@ export function deriveAgentId(apiKey: string): string {
  * Allows multiple named agents to share one API key with distinct IDs.
  */
 export function deriveAgentIdWithName(apiKey: string, name: string): string {
-  const hash = crypto
-    .createHash("sha256")
-    .update(`${apiKey}|${name}`)
-    .digest("hex");
-  return `smolt-${hash.slice(0, 8)}`;
+  const derived = crypto.scryptSync(`${apiKey}|${name}`, "smoltbot-agent-id", 16);
+  return `smolt-${derived.toString("hex").slice(0, 8)}`;
 }
 
 // ---------------------------------------------------------------------------

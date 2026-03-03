@@ -86,8 +86,8 @@ export async function statusCommand(agentName?: string): Promise<void> {
   console.log(fmt.label("Dashboard:", ` ${DASHBOARD_URL}/agents/${agent.agentId}`));
 
   if (config.mnemomApiKey) {
-    const prefix = config.mnemomApiKey.slice(0, 8);
-    console.log(`Mnemom Key: ${prefix}... (billing enabled)`);
+    const redacted = `${config.mnemomApiKey.slice(0, 4)}${"*".repeat(8)}`;
+    console.log(`Mnemom Key: ${redacted} (billing enabled)`);
   } else {
     console.log(`Mnemom Key: Not configured (free tier)`);
   }

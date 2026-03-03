@@ -36,7 +36,8 @@ export async function licenseActivateCommand(jwt: string): Promise<void> {
   // Validate against API (if reachable)
   const hostname = (await import("node:os")).hostname();
   try {
-    const response = await fetch(`${API_BASE}/v1/license/validate`, {
+    const licenseUrl = new URL(`${API_BASE}/v1/license/validate`).href;
+    const response = await fetch(licenseUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -149,11 +150,12 @@ export async function licenseDeactivateCommand(): Promise<void> {
   if (claims) {
     try {
       const hostname = (await import("node:os")).hostname();
-      await fetch(`${API_BASE}/v1/license/validate`, {
+      const deactivateUrl = new URL(`${API_BASE}/v1/license/validate`).href;
+      await fetch(deactivateUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          license: config.licenseJwt,
+          license: String(config.licenseJwt),
           instance_id: hostname,
           instance_metadata: { deactivating: true },
         }),

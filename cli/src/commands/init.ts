@@ -276,7 +276,7 @@ function showStandaloneSuccess(
 
   if (mnemomApiKey) {
     console.log("  Set your Mnemom API key as an environment variable:\n");
-    console.log(`    export MNEMOM_API_KEY=${mnemomApiKey}\n`);
+    console.log(`    export MNEMOM_API_KEY=<your-mnemom-api-key>\n`);
   }
 
   for (const { provider } of verifiedProviders) {
@@ -562,8 +562,8 @@ async function promptMnemomApiKey(existingConfig: Config | null): Promise<string
   console.log(`Create one at: ${DASHBOARD_URL}/settings/api-keys\n`);
 
   if (existingConfig?.mnemomApiKey) {
-    const prefix = existingConfig.mnemomApiKey.slice(0, 8);
-    console.log(`  Existing key: ${prefix}...\n`);
+    const redacted = `${existingConfig.mnemomApiKey.slice(0, 4)}${"*".repeat(8)}`;
+    console.log(`  Existing key: ${redacted}\n`);
   }
 
   if (!isInteractive()) {

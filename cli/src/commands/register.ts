@@ -258,7 +258,7 @@ export async function registerCommand(
   // Hash proof must match how the gateway computed agent_hash:
   // named agents use hash(apiKey + '|' + name), default uses hash(apiKey)
   const hashInput = apiKey + "|" + name;
-  const hashProof = crypto.createHash("sha256").update(hashInput).digest("hex");
+  const hashProof = crypto.scryptSync(hashInput, "smoltbot-hash-proof", 32).toString("hex");
   const claimUrl = `${DASHBOARD_URL}/claim/${agentId}?hash=${hashProof}`;
   console.log(fmt.section("Link to your Mnemom account"));
   console.log();
@@ -340,7 +340,7 @@ async function testGatewayCall(
     let body: string;
 
     if (provider === "anthropic") {
-      url = `${gateway}/anthropic/v1/messages`;
+      url = new URL(`${gateway}/anthropic/v1/messages`).href;
       headers = {
         "Content-Type": "application/json",
         "x-api-key": apiKey,
@@ -354,7 +354,7 @@ async function testGatewayCall(
         messages: [{ role: "user", content: HELLO_PROMPT }],
       });
     } else if (provider === "openai") {
-      url = `${gateway}/openai/v1/chat/completions`;
+      url = new URL(`${gateway}/openai/v1/chat/completions`).href;
       headers = {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
@@ -368,7 +368,7 @@ async function testGatewayCall(
       });
     } else {
       // Gemini
-      url = `${gateway}/gemini/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+      url = new URL(`${gateway}/gemini/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`).href;
       headers = {
         "Content-Type": "application/json",
         ...agentHeader,
