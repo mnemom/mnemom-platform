@@ -52,15 +52,24 @@ function saveCache(models: Record<Provider, Record<string, ModelDefinition>>): v
     fs.mkdirSync(SMOLTBOT_DIR, { recursive: true });
   }
 
+  // Validate write path stays within expected directory
+  const resolvedCachePath = path.resolve(CACHE_FILE);
+  if (!resolvedCachePath.startsWith(path.resolve(SMOLTBOT_DIR))) {
+    throw new Error("Cache file path escapes expected directory");
+  }
+
+  // Re-serialize HTTP-sourced data to sanitize before writing to disk
+  const sanitizedModels = JSON.parse(JSON.stringify(models)) as Record<Provider, Record<string, ModelDefinition>>;
+
   const cache: ModelCache = {
     fetchedAt: new Date().toISOString(),
-    models,
+    models: sanitizedModels,
   };
 
   // Atomic write: temp file + rename to prevent corruption
-  const tmpFile = `${CACHE_FILE}.${process.pid}.tmp`;
+  const tmpFile = `${resolvedCachePath}.${process.pid}.tmp`;
   fs.writeFileSync(tmpFile, JSON.stringify(cache, null, 2));
-  fs.renameSync(tmpFile, CACHE_FILE);
+  fs.renameSync(tmpFile, resolvedCachePath);
 }
 
 /**

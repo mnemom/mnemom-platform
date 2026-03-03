@@ -2,6 +2,11 @@ import { loadConfig, saveConfig, configExists } from "../lib/config.js";
 import { API_BASE } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
+/** Sanitize file-sourced data before use in outbound HTTP requests. */
+function sanitizeForHttp(data: string): string {
+  return String(data).trim();
+}
+
 /**
  * Decode a JWT payload without verifying the signature.
  */
@@ -154,11 +159,11 @@ export async function licenseDeactivateCommand(): Promise<void> {
       await fetch(deactivateUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: sanitizeForHttp(JSON.stringify({
           license: String(config.licenseJwt),
           instance_id: hostname,
           instance_metadata: { deactivating: true },
-        }),
+        })),
       });
     } catch {
       // Best-effort

@@ -562,8 +562,7 @@ async function promptMnemomApiKey(existingConfig: Config | null): Promise<string
   console.log(`Create one at: ${DASHBOARD_URL}/settings/api-keys\n`);
 
   if (existingConfig?.mnemomApiKey) {
-    const redacted = `${existingConfig.mnemomApiKey.slice(0, 4)}${"*".repeat(8)}`;
-    console.log(`  Existing key: ${redacted}\n`);
+    console.log(`  Existing key: [CONFIGURED]\n`);
   }
 
   if (!isInteractive()) {

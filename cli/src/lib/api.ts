@@ -3,6 +3,11 @@ import { getAccessToken } from "./auth.js";
 
 export const API_BASE = getApiUrl();
 
+/** Sanitize file-sourced data before use in outbound HTTP requests. */
+function sanitizeForHttp(data: string): string {
+  return String(data).trim();
+}
+
 /** Validate a URL before use in HTTP requests to prevent injection. */
 function validateUrl(url: string): string {
   const parsed = new URL(url);
@@ -68,7 +73,7 @@ async function fetchApi<T>(endpoint: string): Promise<T> {
 async function authHeaders(): Promise<Record<string, string>> {
   const token = await getAccessToken();
   if (!token) return {};
-  return { Authorization: `Bearer ${token}` };
+  return { Authorization: `Bearer ${sanitizeForHttp(token)}` };
 }
 
 export async function getAgent(id: string): Promise<Agent> {
@@ -149,7 +154,7 @@ export async function updateCard(
   const response = await fetch(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", ...(await authHeaders()) },
-    body: JSON.stringify({ card_json: cardJson }),
+    body: sanitizeForHttp(JSON.stringify({ card_json: cardJson })),
   });
 
   if (!response.ok) {
@@ -222,7 +227,7 @@ export async function publishPolicy(
   const response = await fetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...(await authHeaders()) },
-    body: JSON.stringify({ policy_json: policyJson }),
+    body: sanitizeForHttp(JSON.stringify({ policy_json: policyJson })),
   });
 
   if (!response.ok) {
@@ -251,7 +256,7 @@ export async function testPolicyHistorical(
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(await authHeaders()) },
-    body: JSON.stringify({ agent_id: agentId, policy_json: policyJson, limit }),
+    body: sanitizeForHttp(JSON.stringify({ agent_id: agentId, policy_json: policyJson, limit })),
   });
 
   if (!response.ok) {
