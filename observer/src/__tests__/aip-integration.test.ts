@@ -35,7 +35,7 @@ const mockEnv = {
 /** AAP-format AlignmentCard (as the observer receives it from Supabase) */
 function createMockAAPCard(overrides: Partial<AlignmentCard> = {}): AlignmentCard {
   return {
-    aap_version: '1.0',
+    aap_version: '0.5.0',
     card_id: 'ac-test-aip-001',
     agent_id: 'smolt-abc12345',
     issued_at: '2024-01-01T00:00:00Z',
