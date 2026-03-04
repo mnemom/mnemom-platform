@@ -1,6 +1,6 @@
 {
   "name": "@mnemom/policy-engine",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shared policy-as-code engine for smoltbot verification checkpoints",
   "type": "module",
   "main": "./dist/index.js",
@@ -16,12 +16,18 @@
     "test": "vitest",
     "typecheck": "tsc --noEmit"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "typescript": "^5.3.3",
     "vitest": "^1.2.0"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.1"
   }
 }
