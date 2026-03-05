@@ -588,7 +588,7 @@ export async function ensureAlignmentCard(
   // bounded_actions: semantic action types the agent can perform
   // declared values: the full set the observer's Haiku analysis can assign
   const cardJson = {
-    aap_version: '0.1.0',
+    aap_version: '0.5.0',
     card_id: cardId,
     agent_id: agentId,
     issued_at: issuedAt,

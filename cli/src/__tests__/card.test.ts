@@ -1,5 +1,8 @@
-import { describe, it, expect } from "vitest";
-import { validateCardJson, type ValidationCheck } from "../commands/card.js";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import { validateCardJson, validateCard, validateCardObject, parseCardFile, type ValidationCheck } from "../commands/card.js";
 
 // ============================================================================
 // Validation tests
@@ -311,5 +314,110 @@ describe("validateCardJson edge cases", () => {
     // JSON + 4 blocks + declared + definitions + bounded + triggers + expires = 10
     expect(checks.length).toBe(10);
     expect(checks.every((c) => c.passed)).toBe(true);
+  });
+});
+
+// ============================================================================
+// YAML card parsing tests
+// ============================================================================
+
+describe("parseCardFile", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "card-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const validCard = {
+    principal: { name: "TestBot", type: "assistant" },
+    values: { declared: ["transparency", "honesty"] },
+    autonomy_envelope: {
+      bounded_actions: ["code_generation"],
+      escalation_triggers: [{ condition: "high_risk", action: "notify" }],
+    },
+    audit_commitment: { log_level: "full", retention_days: 90 },
+  };
+
+  const validYaml = `principal:
+  name: TestBot
+  type: assistant
+values:
+  declared:
+    - transparency
+    - honesty
+autonomy_envelope:
+  bounded_actions:
+    - code_generation
+  escalation_triggers:
+    - condition: high_risk
+      action: notify
+audit_commitment:
+  log_level: full
+  retention_days: 90
+`;
+
+  it("should parse a valid YAML card file", () => {
+    const filePath = path.join(tmpDir, "card.yaml");
+    fs.writeFileSync(filePath, validYaml);
+
+    const result = parseCardFile(filePath);
+    expect(result.format).toBe("yaml");
+    expect(result.parsed.principal!.name).toBe("TestBot");
+    expect(result.parsed.values!.declared).toEqual(["transparency", "honesty"]);
+  });
+
+  it("should parse a .yml extension as YAML", () => {
+    const filePath = path.join(tmpDir, "card.yml");
+    fs.writeFileSync(filePath, validYaml);
+
+    const result = parseCardFile(filePath);
+    expect(result.format).toBe("yaml");
+    expect(result.parsed.principal!.name).toBe("TestBot");
+  });
+
+  it("should parse a valid JSON card file", () => {
+    const filePath = path.join(tmpDir, "card.json");
+    fs.writeFileSync(filePath, JSON.stringify(validCard));
+
+    const result = parseCardFile(filePath);
+    expect(result.format).toBe("json");
+    expect(result.parsed.principal!.name).toBe("TestBot");
+  });
+
+  it("should throw on invalid YAML", () => {
+    const filePath = path.join(tmpDir, "bad.yaml");
+    fs.writeFileSync(filePath, ":\n  invalid: [yaml\n  broken");
+
+    expect(() => parseCardFile(filePath)).toThrow();
+  });
+
+  it("should throw on YAML that produces a non-object", () => {
+    const filePath = path.join(tmpDir, "scalar.yaml");
+    fs.writeFileSync(filePath, "just a string");
+
+    expect(() => parseCardFile(filePath)).toThrow("YAML did not produce a valid object");
+  });
+
+  it("should produce identical validation results for YAML and JSON of the same card", () => {
+    const jsonPath = path.join(tmpDir, "card.json");
+    const yamlPath = path.join(tmpDir, "card.yaml");
+    fs.writeFileSync(jsonPath, JSON.stringify(validCard));
+    fs.writeFileSync(yamlPath, validYaml);
+
+    const jsonResult = parseCardFile(jsonPath);
+    const yamlResult = parseCardFile(yamlPath);
+
+    const jsonChecks = validateCardObject(jsonResult.parsed);
+    const yamlChecks = validateCardObject(yamlResult.parsed);
+
+    expect(jsonChecks.length).toBe(yamlChecks.length);
+    for (let i = 0; i < jsonChecks.length; i++) {
+      expect(yamlChecks[i].name).toBe(jsonChecks[i].name);
+      expect(yamlChecks[i].passed).toBe(jsonChecks[i].passed);
+    }
   });
 });

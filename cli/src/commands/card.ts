@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import yaml from "js-yaml";
 import { configExists, loadConfig, requireAgent } from "../lib/config.js";
 import {
   getCard,
@@ -31,6 +32,38 @@ const STANDARD_VALUES = new Set([
 ]);
 
 // ============================================================================
+// File parsing
+// ============================================================================
+
+export type CardFormat = "json" | "yaml";
+
+export interface ParsedCard {
+  format: CardFormat;
+  parsed: AlignmentCard;
+}
+
+function detectFormat(filePath: string): CardFormat {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".yaml" || ext === ".yml") return "yaml";
+  return "json";
+}
+
+export function parseCardFile(filePath: string): ParsedCard {
+  const raw = fs.readFileSync(filePath, "utf-8");
+  const format = detectFormat(filePath);
+
+  if (format === "yaml") {
+    const parsed = yaml.load(raw) as AlignmentCard;
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("YAML did not produce a valid object");
+    }
+    return { format, parsed };
+  }
+
+  return { format, parsed: JSON.parse(raw) as AlignmentCard };
+}
+
+// ============================================================================
 // Validation logic
 // ============================================================================
 
@@ -40,7 +73,10 @@ export interface ValidationCheck {
   message: string;
 }
 
-export function validateCardJson(raw: string): ValidationCheck[] {
+/** @deprecated Use validateCard instead */
+export const validateCardJson = validateCard;
+
+export function validateCard(raw: string): ValidationCheck[] {
   const checks: ValidationCheck[] = [];
 
   // Check 1: Valid JSON
@@ -174,6 +210,14 @@ export function validateCardJson(raw: string): ValidationCheck[] {
   }
 
   return checks;
+}
+
+/**
+ * Validate a pre-parsed card object (used for YAML cards).
+ * Re-serializes to JSON so the same checks run identically.
+ */
+export function validateCardObject(card: AlignmentCard): ValidationCheck[] {
+  return validateCard(JSON.stringify(card));
 }
 
 // ============================================================================
@@ -366,21 +410,25 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
     process.exit(1);
   }
 
-  // Read and parse
-  let raw: string;
+  // Parse file (JSON or YAML)
+  let parsed: AlignmentCard;
+  let format: CardFormat;
   try {
-    raw = fs.readFileSync(filePath, "utf-8");
+    const result = parseCardFile(filePath);
+    parsed = result.parsed;
+    format = result.format;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.log("\n" + fmt.error(`Could not read file: ${msg}`) + "\n");
+    console.log("\n" + fmt.error(`Could not parse file: ${msg}`) + "\n");
     process.exit(1);
   }
 
   // Validate locally
-  const checks = validateCardJson(raw);
+  const checks = validateCardObject(parsed!);
   const allPassed = checks.every((c) => c.passed);
 
   console.log(fmt.header("Card Validation"));
+  console.log(fmt.label("  Format:", ` ${format!.toUpperCase()}`));
   console.log();
   for (const check of checks) {
     if (check.passed) {
@@ -411,8 +459,7 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
     }
   }
 
-  // Publish
-  const parsed = JSON.parse(raw) as AlignmentCard;
+  // Publish (always sends JSON to API regardless of source format)
 
   try {
     console.log("\nPublishing card...");
@@ -443,18 +490,21 @@ export async function cardValidateCommand(file: string): Promise<void> {
     process.exit(1);
   }
 
-  // Read file
-  let raw: string;
+  // Parse file (JSON or YAML)
+  let parsed: AlignmentCard;
+  let format: CardFormat;
   try {
-    raw = fs.readFileSync(filePath, "utf-8");
+    const result = parseCardFile(filePath);
+    parsed = result.parsed;
+    format = result.format;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.log("\n" + fmt.error(`Could not read file: ${msg}`) + "\n");
+    console.log("\n" + fmt.error(`Could not parse file: ${msg}`) + "\n");
     process.exit(1);
   }
 
-  // Validate
-  const checks = validateCardJson(raw);
+  // Validate the parsed object
+  const checks = validateCardObject(parsed!);
   const allPassed = checks.every((c) => c.passed);
   const passCount = checks.filter((c) => c.passed).length;
   const failCount = checks.filter((c) => !c.passed).length;
@@ -462,6 +512,7 @@ export async function cardValidateCommand(file: string): Promise<void> {
   console.log(fmt.header("Card Validation Report"));
   console.log();
   console.log(fmt.label("  File:", ` ${filePath}`));
+  console.log(fmt.label("  Format:", ` ${format!.toUpperCase()}`));
   console.log();
 
   for (const check of checks) {
