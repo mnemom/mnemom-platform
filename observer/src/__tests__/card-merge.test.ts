@@ -9,7 +9,7 @@ function makeAgentCard(overrides?: Record<string, any>): Record<string, any> {
   return {
     card_id: 'card-agent-001',
     agent_id: 'agent-001',
-    aap_version: '1.0',
+    aap_version: '0.5.0',
     issued_at: '2025-01-01T00:00:00Z',
     expires_at: '2026-01-01T00:00:00Z',
     principal: { name: 'Agent Owner', contact: 'owner@example.com' },

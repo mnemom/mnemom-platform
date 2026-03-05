@@ -61,6 +61,10 @@ jobs:
         with:
           workspace: cli
 
+      - name: Build policy-engine
+        working-directory: shared/policy-engine
+        run: npm ci && npm run build
+
       - name: Build (typecheck)
         working-directory: cli
         run: npm run build
@@ -123,6 +127,10 @@ jobs:
       - uses: ./.github/actions/setup-workspace
         with:
           workspace: cli
+
+      - name: Build policy-engine
+        working-directory: shared/policy-engine
+        run: npm ci && npm run build
 
       - name: Build
         working-directory: cli

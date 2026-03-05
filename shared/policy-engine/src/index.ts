@@ -2,6 +2,7 @@ export { evaluatePolicy } from './evaluator.js';
 export { mergePolicies, mergeTransactionGuardrails } from './merge.js';
 export { validatePolicySchema } from './validator.js';
 export { toolMatchesPattern, toolMatchesAny } from './glob.js';
+export { loadFromYAML, toYAML } from './yaml.js';
 
 export type {
   Policy,

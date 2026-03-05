@@ -1290,7 +1290,7 @@ describe('buildObserverSystemPrompt', () => {
 
   it('should generate prompt with card-declared values', () => {
     const card = {
-      aap_version: '1.0',
+      aap_version: '0.5.0',
       card_id: 'test',
       agent_id: 'test',
       issued_at: '2024-01-01',
@@ -1311,7 +1311,7 @@ describe('buildObserverSystemPrompt', () => {
 
   it('should include value definitions from card', () => {
     const card = {
-      aap_version: '1.0',
+      aap_version: '0.5.0',
       card_id: 'test',
       agent_id: 'test',
       issued_at: '2024-01-01',
@@ -1336,7 +1336,7 @@ describe('buildObserverSystemPrompt', () => {
 
   it('should add content_flags for boolean escalation triggers', () => {
     const card = {
-      aap_version: '1.0',
+      aap_version: '0.5.0',
       card_id: 'test',
       agent_id: 'test',
       issued_at: '2024-01-01',
@@ -1360,7 +1360,7 @@ describe('buildObserverSystemPrompt', () => {
 
   it('should NOT add content_flags for non-boolean escalation conditions', () => {
     const card = {
-      aap_version: '1.0',
+      aap_version: '0.5.0',
       card_id: 'test',
       agent_id: 'test',
       issued_at: '2024-01-01',
@@ -1381,7 +1381,7 @@ describe('buildObserverSystemPrompt', () => {
 
   it('should handle empty declared values', () => {
     const card = {
-      aap_version: '1.0',
+      aap_version: '0.5.0',
       card_id: 'test',
       agent_id: 'test',
       issued_at: '2024-01-01',
