@@ -31,6 +31,15 @@ jobs:
       - name: Upgrade npm for OIDC trusted publishing
         run: npm install -g npm@latest
 
+      - name: Install shared dependencies
+        run: |
+          for dir in shared/*/; do
+            if [ -f "$dir/package.json" ]; then
+              echo "Installing deps in $dir"
+              (cd "$dir" && npm ci || npm install)
+            fi
+          done
+
       - name: Install and build
         working-directory: ${{ inputs.npm-directory }}
         run: |
