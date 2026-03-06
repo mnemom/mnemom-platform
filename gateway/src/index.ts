@@ -178,6 +178,7 @@ export interface AgentSettings {
   nudge_strategy?: 'always' | 'sampling' | 'threshold' | 'off';
   nudge_rate?: number;
   nudge_threshold?: number;
+  analyze_output?: boolean;
 }
 
 export interface QuotaContext {
@@ -691,6 +692,56 @@ export function buildMetadataHeader(
 // AIP Helper Functions
 // ============================================================================
 
+/** Default token budget for output block analysis (matches SDK constant). */
+const DEFAULT_OUTPUT_TOKEN_BUDGET = 2048;
+
+/**
+ * Extract text output from a non-streaming provider response body.
+ * Supports Anthropic (content[].text), OpenAI (choices[].message.content),
+ * and Gemini (candidates[].content.parts[].text) formats.
+ */
+function extractOutputText(responseBody: string): string | undefined {
+  try {
+    const body = JSON.parse(responseBody) as Record<string, unknown>;
+
+    // Anthropic: content array with text blocks
+    const content = body.content as Array<Record<string, unknown>> | undefined;
+    if (content && Array.isArray(content)) {
+      const textParts: string[] = [];
+      for (const block of content) {
+        if (block.type === 'text' && typeof block.text === 'string') {
+          textParts.push(block.text);
+        }
+      }
+      if (textParts.length > 0) return textParts.join('\n');
+    }
+
+    // OpenAI: choices[].message.content
+    const choices = body.choices as Array<Record<string, unknown>> | undefined;
+    if (choices && Array.isArray(choices) && choices.length > 0) {
+      const msg = choices[0].message as Record<string, unknown> | undefined;
+      if (msg && typeof msg.content === 'string') return msg.content;
+    }
+
+    // Gemini: candidates[].content.parts[].text
+    const candidates = body.candidates as Array<Record<string, unknown>> | undefined;
+    if (candidates && Array.isArray(candidates) && candidates.length > 0) {
+      const parts = (candidates[0].content as Record<string, unknown>)?.parts as Array<Record<string, unknown>> | undefined;
+      if (parts && Array.isArray(parts)) {
+        const textParts: string[] = [];
+        for (const part of parts) {
+          if (typeof part.text === 'string') textParts.push(part.text);
+        }
+        if (textParts.length > 0) return textParts.join('\n');
+      }
+    }
+
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Extract PII-safe agent description from card extensions.
  */
@@ -1096,6 +1147,7 @@ async function storeCheckpoint(
           session_id: checkpoint.session_id,
           timestamp: checkpoint.timestamp,
           thinking_block_hash: checkpoint.thinking_block_hash,
+          ...(checkpoint.output_block_hash ? { output_block_hash: checkpoint.output_block_hash } : {}),
           provider: checkpoint.provider,
           model: checkpoint.model,
           verdict: checkpoint.verdict,
@@ -1797,8 +1849,11 @@ async function analyzeStreamInBackground(
       window.push(cp);
     }
 
-    // 6. Hash thinking block
+    // 6. Hash thinking block + extract output for analysis
     const thinkingHash = await sha256(parsed.thinking);
+    const analyzeOutput = agentSettings?.analyze_output === true;
+    const outputText = analyzeOutput && parsed.text ? parsed.text : undefined;
+    const outputHash = outputText ? await sha256(outputText) : undefined;
 
     // 7. Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
     if (!env.ANTHROPIC_API_KEY && env.MNEMOM_ANALYZE_URL && env.MNEMOM_API_KEY) {
@@ -1819,6 +1874,7 @@ async function analyzeStreamInBackground(
             session_id: sessionId,
             card: aipCard,
             conscience_values: values,
+            ...(outputText ? { output_block: outputText } : {}),
             task_context: (() => {
               const desc = card?.extensions?.mnemom?.description || card?.extensions?.mnemom?.role || '';
               return desc ? desc.toString().slice(0, 200) : undefined;
@@ -1899,10 +1955,11 @@ async function analyzeStreamInBackground(
       windowContext: window.getState().checkpoints,
       thinkingBlock: parsed.thinking,
       taskContext: gatewayTaskContext,
+      ...(outputText ? { outputBlock: outputText, outputTokenBudget: DEFAULT_OUTPUT_TOKEN_BUDGET } : {}),
     });
 
     // Call analysis LLM (Haiku)
-    console.log(`[gateway/stream-aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${parsed.thinking.length}`);
+    console.log(`[gateway/stream-aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${parsed.thinking.length} output_analysis=${!!outputText}`);
     const analysisStartTime = Date.now();
     const rawAnalysisResponse = await callAnalysisLLM(prompt.system, prompt.user, env);
     const analysisDurationMs = Date.now() - analysisStartTime;
@@ -1924,6 +1981,14 @@ async function analyzeStreamInBackground(
         truncated: prompt.truncated,
         confidence: 1.0,
       },
+      ...(outputHash && prompt.outputOriginalTokens != null ? {
+        output: {
+          hash: outputHash,
+          tokensOriginal: prompt.outputOriginalTokens,
+          tokensAnalyzed: prompt.outputAnalyzedTokens ?? 0,
+          truncated: prompt.outputTruncated ?? false,
+        },
+      } : {}),
       agentId: agent.id,
       cardId: aipCard.card_id,
       sessionId,
@@ -3340,6 +3405,10 @@ export async function handleProviderProxy(
         });
       }
 
+      // Extract output text for output-aware analysis (when enabled)
+      const analyzeOutput = agentSettings?.analyze_output === true;
+      const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
+
       // Phase 7: Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
       if (!env.ANTHROPIC_API_KEY && env.MNEMOM_ANALYZE_URL && env.MNEMOM_API_KEY) {
         try {
@@ -3358,6 +3427,7 @@ export async function handleProviderProxy(
               session_id: sessionId,
               card: aipCard,
               conscience_values: conscienceValues || [...DEFAULT_CONSCIENCE_VALUES],
+              ...(outputText ? { output_block: outputText } : {}),
               task_context: (() => {
                 const desc = card?.extensions?.mnemom?.description || card?.extensions?.mnemom?.role || '';
                 return desc ? desc.toString().slice(0, 200) : undefined;
@@ -3384,6 +3454,7 @@ export async function handleProviderProxy(
             responseHeaders.set('X-AIP-Action', hybridAction);
             responseHeaders.set('X-AIP-Proceed', String(hybridProceed));
             responseHeaders.set('X-AIP-Source', 'hybrid');
+            responseHeaders.set('X-AIP-Analysis-Scope', outputText ? 'thinking_and_output' : 'thinking_only');
 
             // Pass through attestation data from hybrid API response
             const hybridAttestation = hybridResult.attestation as Record<string, unknown> | undefined;
@@ -3490,10 +3561,11 @@ export async function handleProviderProxy(
         windowContext: window.getState().checkpoints,
         thinkingBlock: thinking.content,
         taskContext: gatewayTaskContext,
+        ...(outputText ? { outputBlock: outputText, outputTokenBudget: DEFAULT_OUTPUT_TOKEN_BUDGET } : {}),
       });
 
       // Call analysis LLM (Haiku)
-      console.log(`[gateway/aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${thinking.content.length}`);
+      console.log(`[gateway/aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${thinking.content.length} output_analysis=${!!outputText}`);
       const analysisStartTime = Date.now();
       const rawAnalysisResponse = await callAnalysisLLM(prompt.system, prompt.user, env);
       const analysisDurationMs = Date.now() - analysisStartTime;
@@ -3503,8 +3575,9 @@ export async function handleProviderProxy(
       const analysisResponseText = jsonMatch ? sanitizeJson(jsonMatch[0]) : rawAnalysisResponse;
       console.log(`[gateway/aip] Analysis complete in ${analysisDurationMs}ms, json_extracted=${!!jsonMatch}`);
 
-      // Hash thinking block using Web Crypto API
+      // Hash thinking block (and output block if present) using Web Crypto API
       const thinkingHash = await sha256(thinking.content);
+      const outputHash = outputText ? await sha256(outputText) : undefined;
 
       // Build checkpoint via checkIntegrity
       const windowState = window.getState();
@@ -3519,6 +3592,14 @@ export async function handleProviderProxy(
           truncated: prompt.truncated,
           confidence: thinking.confidence,
         },
+        ...(outputHash && prompt.outputOriginalTokens != null ? {
+          output: {
+            hash: outputHash,
+            tokensOriginal: prompt.outputOriginalTokens,
+            tokensAnalyzed: prompt.outputAnalyzedTokens ?? 0,
+            truncated: prompt.outputTruncated ?? false,
+          },
+        } : {}),
         agentId: agent.id,
         cardId: aipCard.card_id,
         sessionId,
@@ -3568,6 +3649,7 @@ export async function handleProviderProxy(
       responseHeaders.set('X-AIP-Checkpoint-Id', checkpoint.checkpoint_id);
       responseHeaders.set('X-AIP-Action', signal.recommended_action);
       responseHeaders.set('X-AIP-Proceed', String(signal.proceed));
+      responseHeaders.set('X-AIP-Analysis-Scope', outputText ? 'thinking_and_output' : 'thinking_only');
       if (attestation) {
         responseHeaders.set('X-AIP-Certificate-Id', attestation.certificate_id);
         responseHeaders.set('X-AIP-Chain-Hash', attestation.chain_hash);
