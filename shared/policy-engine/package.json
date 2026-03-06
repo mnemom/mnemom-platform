@@ -2,6 +2,11 @@
   "name": "@mnemom/policy-engine",
   "version": "0.2.0",
   "description": "Shared policy-as-code engine for smoltbot verification checkpoints",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mnemom/smoltbot",
+    "directory": "shared/policy-engine"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
