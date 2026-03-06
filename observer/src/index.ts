@@ -363,7 +363,7 @@ async function processLog(
   // Fetch card and policy data in parallel
   const [card, policyData] = await Promise.all([
     fetchCard(agent_id, env),
-    fetchPolicyForAgent(agent_id, env),
+    fetchPolicyForAgent(agent_id, env, metadata?.agent_name),
   ]);
 
   // Analyze reasoning with Claude Haiku (card-aware)
@@ -397,6 +397,28 @@ async function processLog(
           tools,
         });
         console.log(`[observer/policy] Agent ${agent_id}: verdict=${policyResult.verdict}, violations=${policyResult.violations.length}, warnings=${policyResult.warnings.length}`);
+
+        // Record policy evaluation OTel span (requires aip-otel-exporter >=0.5.0 with policy support)
+        if (otelExporter && 'recordPolicyEvaluation' in otelExporter) {
+          (otelExporter as any).recordPolicyEvaluation({
+            agent_id,
+            policy_id: policyResult.policy_id,
+            policy_version: String(policyResult.policy_version),
+            verdict: policyResult.verdict,
+            violations_count: policyResult.violations.length,
+            warnings_count: policyResult.warnings.length,
+            coverage_pct: policyResult.coverage.coverage_pct,
+            context: policyResult.context,
+            duration_ms: policyResult.duration_ms,
+            enforcement_mode: 'observe',
+            violations: policyResult.violations.map(v => ({
+              type: v.type,
+              tool: v.tool,
+              severity: v.severity,
+              reason: v.reason,
+            })),
+          });
+        }
       }
     }
   }
@@ -1406,7 +1428,8 @@ async function submitTrace(
  */
 async function fetchPolicyForAgent(
   agentId: string,
-  env: Env
+  env: Env,
+  agentName?: string
 ): Promise<{ orgPolicy: Policy | null; agentPolicy: Policy | null; exempt: boolean; dbPolicyId: string | null; dbPolicyVersion: number | null } | null> {
   try {
     const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
@@ -1425,17 +1448,102 @@ async function fetchPolicyForAgent(
     }
 
     const data = await response.json() as Record<string, unknown> | null;
-    if (!data) return null;
 
-    return {
-      orgPolicy: (data.org_policy as Policy) ?? null,
-      agentPolicy: (data.agent_policy as Policy) ?? null,
+    // If RPC returned a policy, use it
+    if (data?.agent_policy || data?.org_policy) {
+      return {
+        orgPolicy: (data.org_policy as Policy) ?? null,
+        agentPolicy: (data.agent_policy as Policy) ?? null,
+        exempt: (data.exempt as boolean) ?? false,
+        dbPolicyId: ((data.agent_policy_id ?? data.org_policy_id) as string) ?? null,
+        dbPolicyVersion: ((data.agent_policy_version ?? data.org_policy_version) as number) ?? null,
+      };
+    }
+
+    // Name-based fallback: resolve linked_agent_id or same-name agent with policy
+    if (agentName) {
+      const linkedId = await resolveLinkedAgentId(agentId, agentName, env);
+      if (linkedId) {
+        console.log(`[observer/policy] Name fallback: ${agentName} → ${linkedId}`);
+        const fallbackResponse = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
+          method: 'POST',
+          headers: {
+            apikey: env.SUPABASE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ p_agent_id: linkedId }),
+        });
+        if (fallbackResponse.ok) {
+          const fallbackData = await fallbackResponse.json() as Record<string, unknown> | null;
+          if (fallbackData?.agent_policy || fallbackData?.org_policy) {
+            return {
+              orgPolicy: (fallbackData.org_policy as Policy) ?? null,
+              agentPolicy: (fallbackData.agent_policy as Policy) ?? null,
+              exempt: (fallbackData.exempt as boolean) ?? false,
+              dbPolicyId: ((fallbackData.agent_policy_id ?? fallbackData.org_policy_id) as string) ?? null,
+              dbPolicyVersion: ((fallbackData.agent_policy_version ?? fallbackData.org_policy_version) as number) ?? null,
+            };
+          }
+        }
+      }
+    }
+
+    return data ? {
+      orgPolicy: null,
+      agentPolicy: null,
       exempt: (data.exempt as boolean) ?? false,
-      dbPolicyId: ((data.agent_policy_id ?? data.org_policy_id) as string) ?? null,
-      dbPolicyVersion: ((data.agent_policy_version ?? data.org_policy_version) as number) ?? null,
-    };
+      dbPolicyId: null,
+      dbPolicyVersion: null,
+    } : null;
   } catch (error) {
     console.warn('[observer/policy] fetchPolicyForAgent failed (fail-open):', error);
+    return null;
+  }
+}
+
+/**
+ * Resolve a linked agent ID for policy lookup via linked_agent_id column
+ * or same-name agent match.
+ */
+async function resolveLinkedAgentId(
+  agentId: string,
+  agentName: string,
+  env: Env
+): Promise<string | null> {
+  try {
+    // First check if this agent has a linked_agent_id
+    const linkedResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=linked_agent_id&limit=1`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+    if (linkedResponse.ok) {
+      const rows = await linkedResponse.json() as Array<{ linked_agent_id: string | null }>;
+      if (rows[0]?.linked_agent_id) return rows[0].linked_agent_id;
+    }
+
+    // Fallback: find same-name agent with an active policy
+    const nameResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/agents?name=eq.${encodeURIComponent(agentName)}&id=neq.${agentId}&select=id&limit=1`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+    if (nameResponse.ok) {
+      const nameRows = await nameResponse.json() as Array<{ id: string }>;
+      if (nameRows[0]?.id) return nameRows[0].id;
+    }
+
+    return null;
+  } catch {
     return null;
   }
 }
@@ -1636,9 +1744,9 @@ async function linkCheckpointToTrace(
   try {
     // Two-step GET-then-PATCH: PostgREST ignores `limit` on PATCH, so a single
     // PATCH with limit=1 would link ALL unlinked checkpoints for this agent+session.
-    // Step 1: GET the most recent unlinked checkpoint
+    // Step 1: GET the most recent unlinked checkpoint (include output analysis fields)
     const getResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&linked_trace_id=is.null&order=timestamp.desc&limit=1&select=checkpoint_id`,
+      `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&linked_trace_id=is.null&order=timestamp.desc&limit=1&select=checkpoint_id,output_block_hash,analysis_scope`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -1647,11 +1755,17 @@ async function linkCheckpointToTrace(
       }
     );
     if (!getResponse.ok) return;
-    const rows = await getResponse.json() as Array<{ checkpoint_id: string }>;
+    const rows = await getResponse.json() as Array<{ checkpoint_id: string; output_block_hash?: string; analysis_scope?: string }>;
     if (!rows.length) return;
 
+    // Log output analysis metadata if present
+    const cp = rows[0];
+    if (cp.output_block_hash || cp.analysis_scope) {
+      console.log(`[observer] Checkpoint ${cp.checkpoint_id}: analysis_scope=${cp.analysis_scope}, output_hash=${cp.output_block_hash?.substring(0, 12)}...`);
+    }
+
     // Step 2: PATCH that specific checkpoint by ID
-    const cpId = rows[0].checkpoint_id;
+    const cpId = cp.checkpoint_id;
     const patchResponse = await fetch(
       `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?checkpoint_id=eq.${cpId}`,
       {
