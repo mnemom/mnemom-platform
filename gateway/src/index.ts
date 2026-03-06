@@ -154,6 +154,7 @@ interface Agent {
   claimed_by: string | null;
   email: string | null;
   aip_enforcement_mode?: string;
+  linked_agent_id?: string | null;
 }
 
 interface AlignmentCard {
@@ -2530,7 +2531,8 @@ function extractToolsFromRequest(
  */
 async function fetchPolicyForAgent(
   agentId: string,
-  env: Env
+  env: Env,
+  linkedAgentId?: string | null
 ): Promise<{
   orgPolicy: Policy | null;
   agentPolicy: Policy | null;
@@ -2539,6 +2541,9 @@ async function fetchPolicyForAgent(
   dbPolicyVersion: number | null;
 } | null> {
   try {
+    // If a linked_agent_id exists, try that first (permanent identity link)
+    const lookupId = linkedAgentId || agentId;
+
     const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
       method: 'POST',
       headers: {
@@ -2546,16 +2551,22 @@ async function fetchPolicyForAgent(
         Authorization: `Bearer ${env.SUPABASE_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ p_agent_id: agentId }),
+      body: JSON.stringify({ p_agent_id: lookupId }),
     });
 
     if (!response.ok) {
-      console.warn(`[gateway/policy] RPC failed for ${agentId}: ${response.status}`);
+      console.warn(`[gateway/policy] RPC failed for ${lookupId}: ${response.status}`);
       return null;
     }
 
     const data = await response.json() as Record<string, unknown> | null;
-    if (!data) return null;
+    if (!data) {
+      // If we used linkedAgentId and got nothing, try original agentId
+      if (linkedAgentId && linkedAgentId !== agentId) {
+        return fetchPolicyForAgent(agentId, env);
+      }
+      return null;
+    }
 
     return {
       orgPolicy: (data.org_policy as Policy) ?? null,
@@ -2566,6 +2577,70 @@ async function fetchPolicyForAgent(
     };
   } catch (error) {
     console.warn('[gateway/policy] fetchPolicyForAgent failed (fail-open):', error);
+    return null;
+  }
+}
+
+/**
+ * Fetch policy by looking up the agent's registered name.
+ * Used as fallback when the gateway-generated smolt-* ID has no policy.
+ * If a match is found, auto-links the IDs so future lookups are instant.
+ * Fail-open: returns null on error.
+ */
+async function fetchPolicyByAgentName(
+  agentName: string,
+  currentAgentId: string,
+  env: Env
+): Promise<{
+  orgPolicy: Policy | null;
+  agentPolicy: Policy | null;
+  exempt: boolean;
+  dbPolicyId: string | null;
+  dbPolicyVersion: number | null;
+} | null> {
+  try {
+    const headers = {
+      apikey: env.SUPABASE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    };
+
+    // Look up agents by name
+    const lookupResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/agents?name=eq.${encodeURIComponent(agentName)}&select=id`,
+      { headers }
+    );
+
+    if (!lookupResponse.ok) {
+      console.warn(`[gateway/policy] Agent name lookup failed for "${agentName}": ${lookupResponse.status}`);
+      return null;
+    }
+
+    const agents: { id: string }[] = await lookupResponse.json();
+    if (agents.length === 0) return null;
+
+    // Try each matching agent's policy
+    for (const candidate of agents) {
+      if (candidate.id === currentAgentId) continue; // Skip self
+      const result = await fetchPolicyForAgent(candidate.id, env);
+      if (result) {
+        // Auto-link: PATCH current agent with linked_agent_id for future lookups
+        fetch(
+          `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${currentAgentId}`,
+          {
+            method: 'PATCH',
+            headers: { ...headers, 'Prefer': 'return=minimal' },
+            body: JSON.stringify({ linked_agent_id: candidate.id }),
+          }
+        ).catch(() => {}); // Best-effort, don't block
+        console.log(`[gateway/policy] Name fallback matched "${agentName}" → ${candidate.id}, linked from ${currentAgentId}`);
+        return result;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.warn('[gateway/policy] fetchPolicyByAgentName failed (fail-open):', error);
     return null;
   }
 }
@@ -2891,9 +2966,14 @@ export async function handleProviderProxy(
 
     // Always resolve quota context — agent_settings needed for feature gating
     // Policy fetch runs in parallel with quota resolution (zero added latency)
+    // CLPI identity fix: use linked_agent_id if available, fall back to name lookup
     const [quotaContext, policyData, txnGuardrails] = await Promise.all([
       resolveQuotaContext(agent.id, env, mnemomKeyHash),
-      fetchPolicyForAgent(agent.id, env),
+      fetchPolicyForAgent(agent.id, env, agent.linked_agent_id).then(async (result) => {
+        if (result) return result;
+        if (agentName) return fetchPolicyByAgentName(agentName, agent.id, env);
+        return null;
+      }),
       transactionId ? fetchTransactionGuardrails(agent.id, transactionId, env) : Promise.resolve(null),
     ]);
     const agentSettings = quotaContext.agent_settings;
