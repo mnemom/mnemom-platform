@@ -29,6 +29,8 @@ import {
   type DriftState,
   type CheckIntegrityInput,
   type ConscienceValue,
+  type DetectionRecipe,
+  type RecipeParsedContent,
 } from '@mnemom/agent-integrity-protocol';
 
 import { createWorkersExporter } from '@mnemom/aip-otel-exporter/workers';
@@ -930,53 +932,13 @@ async function fetchOrgConscienceValuesForGateway(
 }
 
 // === Recipe Engine Types & Functions ===
-
-interface ParsedRecipe {
-  id: string;
-  version: number;
-  technique_category: string;
-  technique_ids: string[];
-  severity: string;
-  scope: string;
-  has_tier1: boolean;
-  has_tier2: boolean;
-  has_tier3: boolean;
-  parsed_content: {
-    tier1?: {
-      match: 'any' | 'all';
-      conditions: Array<{
-        metric: string;
-        operator: string;
-        threshold: number | string;
-        signal: string;
-      }>;
-    };
-    tier2?: {
-      trigger: {
-        on_signals?: string[];
-        on_categories?: string[];
-      };
-      checks: Array<{
-        id: string;
-        type: string;
-        content: string;
-      }>;
-    };
-    tier3?: {
-      rules: Array<{
-        when: { tier1_escalated: boolean; aip_verdict: string };
-        action: string;
-        reason: string;
-      }>;
-    };
-  };
-}
+// DetectionRecipe and RecipeParsedContent imported from @mnemom/agent-integrity-protocol
 
 /**
  * Fetch active detection recipes from Supabase via RPC.
  * Uses KV cache (5-min TTL). Fail-open: returns empty array on error.
  */
-async function fetchActiveRecipes(env: Env): Promise<ParsedRecipe[]> {
+async function fetchActiveRecipes(env: Env): Promise<DetectionRecipe[]> {
   const cacheKey = 'active-recipes';
   if (env.BILLING_CACHE) {
     const cached = await env.BILLING_CACHE.get(cacheKey);
@@ -993,7 +955,7 @@ async function fetchActiveRecipes(env: Env): Promise<ParsedRecipe[]> {
       body: '{}',
     });
     if (!response.ok) return [];
-    const recipes = await response.json() as ParsedRecipe[];
+    const recipes = await response.json() as DetectionRecipe[];
     if (env.BILLING_CACHE) {
       await env.BILLING_CACHE.put(cacheKey, JSON.stringify(recipes), { expirationTtl: 300 }).catch(() => {});
     }
@@ -1005,7 +967,7 @@ async function fetchActiveRecipes(env: Env): Promise<ParsedRecipe[]> {
 
 interface Tier1Result {
   signals: string[];
-  matchedRecipes: ParsedRecipe[];
+  matchedRecipes: DetectionRecipe[];
   escalated: boolean;
 }
 
@@ -1014,7 +976,7 @@ interface Tier1Result {
  * Evaluates recipe conditions against computed metrics from thinking/output blocks.
  */
 function evaluateTier1(
-  recipes: ParsedRecipe[],
+  recipes: DetectionRecipe[],
   thinkingBlock: string,
   outputBlock: string | undefined,
   inputTokens: number,
@@ -1029,7 +991,7 @@ function evaluateTier1(
   };
 
   const signals: string[] = [];
-  const matchedRecipes: ParsedRecipe[] = [];
+  const matchedRecipes: DetectionRecipe[] = [];
 
   for (const recipe of recipes) {
     if (!recipe.has_tier1 || !recipe.parsed_content.tier1) continue;
@@ -1068,7 +1030,7 @@ function evaluateTier1(
  * Tier 2: Select conscience checks to inject based on Tier 1 signals.
  */
 function selectTier2Checks(
-  recipes: ParsedRecipe[],
+  recipes: DetectionRecipe[],
   signals: string[],
   techniqueCategory?: string
 ): Array<{ id: string; content: string; type: string }> {
