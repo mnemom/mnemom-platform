@@ -3810,6 +3810,57 @@ export async function handleProviderProxy(
 
       // Build conscience prompt
       const values: ConscienceValue[] = conscienceValues || [...DEFAULT_CONSCIENCE_VALUES];
+
+      // === Recipe Engine: Fetch settings + recipes in parallel ===
+      let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false };
+      let tier2RecipeIds: string[] = [];
+      let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
+      try {
+        const [settings, activeRecipes] = await Promise.all([
+          fetchSecuritySettings(env),
+          fetchActiveRecipes(env),
+        ]);
+        tierConfig = settings;
+        console.log(`[recipe-engine] Config: t1=${tierConfig.tier1_enabled} t2=${tierConfig.tier2_enabled} t3=${tierConfig.tier3_enabled} recipes=${activeRecipes.length}`);
+
+        if (activeRecipes.length > 0) {
+          // Count tool calls from response body for Tier 1 metrics
+          let toolCallCount = 0;
+          try {
+            const respBody = JSON.parse(responseBodyText) as Record<string, unknown>;
+            const content = respBody.content as Array<Record<string, unknown>> | undefined;
+            if (Array.isArray(content)) {
+              toolCallCount = content.filter(b => b.type === 'tool_use').length;
+            }
+          } catch { /* fail-open */ }
+
+          // Tier 1: heuristic prefilter (only if enabled)
+          if (tierConfig.tier1_enabled) {
+            tier1Result = evaluateTier1(activeRecipes, thinking.content, outputText, thinking.content.length, outputText?.length || 0, toolCallCount);
+            if (tier1Result.escalated) {
+              console.log(`[recipe-engine] Tier 1 escalated: signals=${tier1Result.signals.join(',')}`);
+            }
+          }
+
+          // Tier 2: inject recipe checks into AIP conscience analysis
+          if (tierConfig.tier2_enabled) {
+            const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled });
+            for (const check of tier2Checks) {
+              values.push({ id: check.id, content: check.content, type: check.type as ConscienceValue['type'] });
+            }
+            const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
+            const recipesWithTier2 = activeRecipes.filter(r => r.has_tier2).length;
+            tier2RecipeIds = tierConfig.tier1_enabled
+              ? tier1Result.matchedRecipes.map(r => r.id)
+              : activeRecipes.filter(r => r.has_tier2).map(r => r.id);
+            console.log(`[recipe-engine] Tier 2: injected ${tier2Checks.length} checks from ${recipesWithTier2} recipes (mode=${mode})`);
+          }
+        }
+      } catch (e) {
+        console.error('[recipe-engine] Error evaluating recipes:', e);
+        // Fail open — continue without recipe checks
+      }
+
       // Build task context from request messages and card description (PII-safe)
       const gatewayAgentDesc = card?.extensions?.mnemom?.description
         || card?.extensions?.mnemom?.role
@@ -3891,6 +3942,31 @@ export async function handleProviderProxy(
         analysisDurationMs,
       });
 
+      // === Recipe Engine: Tier 3 Cross-validation (requires both T1 and T3 enabled) ===
+      if (tierConfig.tier3_enabled && tierConfig.tier1_enabled && tier1Result.escalated && checkpoint.verdict === 'clear') {
+        for (const recipe of tier1Result.matchedRecipes) {
+          const t3 = recipe.parsed_content.tier3;
+          if (!t3) continue;
+          for (const rule of t3.rules) {
+            if (rule.when.tier1_escalated && rule.when.aip_verdict === 'clear' && rule.action === 'override_to_review') {
+              checkpoint.verdict = 'review_needed';
+              checkpoint.concerns = checkpoint.concerns || [];
+              checkpoint.concerns.push({
+                category: 'undeclared_intent',
+                description: rule.reason || 'Heuristic signals contradicted clear verdict',
+                severity: 'medium',
+                evidence: `Tier 1 signals: ${tier1Result.signals.join(', ')}`,
+                relevant_card_field: null,
+                relevant_conscience_value: null,
+              });
+              console.log(`[recipe-engine] Tier 3 override: clear → review_needed (recipe=${recipe.id})`);
+              break;
+            }
+          }
+          if (checkpoint.verdict === 'review_needed') break;
+        }
+      }
+
       // Push to window, get summary, build signal
       window.push(checkpoint);
       const summary = window.getSummary();
@@ -3937,6 +4013,9 @@ export async function handleProviderProxy(
 
       // Background: store checkpoint (with attestation), deliver webhooks, meter, flush OTel
       ctx.waitUntil(storeCheckpoint(checkpoint, 'gateway', env, attestation));
+      // Record recipe hits (matched = Tier 2 injected, triggered = Tier 1 fired)
+      const triggeredRecipeIds = tier1Result.matchedRecipes.map(r => r.id);
+      ctx.waitUntil(recordRecipeHits(env, checkpoint.checkpoint_id, tier2RecipeIds, triggeredRecipeIds));
       ctx.waitUntil(submitMeteringEvent(agent.id, checkpoint.checkpoint_id, 'gateway', env));
       ctx.waitUntil(deliverWebhooks(checkpoint, env));
       if (otelExporter) {
