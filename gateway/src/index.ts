@@ -1961,7 +1961,7 @@ async function analyzeStreamInBackground(
     // Call analysis LLM (Haiku)
     console.log(`[gateway/stream-aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${parsed.thinking.length} output_analysis=${!!outputText}`);
     const analysisStartTime = Date.now();
-    const rawAnalysisResponse = await callAnalysisLLM(prompt.system, prompt.user, env);
+    const rawAnalysisResponse = await callAnalysisLLM(prompt.system, prompt.user, env, { analyzeOutput });
     const analysisDurationMs = Date.now() - analysisStartTime;
 
     const jsonMatch = rawAnalysisResponse.match(/\{[\s\S]*\}/);
@@ -2123,7 +2123,8 @@ async function markNudgesDelivered(
 async function callAnalysisLLM(
   system: string,
   user: string,
-  env: Env
+  env: Env,
+  options?: { analyzeOutput?: boolean }
 ): Promise<string> {
   // Circuit breaker: skip calls during sustained API failures
   if (analysisCircuitBreaker.isOpen) {
@@ -2136,7 +2137,9 @@ async function callAnalysisLLM(
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const timeoutMs = options?.analyzeOutput ? 15000 : 10000;
+  const maxTokens = options?.analyzeOutput ? 2048 : 1024;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -2148,7 +2151,7 @@ async function callAnalysisLLM(
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1024,
+        max_tokens: maxTokens,
         system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: user }],
       }),
@@ -3567,7 +3570,7 @@ export async function handleProviderProxy(
       // Call analysis LLM (Haiku)
       console.log(`[gateway/aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${thinking.content.length} output_analysis=${!!outputText}`);
       const analysisStartTime = Date.now();
-      const rawAnalysisResponse = await callAnalysisLLM(prompt.system, prompt.user, env);
+      const rawAnalysisResponse = await callAnalysisLLM(prompt.system, prompt.user, env, { analyzeOutput });
       const analysisDurationMs = Date.now() - analysisStartTime;
 
       // Strip markdown code fences if present (claude-haiku-4-5 wraps JSON in ```json...```)
