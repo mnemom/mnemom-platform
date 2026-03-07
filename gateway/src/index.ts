@@ -965,6 +965,52 @@ async function fetchActiveRecipes(env: Env): Promise<DetectionRecipe[]> {
   }
 }
 
+// === Security Settings ===
+
+interface SecuritySettings {
+  tier1_enabled: boolean;
+  tier2_enabled: boolean;
+  tier3_enabled: boolean;
+}
+
+const DEFAULT_SECURITY_SETTINGS: SecuritySettings = {
+  tier1_enabled: true,
+  tier2_enabled: true,
+  tier3_enabled: true,
+};
+
+/**
+ * Fetch global tier flags from security_settings.
+ * Uses KV cache (2-min TTL). Fail-open: returns defaults (all tiers on).
+ */
+async function fetchSecuritySettings(env: Env): Promise<SecuritySettings> {
+  const cacheKey = 'security-settings';
+  if (env.BILLING_CACHE) {
+    const cached = await env.BILLING_CACHE.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+  }
+  try {
+    const response = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/security_settings?id=eq.1&select=tier1_enabled,tier2_enabled,tier3_enabled`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          Accept: 'application/vnd.pgrst.object+json',
+        },
+      }
+    );
+    if (!response.ok) return { ...DEFAULT_SECURITY_SETTINGS };
+    const settings = await response.json() as SecuritySettings;
+    if (env.BILLING_CACHE) {
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(settings), { expirationTtl: 120 }).catch(() => {});
+    }
+    return settings;
+  } catch {
+    return { ...DEFAULT_SECURITY_SETTINGS };
+  }
+}
+
 interface Tier1Result {
   signals: string[];
   matchedRecipes: DetectionRecipe[];
@@ -980,14 +1026,15 @@ function evaluateTier1(
   thinkingBlock: string,
   outputBlock: string | undefined,
   inputTokens: number,
-  outputTokens: number
+  outputTokens: number,
+  toolCallCount: number = 0
 ): Tier1Result {
   const metrics: Record<string, number | string> = {
     thinking_output_ratio: outputTokens > 0 ? thinkingBlock.length / (outputBlock?.length || 1) : 0,
     output_token_count: outputTokens,
     thinking_token_count: thinkingBlock.length,
     hedging_word_count: (outputBlock || '').match(/\b(perhaps|maybe|might|could|uncertain|approximately|roughly)\b/gi)?.length || 0,
-    tool_call_count: 0,
+    tool_call_count: toolCallCount,
   };
 
   const signals: string[] = [];
@@ -1027,22 +1074,32 @@ function evaluateTier1(
 }
 
 /**
- * Tier 2: Select conscience checks to inject based on Tier 1 signals.
+ * Tier 2: Select conscience checks to inject into AIP analysis.
+ * When tier1Ran=false (broad mode): inject ALL tier2 checks from active recipes.
+ * When tier1Ran=true (targeted mode): filter by Tier 1 signal/category match.
  */
 function selectTier2Checks(
   recipes: DetectionRecipe[],
   signals: string[],
-  techniqueCategory?: string
+  opts?: { techniqueCategory?: string; tier1Ran?: boolean }
 ): Array<{ id: string; content: string; type: string }> {
   const checks: Array<{ id: string; content: string; type: string }> = [];
   for (const recipe of recipes) {
     if (!recipe.has_tier2 || !recipe.parsed_content.tier2) continue;
-    const trigger = recipe.parsed_content.tier2.trigger;
-    const signalMatch = trigger.on_signals?.some(s => signals.includes(s));
-    const categoryMatch = techniqueCategory && trigger.on_categories?.includes(techniqueCategory);
-    if (signalMatch || categoryMatch) {
+    if (!opts?.tier1Ran) {
+      // Broad mode: inject all tier2 checks unconditionally
       for (const check of recipe.parsed_content.tier2.checks) {
         checks.push({ id: check.id, content: check.content, type: 'BOUNDARY' });
+      }
+    } else {
+      // Targeted mode: filter by Tier 1 signal/category match
+      const trigger = recipe.parsed_content.tier2.trigger;
+      const signalMatch = trigger.on_signals?.some(s => signals.includes(s));
+      const categoryMatch = opts.techniqueCategory && trigger.on_categories?.includes(opts.techniqueCategory);
+      if (signalMatch || categoryMatch) {
+        for (const check of recipe.parsed_content.tier2.checks) {
+          checks.push({ id: check.id, content: check.content, type: 'BOUNDARY' });
+        }
       }
     }
   }
@@ -1301,6 +1358,36 @@ async function storeCheckpoint(
     }
   } catch (error) {
     console.error('[gateway/aip] Error storing checkpoint:', error);
+  }
+}
+
+/**
+ * Record which detection recipes matched (Tier 2 injected) and triggered (Tier 1 fired)
+ * for a given checkpoint. Calls the record_recipe_hits RPC. Fail-open.
+ */
+async function recordRecipeHits(
+  env: Env,
+  checkpointId: string,
+  matchedRecipeIds: string[],
+  triggeredRecipeIds: string[]
+): Promise<void> {
+  if (matchedRecipeIds.length === 0 && triggeredRecipeIds.length === 0) return;
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/record_recipe_hits`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      },
+      body: JSON.stringify({
+        p_checkpoint_id: checkpointId,
+        p_matched_ids: matchedRecipeIds,
+        p_triggered_ids: triggeredRecipeIds,
+      }),
+    });
+  } catch (e) {
+    console.error('[recipe-hits] Failed to record:', e);
   }
 }
 
@@ -2044,20 +2131,39 @@ async function analyzeStreamInBackground(
     // 9. Build conscience prompt and call analysis LLM
     const values: ConscienceValue[] = conscienceValues || [...DEFAULT_CONSCIENCE_VALUES];
 
-    // === Recipe Engine: Tier 1 + Tier 2 ===
+    // === Recipe Engine: Fetch settings + recipes in parallel ===
     let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false };
     let tier2RecipeIds: string[] = [];
+    let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
     try {
-      const activeRecipes = await fetchActiveRecipes(env);
+      const [settings, activeRecipes] = await Promise.all([
+        fetchSecuritySettings(env),
+        fetchActiveRecipes(env),
+      ]);
+      tierConfig = settings;
+      console.log(`[recipe-engine] Config: t1=${tierConfig.tier1_enabled} t2=${tierConfig.tier2_enabled} t3=${tierConfig.tier3_enabled} recipes=${activeRecipes.length}`);
+
       if (activeRecipes.length > 0) {
-        tier1Result = evaluateTier1(activeRecipes, parsed.thinking, outputText, parsed.thinking.length, outputText?.length || 0);
-        if (tier1Result.escalated) {
-          const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals);
+        // Tier 1: heuristic prefilter (only if enabled)
+        if (tierConfig.tier1_enabled) {
+          tier1Result = evaluateTier1(activeRecipes, parsed.thinking, outputText, parsed.thinking.length, outputText?.length || 0, parsed.toolCalls?.length || 0);
+          if (tier1Result.escalated) {
+            console.log(`[recipe-engine] Tier 1 escalated: signals=${tier1Result.signals.join(',')}`);
+          }
+        }
+
+        // Tier 2: inject recipe checks into AIP conscience analysis
+        if (tierConfig.tier2_enabled) {
+          const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled });
           for (const check of tier2Checks) {
             values.push({ id: check.id, content: check.content, type: check.type as ConscienceValue['type'] });
           }
-          tier2RecipeIds = tier1Result.matchedRecipes.map(r => r.id);
-          console.log(`[recipe-engine] Tier 1 escalated: signals=${tier1Result.signals.join(',')} tier2_checks=${tier2Checks.length}`);
+          const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
+          const recipesWithTier2 = activeRecipes.filter(r => r.has_tier2).length;
+          tier2RecipeIds = tierConfig.tier1_enabled
+            ? tier1Result.matchedRecipes.map(r => r.id)
+            : activeRecipes.filter(r => r.has_tier2).map(r => r.id);
+          console.log(`[recipe-engine] Tier 2: injected ${tier2Checks.length} checks from ${recipesWithTier2} recipes (mode=${mode})`);
         }
       }
     } catch (e) {
@@ -2141,8 +2247,8 @@ async function analyzeStreamInBackground(
       analysisDurationMs,
     });
 
-    // === Recipe Engine: Tier 3 Cross-validation ===
-    if (tier1Result.escalated && checkpoint.verdict === 'clear') {
+    // === Recipe Engine: Tier 3 Cross-validation (requires both T1 and T3 enabled) ===
+    if (tierConfig.tier3_enabled && tierConfig.tier1_enabled && tier1Result.escalated && checkpoint.verdict === 'clear') {
       for (const recipe of tier1Result.matchedRecipes) {
         const t3 = recipe.parsed_content.tier3;
         if (!t3) continue;
@@ -2200,6 +2306,11 @@ async function analyzeStreamInBackground(
 
     // 13. Store checkpoint, submit metering, deliver webhooks
     await storeCheckpoint(checkpoint, 'gateway', env, attestation);
+
+    // 13a. Record recipe hits (matched = Tier 2 injected, triggered = Tier 1 fired)
+    const triggeredRecipeIds = tier1Result.matchedRecipes.map(r => r.id);
+    await recordRecipeHits(env, checkpoint.checkpoint_id, tier2RecipeIds, triggeredRecipeIds);
+
     await submitMeteringEvent(agent.id, checkpoint.checkpoint_id, 'gateway', env);
     await deliverWebhooks(checkpoint, env);
     if (otelExporter) {
