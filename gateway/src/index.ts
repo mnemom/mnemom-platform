@@ -929,6 +929,164 @@ async function fetchOrgConscienceValuesForGateway(
   }
 }
 
+// === Recipe Engine Types & Functions ===
+
+interface ParsedRecipe {
+  id: string;
+  version: number;
+  technique_category: string;
+  technique_ids: string[];
+  severity: string;
+  scope: string;
+  has_tier1: boolean;
+  has_tier2: boolean;
+  has_tier3: boolean;
+  parsed_content: {
+    tier1?: {
+      match: 'any' | 'all';
+      conditions: Array<{
+        metric: string;
+        operator: string;
+        threshold: number | string;
+        signal: string;
+      }>;
+    };
+    tier2?: {
+      trigger: {
+        on_signals?: string[];
+        on_categories?: string[];
+      };
+      checks: Array<{
+        id: string;
+        type: string;
+        content: string;
+      }>;
+    };
+    tier3?: {
+      rules: Array<{
+        when: { tier1_escalated: boolean; aip_verdict: string };
+        action: string;
+        reason: string;
+      }>;
+    };
+  };
+}
+
+/**
+ * Fetch active detection recipes from Supabase via RPC.
+ * Uses KV cache (5-min TTL). Fail-open: returns empty array on error.
+ */
+async function fetchActiveRecipes(env: Env): Promise<ParsedRecipe[]> {
+  const cacheKey = 'active-recipes';
+  if (env.BILLING_CACHE) {
+    const cached = await env.BILLING_CACHE.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+  }
+  try {
+    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_active_detection_recipes`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    if (!response.ok) return [];
+    const recipes = await response.json() as ParsedRecipe[];
+    if (env.BILLING_CACHE) {
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(recipes), { expirationTtl: 300 }).catch(() => {});
+    }
+    return recipes;
+  } catch {
+    return [];
+  }
+}
+
+interface Tier1Result {
+  signals: string[];
+  matchedRecipes: ParsedRecipe[];
+  escalated: boolean;
+}
+
+/**
+ * Tier 1: Pure heuristic prefilter — no LLM calls.
+ * Evaluates recipe conditions against computed metrics from thinking/output blocks.
+ */
+function evaluateTier1(
+  recipes: ParsedRecipe[],
+  thinkingBlock: string,
+  outputBlock: string | undefined,
+  inputTokens: number,
+  outputTokens: number
+): Tier1Result {
+  const metrics: Record<string, number | string> = {
+    thinking_output_ratio: outputTokens > 0 ? thinkingBlock.length / (outputBlock?.length || 1) : 0,
+    output_token_count: outputTokens,
+    thinking_token_count: thinkingBlock.length,
+    hedging_word_count: (outputBlock || '').match(/\b(perhaps|maybe|might|could|uncertain|approximately|roughly)\b/gi)?.length || 0,
+    tool_call_count: 0,
+  };
+
+  const signals: string[] = [];
+  const matchedRecipes: ParsedRecipe[] = [];
+
+  for (const recipe of recipes) {
+    if (!recipe.has_tier1 || !recipe.parsed_content.tier1) continue;
+    const t1 = recipe.parsed_content.tier1;
+    const condResults = t1.conditions.map(cond => {
+      const val = metrics[cond.metric];
+      if (val === undefined) return false;
+      const numVal = typeof val === 'number' ? val : parseFloat(val as string);
+      const threshold = typeof cond.threshold === 'number' ? cond.threshold : parseFloat(cond.threshold as string);
+      switch (cond.operator) {
+        case 'lt': return numVal < threshold;
+        case 'lte': return numVal <= threshold;
+        case 'gt': return numVal > threshold;
+        case 'gte': return numVal >= threshold;
+        case 'eq': return numVal === threshold;
+        case 'neq': return numVal !== threshold;
+        case 'matches': return new RegExp(String(cond.threshold)).test(String(val));
+        case 'contains': return String(val).includes(String(cond.threshold));
+        default: return false;
+      }
+    });
+    const matched = t1.match === 'all' ? condResults.every(Boolean) : condResults.some(Boolean);
+    if (matched) {
+      matchedRecipes.push(recipe);
+      for (const cond of t1.conditions) {
+        const idx = t1.conditions.indexOf(cond);
+        if (condResults[idx] && cond.signal) signals.push(cond.signal);
+      }
+    }
+  }
+
+  return { signals: [...new Set(signals)], matchedRecipes, escalated: signals.length > 0 };
+}
+
+/**
+ * Tier 2: Select conscience checks to inject based on Tier 1 signals.
+ */
+function selectTier2Checks(
+  recipes: ParsedRecipe[],
+  signals: string[],
+  techniqueCategory?: string
+): Array<{ id: string; content: string; type: string }> {
+  const checks: Array<{ id: string; content: string; type: string }> = [];
+  for (const recipe of recipes) {
+    if (!recipe.has_tier2 || !recipe.parsed_content.tier2) continue;
+    const trigger = recipe.parsed_content.tier2.trigger;
+    const signalMatch = trigger.on_signals?.some(s => signals.includes(s));
+    const categoryMatch = techniqueCategory && trigger.on_categories?.includes(techniqueCategory);
+    if (signalMatch || categoryMatch) {
+      for (const check of recipe.parsed_content.tier2.checks) {
+        checks.push({ id: check.id, content: check.content, type: 'BOUNDARY' });
+      }
+    }
+  }
+  return checks;
+}
+
 /**
  * Fetch org card template for an agent (Phase 3c).
  * Uses KV cache (30-min TTL) → Supabase RPC. Fail-open: returns null on error.
@@ -1924,6 +2082,27 @@ async function analyzeStreamInBackground(
     // 9. Build conscience prompt and call analysis LLM
     const values: ConscienceValue[] = conscienceValues || [...DEFAULT_CONSCIENCE_VALUES];
 
+    // === Recipe Engine: Tier 1 + Tier 2 ===
+    let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false };
+    let tier2RecipeIds: string[] = [];
+    try {
+      const activeRecipes = await fetchActiveRecipes(env);
+      if (activeRecipes.length > 0) {
+        tier1Result = evaluateTier1(activeRecipes, parsed.thinking, outputText, parsed.thinking.length, outputText?.length || 0);
+        if (tier1Result.escalated) {
+          const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals);
+          for (const check of tier2Checks) {
+            values.push({ id: check.id, content: check.content, type: check.type as ConscienceValue['type'] });
+          }
+          tier2RecipeIds = tier1Result.matchedRecipes.map(r => r.id);
+          console.log(`[recipe-engine] Tier 1 escalated: signals=${tier1Result.signals.join(',')} tier2_checks=${tier2Checks.length}`);
+        }
+      }
+    } catch (e) {
+      console.error('[recipe-engine] Error evaluating recipes:', e);
+      // Fail open — continue without recipe checks
+    }
+
     const gatewayAgentDesc = card?.extensions?.mnemom?.description
       || card?.extensions?.mnemom?.role
       || '';
@@ -1999,6 +2178,31 @@ async function analyzeStreamInBackground(
       analysisModel: 'claude-haiku-4-5-20251001',
       analysisDurationMs,
     });
+
+    // === Recipe Engine: Tier 3 Cross-validation ===
+    if (tier1Result.escalated && checkpoint.verdict === 'clear') {
+      for (const recipe of tier1Result.matchedRecipes) {
+        const t3 = recipe.parsed_content.tier3;
+        if (!t3) continue;
+        for (const rule of t3.rules) {
+          if (rule.when.tier1_escalated && rule.when.aip_verdict === 'clear' && rule.action === 'override_to_review') {
+            checkpoint.verdict = 'review_needed';
+            checkpoint.concerns = checkpoint.concerns || [];
+            checkpoint.concerns.push({
+              category: 'undeclared_intent',
+              description: rule.reason || 'Heuristic signals contradicted clear verdict',
+              severity: 'medium',
+              evidence: `Tier 1 signals: ${tier1Result.signals.join(', ')}`,
+              relevant_card_field: null,
+              relevant_conscience_value: null,
+            });
+            console.log(`[recipe-engine] Tier 3 override: clear → review_needed (recipe=${recipe.id})`);
+            break;
+          }
+        }
+        if (checkpoint.verdict === 'review_needed') break;
+      }
+    }
 
     window.push(checkpoint);
     const summary = window.getSummary();
