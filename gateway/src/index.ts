@@ -177,6 +177,7 @@ export interface AgentSettings {
   aip_enabled: boolean;
   proof_enabled: boolean;
   proof_rate: number;
+  proof_boundary_cap?: number; // Max % of boundary violations to prove (default 100). Reduces to stochastic sampling when card_gaps aren't available.
   nudge_strategy?: 'always' | 'sampling' | 'threshold' | 'off';
   nudge_rate?: number;
   nudge_threshold?: number;
@@ -1425,23 +1426,48 @@ async function recordRecipeHits(
 
 /**
  * Determine whether a checkpoint should be proven via zkVM.
- * boundary_violation verdicts are always proven (when enabled).
- * Other verdicts are stochastically sampled at the configured proof_rate.
+ *
+ * Tiered proving strategy:
+ * - If card_gaps detected alongside a boundary_violation, the violation is likely
+ *   due to a stale alignment card, not real agent misbehavior. Defer proving to
+ *   let DDR reconciliation classify first (returns 'deferred').
+ * - boundary_violations with no card_gaps are proven, subject to proof_boundary_cap.
+ * - Other verdicts are stochastically sampled at the configured proof_rate.
+ *
+ * Returns: 'prove' | 'deferred' | 'skip'
  */
 function shouldProve(
   checkpoint: { verdict: string },
   agentSettings: AgentSettings | null,
-): boolean {
+  policyCardGaps?: unknown[] | null,
+): 'prove' | 'deferred' | 'skip' {
   if (!agentSettings?.proof_enabled) {
-    console.log(`[gateway/proof] shouldProve=false: proof_enabled=${agentSettings?.proof_enabled}`);
-    return false;
+    console.log(`[gateway/proof] shouldProve=skip: proof_enabled=${agentSettings?.proof_enabled}`);
+    return 'skip';
   }
-  if (checkpoint.verdict === 'boundary_violation') return true;
+
+  if (checkpoint.verdict === 'boundary_violation') {
+    // Card-gap detected: defer proving — DDR will classify and trigger proof if needed
+    if (policyCardGaps && policyCardGaps.length > 0) {
+      console.log(`[gateway/proof] shouldProve=deferred: ${policyCardGaps.length} card_gaps detected, deferring to DDR`);
+      return 'deferred';
+    }
+    // No card-gap info: apply boundary cap (default 100% = always prove)
+    const cap = (agentSettings.proof_boundary_cap ?? 100) / 100;
+    if (cap >= 1) return 'prove';
+    const bytes = new Uint8Array(4);
+    crypto.getRandomValues(bytes);
+    const rand = new DataView(bytes.buffer).getUint32(0) / 0xFFFFFFFF;
+    const result = rand < cap ? 'prove' : 'skip';
+    console.log(`[gateway/proof] shouldProve=${result}: boundary_violation cap=${cap} rand=${rand.toFixed(4)}`);
+    return result;
+  }
+
   const rate = (agentSettings.proof_rate ?? 10) / 100;
   const bytes = new Uint8Array(4);
   crypto.getRandomValues(bytes);
   const rand = new DataView(bytes.buffer).getUint32(0) / 0xFFFFFFFF;
-  const result = rand < rate;
+  const result = rand < rate ? 'prove' : 'skip';
   console.log(`[gateway/proof] shouldProve=${result}: verdict=${checkpoint.verdict} rate=${rate} rand=${rand.toFixed(4)}`);
   return result;
 }
@@ -1522,6 +1548,55 @@ async function requestProof(
     }),
   }).then(r => console.log(`[gateway/proof] Prover POST: ${r.status}`))
     .catch(err => console.warn(`[gateway/proof] Prover POST failed:`, err));
+}
+
+/**
+ * Record a deferred proof row in verdict_proofs. No GPU work is triggered.
+ * DDR reconciliation in the observer will later resolve the proof as either
+ * 'skipped_card_gap' (no cost) or upgrade to 'pending' and POST to the prover.
+ */
+async function deferProof(
+  checkpointId: string,
+  checkpointData: {
+    analysis_response_text?: string;
+    thinking_block_hash: string;
+    card_hash?: string;
+    values_hash?: string;
+    model: string;
+  },
+  env: Env,
+): Promise<void> {
+  const proofId = `prf-${crypto.randomUUID().slice(0, 8)}`;
+  console.log(`[gateway/proof] deferProof: ${proofId} for checkpoint ${checkpointId} (awaiting DDR)`);
+
+  try {
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        proof_id: proofId,
+        checkpoint_id: checkpointId,
+        proof_type: 'sp1-stark',
+        status: 'deferred',
+        analysis_json: checkpointData.analysis_response_text || '',
+        thinking_hash: checkpointData.thinking_block_hash,
+        card_hash: checkpointData.card_hash || '',
+        values_hash: checkpointData.values_hash || '',
+        model: checkpointData.model,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(`[gateway/proof] deferProof DB INSERT failed: ${res.status} ${body}`);
+    }
+  } catch (err) {
+    console.error(`[gateway/proof] deferProof DB INSERT error:`, err);
+  }
 }
 
 /**
@@ -2357,8 +2432,9 @@ async function analyzeStreamInBackground(
       await otelExporter.flush();
     }
 
-    // 13b. Request ZK proof if enabled
-    if (shouldProve(checkpoint, agentSettings)) {
+    // 13b. Request ZK proof if enabled (streaming path has no policy eval, so no card_gaps)
+    const proofDecision = shouldProve(checkpoint, agentSettings, null);
+    if (proofDecision === 'prove') {
       await requestProof(
         checkpoint.checkpoint_id,
         {
@@ -2369,6 +2445,18 @@ async function analyzeStreamInBackground(
           model: 'streaming',
         },
         attestation ? { input_commitment: attestation.input_commitment } : undefined,
+        env,
+      ).catch(() => { /* fail-open */ });
+    } else if (proofDecision === 'deferred') {
+      await deferProof(
+        checkpoint.checkpoint_id,
+        {
+          analysis_response_text: analysisResponseText,
+          thinking_block_hash: thinkingHash,
+          card_hash: await sha256(JSON.stringify(aipCard)),
+          values_hash: await sha256(JSON.stringify(values)),
+          model: 'streaming',
+        },
         env,
       ).catch(() => { /* fail-open */ });
     }
@@ -3422,6 +3510,7 @@ export async function handleProviderProxy(
     // CLPI Phase 2: Gateway policy evaluation (pre-action checkpoint)
     // ====================================================================
     let policyVerdict: string | null = null;
+    let policyCardGaps: unknown[] | null = null;
 
     if (policyData) {
       try {
@@ -3512,6 +3601,7 @@ export async function handleProviderProxy(
               }
 
               policyVerdict = evalResult.verdict;
+              policyCardGaps = evalResult.card_gaps?.length ? evalResult.card_gaps : null;
 
               // Store evaluation (non-blocking)
               if (policyData.dbPolicyId && policyData.dbPolicyVersion != null) {
@@ -4070,8 +4160,9 @@ export async function handleProviderProxy(
         ctx.waitUntil(otelExporter.flush());
       }
 
-      // Request ZK proof if enabled
-      if (shouldProve(checkpoint, agentSettings)) {
+      // Request ZK proof if enabled (non-streaming path has policy eval card_gaps)
+      const nsProofDecision = shouldProve(checkpoint, agentSettings, policyCardGaps);
+      if (nsProofDecision === 'prove') {
         ctx.waitUntil(requestProof(
           checkpoint.checkpoint_id,
           {
@@ -4082,6 +4173,18 @@ export async function handleProviderProxy(
             model: 'claude-haiku-4-5-20251001',
           },
           attestation ? { input_commitment: attestation.input_commitment } : undefined,
+          env,
+        ).catch(() => { /* fail-open */ }));
+      } else if (nsProofDecision === 'deferred') {
+        ctx.waitUntil(deferProof(
+          checkpoint.checkpoint_id,
+          {
+            analysis_response_text: analysisResponseText,
+            thinking_block_hash: thinkingHash,
+            card_hash: await sha256(JSON.stringify(aipCard)),
+            values_hash: await sha256(JSON.stringify(values)),
+            model: 'claude-haiku-4-5-20251001',
+          },
           env,
         ).catch(() => { /* fail-open */ }));
       }

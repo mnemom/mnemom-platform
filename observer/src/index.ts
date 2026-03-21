@@ -2123,6 +2123,9 @@ ${JSON.stringify(cardJson, null, 2)}
 
       console.log(`[observer/ddr] Reconciliation complete: ${result.outcome} (${durationMs}ms)`);
 
+      // Resolve deferred proofs based on DDR outcome
+      await resolveDeferredProof(checkpoint.checkpoint_id, result.outcome, env);
+
       // Auto-apply card amendment if mode is auto-apply and outcome is card_gap
       if (result.outcome === 'card_gap' && ddrMode === 'auto-apply' && result.proposed_amendment) {
         await applyCardAmendment(
@@ -2154,6 +2157,105 @@ ${JSON.stringify(cardJson, null, 2)}
         body: JSON.stringify({ status: 'review' }),
       }
     );
+  }
+}
+
+/**
+ * Resolve a deferred proof based on DDR reconciliation outcome.
+ * - card_gap / observer_noise → mark as skipped (no GPU cost)
+ * - aip_miss → upgrade to pending and fire proof request to the prover
+ */
+async function resolveDeferredProof(
+  checkpointId: string,
+  outcome: 'card_gap' | 'aip_miss' | 'observer_noise',
+  env: Env,
+): Promise<void> {
+  try {
+    // Find deferred proof for this checkpoint
+    const lookupUrl = new URL(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`);
+    lookupUrl.searchParams.set('checkpoint_id', `eq.${checkpointId}`);
+    lookupUrl.searchParams.set('status', 'eq.deferred');
+    lookupUrl.searchParams.set('select', 'proof_id,analysis_json,thinking_hash,card_hash,values_hash,model');
+    lookupUrl.searchParams.set('limit', '1');
+
+    const lookupRes = await fetch(lookupUrl.toString(), {
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      },
+    });
+
+    if (!lookupRes.ok) return;
+    const proofs = (await lookupRes.json()) as Array<{
+      proof_id: string;
+      analysis_json: string;
+      thinking_hash: string;
+      card_hash: string;
+      values_hash: string;
+      model: string;
+    }>;
+    if (proofs.length === 0) return; // No deferred proof for this checkpoint
+
+    const proof = proofs[0];
+
+    if (outcome === 'aip_miss') {
+      // Real violation confirmed — upgrade to pending and fire proof
+      console.log(`[observer/proof] Upgrading deferred proof ${proof.proof_id} to pending (aip_miss confirmed)`);
+
+      const patchUrl = new URL(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`);
+      patchUrl.searchParams.set('proof_id', `eq.${proof.proof_id}`);
+      await fetch(patchUrl.toString(), {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ status: 'pending' }),
+      });
+
+      // Fire proof request to prover
+      if (env.PROVER_URL) {
+        fetch(`${env.PROVER_URL}/prove`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(env.PROVER_API_KEY ? { 'X-Prover-Key': env.PROVER_API_KEY } : {}),
+          },
+          body: JSON.stringify({
+            proof_id: proof.proof_id,
+            checkpoint_id: checkpointId,
+            analysis_json: proof.analysis_json,
+            thinking_hash: proof.thinking_hash,
+            card_hash: proof.card_hash,
+            values_hash: proof.values_hash,
+            model: proof.model,
+          }),
+        }).then(r => console.log(`[observer/proof] Prover POST for upgraded proof: ${r.status}`))
+          .catch(err => console.warn(`[observer/proof] Prover POST failed:`, err));
+      }
+    } else {
+      // card_gap or observer_noise — skip proving entirely
+      const skipStatus = outcome === 'card_gap' ? 'skipped_card_gap' : 'skipped_noise';
+      console.log(`[observer/proof] Resolving deferred proof ${proof.proof_id} as ${skipStatus}`);
+
+      const patchUrl = new URL(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`);
+      patchUrl.searchParams.set('proof_id', `eq.${proof.proof_id}`);
+      await fetch(patchUrl.toString(), {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ status: skipStatus }),
+      });
+    }
+  } catch (err) {
+    // Fail-open: deferred proof resolution errors never block DDR
+    console.warn('[observer/proof] resolveDeferredProof failed (fail-open):', err);
   }
 }
 
