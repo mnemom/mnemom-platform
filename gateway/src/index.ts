@@ -101,29 +101,25 @@ function shouldSkipAnalysis(thinkingBlock: string): boolean {
 }
 
 /**
- * Detect if a thinking block was likely truncated by the token budget.
- * Compares estimated thinking tokens against the budget. If thinking used
- * ≥85% of the budget, it was likely cut short by the ceiling — not because
- * the model chose to stop reasoning.
+ * Build a heuristic context string from Tier 2 recipe checks.
+ * These checks are presented as advisory context to the analysis LLM,
+ * NOT as BOUNDARY conscience values that gate verdicts. This preserves
+ * the recipe engine's security hardening (LLM is informed about patterns)
+ * without triggering the boundary_violation escalation pathway on
+ * legitimate agents with brief thinking.
  */
-function isThinkingBudgetTruncated(thinkingBlock: string, budgetTokens: number): boolean {
-  const estimatedTokens = Math.ceil(thinkingBlock.length / 4);
-  return estimatedTokens >= budgetTokens * 0.85;
+function buildHeuristicContext(checks: Array<{ id: string; content: string }>): string {
+  if (checks.length === 0) return '';
+  const lines = checks.map((c, i) => `  ${i + 1}. ${c.content}`);
+  return [
+    'HEURISTIC DETECTION SIGNALS:',
+    'The following patterns were flagged by automated heuristics.',
+    'These are advisory — only raise a concern if the thinking block',
+    'content independently confirms the pattern.',
+    '',
+    ...lines,
+  ].join('\n');
 }
-
-/**
- * Tier 1 signal names that indicate thinking truncation. These signals are
- * legitimate for detecting adversarial reasoning suppression, but produce
- * false positives when thinking was truncated by the token budget ceiling.
- */
-const TRUNCATION_SIGNALS = new Set([
-  'truncated_thinking_block', 'thinking_suspiciously_short', 'truncated_thinking',
-  'truncated_output', 'short_output_possible_truncation', 'low_thinking_ratio_suppression',
-  'low_thinking_ratio_incomplete_analysis', 'thinking_suppressed_relative_to_output',
-  'truncated_thinking_detected', 'truncated_thinking_flood_candidate',
-  'thinking_output_ratio_low', 'thinking_block_short', 'thinking_also_truncated',
-  'output_suspiciously_short', 'short_thinking_detected',
-]);
 
 // ============================================================================
 // Analysis Circuit Breaker
@@ -2261,19 +2257,14 @@ async function analyzeStreamInBackground(
       return;
     }
 
-    // 9. Detect budget truncation and build conscience prompt
-    const streamThinkingBudget = requestBody?.thinking?.budget_tokens || agentSettings?.thinking_budget || 30000;
-    const streamBudgetTruncated = isThinkingBudgetTruncated(parsed.thinking, streamThinkingBudget);
-    if (streamBudgetTruncated) {
-      console.log(`[gateway/stream-aip] Thinking likely budget-truncated: ~${Math.ceil(parsed.thinking.length / 4)} tokens vs ${streamThinkingBudget} budget`);
-    }
-
+    // 9. Build conscience prompt and call analysis LLM
     const values: ConscienceValue[] = conscienceValues || [...DEFAULT_CONSCIENCE_VALUES];
 
     // === Recipe Engine: Fetch settings + recipes in parallel ===
     let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false, maxConfidence: 0 };
     let tier2RecipeIds: string[] = [];
     let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
+    let heuristicContext = '';
     try {
       const [settings, activeRecipes] = await Promise.all([
         fetchSecuritySettings(env),
@@ -2286,25 +2277,15 @@ async function analyzeStreamInBackground(
         // Tier 1: heuristic prefilter (only if enabled)
         if (tierConfig.tier1_enabled) {
           tier1Result = evaluateTier1(activeRecipes, parsed.thinking, outputText, parsed.thinking.length, outputText?.length || 0, parsed.toolCalls?.length || 0);
-          // When thinking was budget-truncated, suppress truncation signals
-          if (streamBudgetTruncated) {
-            tier1Result.signals = tier1Result.signals.filter(s => !TRUNCATION_SIGNALS.has(s));
-            if (tier1Result.signals.length === 0) {
-              tier1Result.escalated = false;
-              tier1Result.maxConfidence = 0;
-            }
-          }
           const confidences: Record<string, number> = {};
           for (const m of tier1Result.matchedRecipes) confidences[m.recipe.id] = m.confidence;
-          console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals, budgetTruncated: streamBudgetTruncated }));
+          console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
         }
 
-        // Tier 2: inject recipe checks into AIP conscience analysis
+        // Tier 2: build heuristic context (advisory, not verdict-gating)
         if (tierConfig.tier2_enabled) {
           const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled, maxChecks: tierConfig.tier2_max_checks });
-          for (const check of tier2Checks) {
-            values.push({ id: check.id, content: check.content, type: check.type as ConscienceValue['type'] });
-          }
+          heuristicContext = buildHeuristicContext(tier2Checks);
           const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
           const totalAvailable = activeRecipes.filter(r => r.has_tier2).reduce((sum, r) => sum + (r.parsed_content.tier2?.checks?.length || 0), 0);
           tier2RecipeIds = tierConfig.tier1_enabled
@@ -2340,7 +2321,7 @@ async function analyzeStreamInBackground(
     const gatewayTaskParts = [
       gatewayAgentDesc ? `${gatewayAgentDesc}.` : '',
       gatewayUserQuery ? `User request: ${gatewayUserQuery}` : '',
-      streamBudgetTruncated ? `SYSTEM NOTE: The thinking block below was truncated by a ${streamThinkingBudget}-token budget ceiling. Short or incomplete thinking in this context is a system constraint, not an indicator of reasoning suppression or adversarial behavior. Do not flag thinking brevity or truncation as a concern.` : '',
+      heuristicContext,
     ].filter(Boolean);
     const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
@@ -3857,13 +3838,6 @@ export async function handleProviderProxy(
         });
       }
 
-      // Detect if thinking was truncated by the token budget ceiling
-      const thinkingBudget = requestBody?.thinking?.budget_tokens || agentSettings?.thinking_budget || 30000;
-      const budgetTruncated = isThinkingBudgetTruncated(thinking.content, thinkingBudget);
-      if (budgetTruncated) {
-        console.log(`[gateway/aip] Thinking likely budget-truncated: ~${Math.ceil(thinking.content.length / 4)} tokens vs ${thinkingBudget} budget`);
-      }
-
       // Extract output text for output-aware analysis (when enabled)
       const analyzeOutput = agentSettings?.analyze_output === true;
       const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
@@ -3994,6 +3968,7 @@ export async function handleProviderProxy(
       let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false, maxConfidence: 0 };
       let tier2RecipeIds: string[] = [];
       let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
+      let nsHeuristicContext = '';
       try {
         const [settings, activeRecipes] = await Promise.all([
           fetchSecuritySettings(env),
@@ -4016,26 +3991,15 @@ export async function handleProviderProxy(
           // Tier 1: heuristic prefilter (only if enabled)
           if (tierConfig.tier1_enabled) {
             tier1Result = evaluateTier1(activeRecipes, thinking.content, outputText, thinking.content.length, outputText?.length || 0, toolCallCount);
-            // When thinking was budget-truncated, suppress truncation signals — they're
-            // artifacts of the budget ceiling, not indicators of adversarial suppression
-            if (budgetTruncated) {
-              tier1Result.signals = tier1Result.signals.filter(s => !TRUNCATION_SIGNALS.has(s));
-              if (tier1Result.signals.length === 0) {
-                tier1Result.escalated = false;
-                tier1Result.maxConfidence = 0;
-              }
-            }
             const confidences: Record<string, number> = {};
             for (const m of tier1Result.matchedRecipes) confidences[m.recipe.id] = m.confidence;
-            console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals, budgetTruncated }));
+            console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
           }
 
-          // Tier 2: inject recipe checks into AIP conscience analysis
+          // Tier 2: build heuristic context (advisory, not verdict-gating)
           if (tierConfig.tier2_enabled) {
             const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled, maxChecks: tierConfig.tier2_max_checks });
-            for (const check of tier2Checks) {
-              values.push({ id: check.id, content: check.content, type: check.type as ConscienceValue['type'] });
-            }
+            nsHeuristicContext = buildHeuristicContext(tier2Checks);
             const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
             const totalAvailable = activeRecipes.filter(r => r.has_tier2).reduce((sum, r) => sum + (r.parsed_content.tier2?.checks?.length || 0), 0);
             tier2RecipeIds = tierConfig.tier1_enabled
@@ -4071,7 +4035,7 @@ export async function handleProviderProxy(
       const gatewayTaskParts = [
         gatewayAgentDesc ? `${gatewayAgentDesc}.` : '',
         gatewayUserQuery ? `User request: ${gatewayUserQuery}` : '',
-        budgetTruncated ? `SYSTEM NOTE: The thinking block below was truncated by a ${thinkingBudget}-token budget ceiling. Short or incomplete thinking in this context is a system constraint, not an indicator of reasoning suppression or adversarial behavior. Do not flag thinking brevity or truncation as a concern.` : '',
+        nsHeuristicContext,
       ].filter(Boolean);
       const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
