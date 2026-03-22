@@ -100,27 +100,6 @@ function shouldSkipAnalysis(thinkingBlock: string): boolean {
   return false;
 }
 
-/**
- * Build a heuristic context string from Tier 2 recipe checks.
- * These checks are presented as advisory context to the analysis LLM,
- * NOT as BOUNDARY conscience values that gate verdicts. This preserves
- * the recipe engine's security hardening (LLM is informed about patterns)
- * without triggering the boundary_violation escalation pathway on
- * legitimate agents with brief thinking.
- */
-function buildHeuristicContext(checks: Array<{ id: string; content: string }>): string {
-  if (checks.length === 0) return '';
-  const lines = checks.map((c, i) => `  ${i + 1}. ${c.content}`);
-  return [
-    'HEURISTIC DETECTION SIGNALS:',
-    'The following patterns were flagged by automated heuristics.',
-    'These are advisory — only raise a concern if the thinking block',
-    'content independently confirms the pattern.',
-    '',
-    ...lines,
-  ].join('\n');
-}
-
 // ============================================================================
 // Analysis Circuit Breaker
 // ============================================================================
@@ -2264,7 +2243,6 @@ async function analyzeStreamInBackground(
     let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false, maxConfidence: 0 };
     let tier2RecipeIds: string[] = [];
     let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
-    let heuristicContext = '';
     try {
       const [settings, activeRecipes] = await Promise.all([
         fetchSecuritySettings(env),
@@ -2282,16 +2260,16 @@ async function analyzeStreamInBackground(
           console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
         }
 
-        // Tier 2: build heuristic context (advisory, not verdict-gating)
+        // Tier 2: select checks for logging (not injected into analysis prompt —
+        // Tier 3 verdict override provides the safety net instead)
         if (tierConfig.tier2_enabled) {
           const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled, maxChecks: tierConfig.tier2_max_checks });
-          heuristicContext = buildHeuristicContext(tier2Checks);
           const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
           const totalAvailable = activeRecipes.filter(r => r.has_tier2).reduce((sum, r) => sum + (r.parsed_content.tier2?.checks?.length || 0), 0);
           tier2RecipeIds = tierConfig.tier1_enabled
             ? tier1Result.matchedRecipes.map(r => r.recipe.id)
             : activeRecipes.filter(r => r.has_tier2).map(r => r.id);
-          console.log(JSON.stringify({ event: 'recipe-engine-tier2', mode, checksInjected: tier2Checks.length, totalAvailable, capped: tier2Checks.length < totalAvailable }));
+          console.log(JSON.stringify({ event: 'recipe-engine-tier2', mode, checksSelected: tier2Checks.length, totalAvailable, capped: tier2Checks.length < totalAvailable }));
         }
       }
     } catch (e) {
@@ -2321,7 +2299,6 @@ async function analyzeStreamInBackground(
     const gatewayTaskParts = [
       gatewayAgentDesc ? `${gatewayAgentDesc}.` : '',
       gatewayUserQuery ? `User request: ${gatewayUserQuery}` : '',
-      heuristicContext,
     ].filter(Boolean);
     const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
@@ -3968,7 +3945,6 @@ export async function handleProviderProxy(
       let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false, maxConfidence: 0 };
       let tier2RecipeIds: string[] = [];
       let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
-      let nsHeuristicContext = '';
       try {
         const [settings, activeRecipes] = await Promise.all([
           fetchSecuritySettings(env),
@@ -3996,16 +3972,16 @@ export async function handleProviderProxy(
             console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
           }
 
-          // Tier 2: build heuristic context (advisory, not verdict-gating)
+          // Tier 2: select checks for logging (not injected into analysis prompt —
+          // Tier 3 verdict override provides the safety net instead)
           if (tierConfig.tier2_enabled) {
             const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled, maxChecks: tierConfig.tier2_max_checks });
-            nsHeuristicContext = buildHeuristicContext(tier2Checks);
             const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
             const totalAvailable = activeRecipes.filter(r => r.has_tier2).reduce((sum, r) => sum + (r.parsed_content.tier2?.checks?.length || 0), 0);
             tier2RecipeIds = tierConfig.tier1_enabled
               ? tier1Result.matchedRecipes.map(r => r.recipe.id)
               : activeRecipes.filter(r => r.has_tier2).map(r => r.id);
-            console.log(JSON.stringify({ event: 'recipe-engine-tier2', mode, checksInjected: tier2Checks.length, totalAvailable, capped: tier2Checks.length < totalAvailable }));
+            console.log(JSON.stringify({ event: 'recipe-engine-tier2', mode, checksSelected: tier2Checks.length, totalAvailable, capped: tier2Checks.length < totalAvailable }));
           }
         }
       } catch (e) {
@@ -4035,7 +4011,6 @@ export async function handleProviderProxy(
       const gatewayTaskParts = [
         gatewayAgentDesc ? `${gatewayAgentDesc}.` : '',
         gatewayUserQuery ? `User request: ${gatewayUserQuery}` : '',
-        nsHeuristicContext,
       ].filter(Boolean);
       const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
