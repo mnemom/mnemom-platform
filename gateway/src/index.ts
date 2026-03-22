@@ -100,6 +100,31 @@ function shouldSkipAnalysis(thinkingBlock: string): boolean {
   return false;
 }
 
+/**
+ * Detect if a thinking block was likely truncated by the token budget.
+ * Compares estimated thinking tokens against the budget. If thinking used
+ * ≥85% of the budget, it was likely cut short by the ceiling — not because
+ * the model chose to stop reasoning.
+ */
+function isThinkingBudgetTruncated(thinkingBlock: string, budgetTokens: number): boolean {
+  const estimatedTokens = Math.ceil(thinkingBlock.length / 4);
+  return estimatedTokens >= budgetTokens * 0.85;
+}
+
+/**
+ * Tier 1 signal names that indicate thinking truncation. These signals are
+ * legitimate for detecting adversarial reasoning suppression, but produce
+ * false positives when thinking was truncated by the token budget ceiling.
+ */
+const TRUNCATION_SIGNALS = new Set([
+  'truncated_thinking_block', 'thinking_suspiciously_short', 'truncated_thinking',
+  'truncated_output', 'short_output_possible_truncation', 'low_thinking_ratio_suppression',
+  'low_thinking_ratio_incomplete_analysis', 'thinking_suppressed_relative_to_output',
+  'truncated_thinking_detected', 'truncated_thinking_flood_candidate',
+  'thinking_output_ratio_low', 'thinking_block_short', 'thinking_also_truncated',
+  'output_suspiciously_short', 'short_thinking_detected',
+]);
+
 // ============================================================================
 // Analysis Circuit Breaker
 // ============================================================================
@@ -178,6 +203,7 @@ export interface AgentSettings {
   proof_enabled: boolean;
   proof_rate: number;
   proof_boundary_cap?: number; // Max % of boundary violations to prove (default 100). Reduces to stochastic sampling when card_gaps aren't available.
+  thinking_budget?: number; // Thinking token budget for extended thinking injection (default 30000).
   nudge_strategy?: 'always' | 'sampling' | 'threshold' | 'off';
   nudge_rate?: number;
   nudge_threshold?: number;
@@ -2235,7 +2261,13 @@ async function analyzeStreamInBackground(
       return;
     }
 
-    // 9. Build conscience prompt and call analysis LLM
+    // 9. Detect budget truncation and build conscience prompt
+    const streamThinkingBudget = requestBody?.thinking?.budget_tokens || agentSettings?.thinking_budget || 30000;
+    const streamBudgetTruncated = isThinkingBudgetTruncated(parsed.thinking, streamThinkingBudget);
+    if (streamBudgetTruncated) {
+      console.log(`[gateway/stream-aip] Thinking likely budget-truncated: ~${Math.ceil(parsed.thinking.length / 4)} tokens vs ${streamThinkingBudget} budget`);
+    }
+
     const values: ConscienceValue[] = conscienceValues || [...DEFAULT_CONSCIENCE_VALUES];
 
     // === Recipe Engine: Fetch settings + recipes in parallel ===
@@ -2254,9 +2286,17 @@ async function analyzeStreamInBackground(
         // Tier 1: heuristic prefilter (only if enabled)
         if (tierConfig.tier1_enabled) {
           tier1Result = evaluateTier1(activeRecipes, parsed.thinking, outputText, parsed.thinking.length, outputText?.length || 0, parsed.toolCalls?.length || 0);
+          // When thinking was budget-truncated, suppress truncation signals
+          if (streamBudgetTruncated) {
+            tier1Result.signals = tier1Result.signals.filter(s => !TRUNCATION_SIGNALS.has(s));
+            if (tier1Result.signals.length === 0) {
+              tier1Result.escalated = false;
+              tier1Result.maxConfidence = 0;
+            }
+          }
           const confidences: Record<string, number> = {};
           for (const m of tier1Result.matchedRecipes) confidences[m.recipe.id] = m.confidence;
-          console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
+          console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals, budgetTruncated: streamBudgetTruncated }));
         }
 
         // Tier 2: inject recipe checks into AIP conscience analysis
@@ -2300,6 +2340,7 @@ async function analyzeStreamInBackground(
     const gatewayTaskParts = [
       gatewayAgentDesc ? `${gatewayAgentDesc}.` : '',
       gatewayUserQuery ? `User request: ${gatewayUserQuery}` : '',
+      streamBudgetTruncated ? `SYSTEM NOTE: The thinking block below was truncated by a ${streamThinkingBudget}-token budget ceiling. Short or incomplete thinking in this context is a system constraint, not an indicator of reasoning suppression or adversarial behavior. Do not flag thinking brevity or truncation as a concern.` : '',
     ].filter(Boolean);
     const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
@@ -2894,19 +2935,20 @@ function extractApiKey(request: Request, provider: GatewayProvider): string | nu
  */
 function injectThinkingForProvider(
   requestBody: Record<string, any>,
-  provider: GatewayProvider
+  provider: GatewayProvider,
+  thinkingBudget: number = 30000
 ): void {
   switch (provider) {
     case 'anthropic':
       if (!requestBody.thinking) {
-        requestBody.thinking = { type: 'enabled', budget_tokens: 10000 };
+        requestBody.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
       }
       // Anthropic requires temperature=1 and max_tokens > budget_tokens
       // when thinking is enabled. Since the gateway injects thinking,
       // enforce the constraints here so clients don't need to know about it.
       if (requestBody.thinking?.type === 'enabled') {
         delete requestBody.temperature;
-        const budget = requestBody.thinking.budget_tokens || 10000;
+        const budget = requestBody.thinking.budget_tokens || thinkingBudget;
         if (typeof requestBody.max_tokens === 'number' && requestBody.max_tokens <= budget) {
           requestBody.max_tokens = budget + 1024;
         }
@@ -3483,7 +3525,7 @@ export async function handleProviderProxy(
 
       // Inject thinking configuration based on provider
       if (requestBody) {
-        injectThinkingForProvider(requestBody, provider);
+        injectThinkingForProvider(requestBody, provider, agentSettings?.thinking_budget ?? 30000);
       }
 
       // ====================================================================
@@ -3815,6 +3857,13 @@ export async function handleProviderProxy(
         });
       }
 
+      // Detect if thinking was truncated by the token budget ceiling
+      const thinkingBudget = requestBody?.thinking?.budget_tokens || agentSettings?.thinking_budget || 30000;
+      const budgetTruncated = isThinkingBudgetTruncated(thinking.content, thinkingBudget);
+      if (budgetTruncated) {
+        console.log(`[gateway/aip] Thinking likely budget-truncated: ~${Math.ceil(thinking.content.length / 4)} tokens vs ${thinkingBudget} budget`);
+      }
+
       // Extract output text for output-aware analysis (when enabled)
       const analyzeOutput = agentSettings?.analyze_output === true;
       const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
@@ -3967,9 +4016,18 @@ export async function handleProviderProxy(
           // Tier 1: heuristic prefilter (only if enabled)
           if (tierConfig.tier1_enabled) {
             tier1Result = evaluateTier1(activeRecipes, thinking.content, outputText, thinking.content.length, outputText?.length || 0, toolCallCount);
+            // When thinking was budget-truncated, suppress truncation signals — they're
+            // artifacts of the budget ceiling, not indicators of adversarial suppression
+            if (budgetTruncated) {
+              tier1Result.signals = tier1Result.signals.filter(s => !TRUNCATION_SIGNALS.has(s));
+              if (tier1Result.signals.length === 0) {
+                tier1Result.escalated = false;
+                tier1Result.maxConfidence = 0;
+              }
+            }
             const confidences: Record<string, number> = {};
             for (const m of tier1Result.matchedRecipes) confidences[m.recipe.id] = m.confidence;
-            console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
+            console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals, budgetTruncated }));
           }
 
           // Tier 2: inject recipe checks into AIP conscience analysis
@@ -4013,6 +4071,7 @@ export async function handleProviderProxy(
       const gatewayTaskParts = [
         gatewayAgentDesc ? `${gatewayAgentDesc}.` : '',
         gatewayUserQuery ? `User request: ${gatewayUserQuery}` : '',
+        budgetTruncated ? `SYSTEM NOTE: The thinking block below was truncated by a ${thinkingBudget}-token budget ceiling. Short or incomplete thinking in this context is a system constraint, not an indicator of reasoning suppression or adversarial behavior. Do not flag thinking brevity or truncation as a concern.` : '',
       ].filter(Boolean);
       const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
