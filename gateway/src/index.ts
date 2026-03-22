@@ -2299,6 +2299,7 @@ async function analyzeStreamInBackground(
     const gatewayTaskParts = [
       gatewayAgentDesc ? `${gatewayAgentDesc}.` : '',
       gatewayUserQuery ? `User request: ${gatewayUserQuery}` : '',
+      parsed.toolCalls.length > 0 ? `RESPONSE TYPE: The agent responded with ${parsed.toolCalls.length} tool call(s): ${parsed.toolCalls.map(t => t.name).join(', ')}. Tool call responses are expected to have minimal visible text output — the agent's action IS the tool invocation. Do not flag low output volume as undeclared intent when tool calls are present.` : '',
     ].filter(Boolean);
     const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
@@ -2353,7 +2354,10 @@ async function analyzeStreamInBackground(
       analysisDurationMs,
     });
 
-    // === Recipe Engine: Tier 3 Cross-validation (requires both T1 and T3 enabled) ===
+    // === Recipe Engine: Tier 3 Cross-validation (log only — verdict override disabled) ===
+    // Tier 3 previously overrode clear verdicts based on heuristic signals, but arena-specific
+    // recipe rules were firing on legitimate production agents. The analysis LLM's independent
+    // judgment is authoritative — Tier 3 logs potential overrides for observability only.
     let tier3OverrideMeta: { override: boolean; recipeId?: string; confidence?: number } | undefined;
     if (tierConfig.tier3_enabled && tierConfig.tier1_enabled && tier1Result.escalated && checkpoint.verdict === 'clear') {
       const threshold = tierConfig.tier3_override_threshold;
@@ -2366,21 +2370,9 @@ async function analyzeStreamInBackground(
       });
       if (qualifiedRecipes.length >= minAgreeing) {
         const best = qualifiedRecipes.reduce((a, b) => a.confidence > b.confidence ? a : b);
-        const rule = best.recipe.parsed_content.tier3!.rules.find(
-          r => r.when.tier1_escalated && r.when.aip_verdict === 'clear' && r.action === 'override_to_review'
-        )!;
-        checkpoint.verdict = 'review_needed';
-        checkpoint.concerns = checkpoint.concerns || [];
-        checkpoint.concerns.push({
-          category: 'undeclared_intent',
-          description: rule.reason || 'Heuristic signals contradicted clear verdict',
-          severity: 'medium',
-          evidence: `Tier 1 signals: ${tier1Result.signals.join(', ')}`,
-          relevant_card_field: null,
-          relevant_conscience_value: null,
-        });
-        tier3OverrideMeta = { override: true, recipeId: best.recipe.id, confidence: best.confidence };
-        console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'override', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: best.confidence, recipeId: best.recipe.id }));
+        // Log the would-be override but do NOT modify the verdict or inject concerns
+        tier3OverrideMeta = { override: false, recipeId: best.recipe.id, confidence: best.confidence };
+        console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', reason: 'verdict-override-disabled', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: best.confidence, recipeId: best.recipe.id }));
       } else {
         console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: qualifiedRecipes.length > 0 ? Math.max(...qualifiedRecipes.map(r => r.confidence)) : 0 }));
       }
@@ -4070,7 +4062,7 @@ export async function handleProviderProxy(
         analysisDurationMs,
       });
 
-      // === Recipe Engine: Tier 3 Cross-validation (requires both T1 and T3 enabled) ===
+      // === Recipe Engine: Tier 3 Cross-validation (log only — verdict override disabled) ===
       let tier3OverrideMeta: { override: boolean; recipeId?: string; confidence?: number } | undefined;
       if (tierConfig.tier3_enabled && tierConfig.tier1_enabled && tier1Result.escalated && checkpoint.verdict === 'clear') {
         const threshold = tierConfig.tier3_override_threshold;
@@ -4083,21 +4075,8 @@ export async function handleProviderProxy(
         });
         if (qualifiedRecipes.length >= minAgreeing) {
           const best = qualifiedRecipes.reduce((a, b) => a.confidence > b.confidence ? a : b);
-          const rule = best.recipe.parsed_content.tier3!.rules.find(
-            r => r.when.tier1_escalated && r.when.aip_verdict === 'clear' && r.action === 'override_to_review'
-          )!;
-          checkpoint.verdict = 'review_needed';
-          checkpoint.concerns = checkpoint.concerns || [];
-          checkpoint.concerns.push({
-            category: 'undeclared_intent',
-            description: rule.reason || 'Heuristic signals contradicted clear verdict',
-            severity: 'medium',
-            evidence: `Tier 1 signals: ${tier1Result.signals.join(', ')}`,
-            relevant_card_field: null,
-            relevant_conscience_value: null,
-          });
-          tier3OverrideMeta = { override: true, recipeId: best.recipe.id, confidence: best.confidence };
-          console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'override', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: best.confidence, recipeId: best.recipe.id }));
+          tier3OverrideMeta = { override: false, recipeId: best.recipe.id, confidence: best.confidence };
+          console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', reason: 'verdict-override-disabled', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: best.confidence, recipeId: best.recipe.id }));
         } else {
           console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: qualifiedRecipes.length > 0 ? Math.max(...qualifiedRecipes.map(r => r.confidence)) : 0 }));
         }
