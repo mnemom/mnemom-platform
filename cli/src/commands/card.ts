@@ -157,9 +157,11 @@ export function validateCard(raw: string): ValidationCheck[] {
   }
 
   // Check 6: escalation_triggers conditions are evaluable
+  // Accepts: simple identifiers, tool_matches('...') calls, and logical expressions
+  // (comparisons with ==, !=, >, <, and/or, quoted strings, numbers)
   const triggers = card.autonomy_envelope?.escalation_triggers;
   if (Array.isArray(triggers) && triggers.length > 0) {
-    const conditionPattern = /^[a-zA-Z0-9_]+$/;
+    const conditionPattern = /^[\w\s\(\)\*\.'",=!><&|]+$/;
     const invalidTriggers = triggers.filter(
       (t) => !t.condition || !conditionPattern.test(t.condition)
     );
@@ -174,7 +176,7 @@ export function validateCard(raw: string): ValidationCheck[] {
       checks.push({
         name: "escalation_triggers",
         passed: false,
-        message: `${invalidTriggers.length} trigger(s) with invalid conditions (alphanumeric + underscores only)`,
+        message: `${invalidTriggers.length} trigger(s) with invalid conditions`,
       });
     }
   } else if (Array.isArray(triggers) && triggers.length === 0) {
