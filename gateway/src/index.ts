@@ -2184,7 +2184,7 @@ async function analyzeStreamInBackground(
           },
           body: JSON.stringify({
             thinking_block: parsed.thinking,
-            thinking_metadata: { provider, model: 'streaming' },
+            thinking_metadata: { provider, model: requestBody?.model || 'streaming' },
             agent_id: agent.id,
             session_id: sessionId,
             card: aipCard,
@@ -3659,7 +3659,8 @@ export async function handleProviderProxy(
     // ====================================================================
 
     const aipEnabled = (env.AIP_ENABLED ?? 'true') !== 'false';
-    const isStreaming = requestBody?.stream === true;
+    const isStreaming = requestBody?.stream === true
+      || (requestBody === null && response.headers.get('content-type')?.includes('text/event-stream'));
 
     // Clone response headers as base for our response
     const responseHeaders = new Headers(response.headers);
