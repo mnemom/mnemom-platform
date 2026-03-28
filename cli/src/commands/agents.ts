@@ -1,4 +1,5 @@
 import { loadConfig, saveConfig } from "../lib/config.js";
+import { listAgents } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
 export async function agentsListCommand(): Promise<void> {
@@ -12,34 +13,60 @@ export async function agentsListCommand(): Promise<void> {
   console.log(fmt.header("Registered Agents"));
   console.log();
 
-  const agentNames = Object.keys(config.agents);
-
-  if (agentNames.length === 0) {
-    console.log("  No agents registered.\n");
-    console.log("  Run `smoltbot init` to create the default agent.\n");
-    return;
+  // Build reverse map: agentId → local alias name
+  const localAliases = new Map<string, string>();
+  for (const [name, agent] of Object.entries(config.agents)) {
+    localAliases.set(agent.agentId, name);
   }
 
-  for (const name of agentNames) {
-    const agent = config.agents[name];
-    const isDefault = name === config.defaultAgent;
-    const defaultMarker = isDefault ? " (default)" : "";
-    const providerInfo = agent.providers
-      ? agent.providers.join(", ")
-      : agent.openclawConfigured
-        ? "openclaw"
-        : "unknown";
+  // Fetch ALL agents from API for the authenticated user
+  let apiAgents: Awaited<ReturnType<typeof listAgents>> = [];
+  try {
+    apiAgents = await listAgents();
+  } catch {
+    console.log(fmt.warn("Could not reach API — showing local agents only") + "\n");
+  }
 
-    console.log(`  ${fmt.label(name + defaultMarker, "")}`);
-    console.log(`    ${fmt.label("Agent ID: ", agent.agentId)}`);
-    console.log(`    ${fmt.label("Provider: ", providerInfo)}`);
-    if (agent.configuredAt) {
-      console.log(`    ${fmt.label("Created:  ", new Date(agent.configuredAt).toLocaleDateString())}`);
+  const shown = new Set<string>();
+
+  if (apiAgents.length > 0) {
+    for (const agent of apiAgents) {
+      shown.add(agent.id);
+      const localName = localAliases.get(agent.id);
+      const isDefault = localName === config.defaultAgent;
+      const displayName = localName ?? agent.name ?? agent.email ?? agent.id;
+      const defaultMarker = isDefault ? " (default)" : "";
+
+      console.log(`  ${fmt.label(displayName + defaultMarker, "")}`);
+      console.log(`    ${fmt.label("Agent ID: ", agent.id)}`);
+      if (localName && localName !== displayName) {
+        console.log(`    ${fmt.label("Local alias:", " " + localName)}`);
+      }
+      if (agent.last_seen) {
+        console.log(`    ${fmt.label("Last seen:", " " + new Date(agent.last_seen).toLocaleDateString())}`);
+      }
+      if (agent.created_at) {
+        console.log(`    ${fmt.label("Created:  ", new Date(agent.created_at).toLocaleDateString())}`);
+      }
+      console.log();
     }
-    console.log();
   }
 
-  console.log(`  Total: ${agentNames.length} agent(s)\n`);
+  // Show locally-registered agents not in the API response
+  for (const [name, agent] of Object.entries(config.agents)) {
+    if (!shown.has(agent.agentId)) {
+      const isDefault = name === config.defaultAgent;
+      const defaultMarker = isDefault ? " (default)" : "";
+      const providerInfo = agent.providers?.join(", ") ?? (agent.openclawConfigured ? "openclaw" : "unknown");
+      console.log(`  ${fmt.label(name + defaultMarker, "")} ${fmt.warn("(local only — not found in account)")}`);
+      console.log(`    ${fmt.label("Agent ID: ", agent.agentId)}`);
+      console.log(`    ${fmt.label("Provider: ", providerInfo)}`);
+      console.log();
+    }
+  }
+
+  const total = apiAgents.length > 0 ? apiAgents.length : Object.keys(config.agents).length;
+  console.log(`  Total: ${total} agent(s)\n`);
 }
 
 export async function agentsDefaultCommand(name: string): Promise<void> {

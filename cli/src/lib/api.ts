@@ -80,6 +80,26 @@ export async function getAgent(id: string): Promise<Agent> {
   return fetchApi<Agent>(`/v1/agents/${id}`);
 }
 
+export interface AgentListItem {
+  id: string;
+  name: string | null;
+  email: string | null;
+  created_at: string;
+  last_seen: string | null;
+  containment_status: string | null;
+}
+
+export async function listAgents(): Promise<AgentListItem[]> {
+  const url = validateUrl(`${API_BASE}/v1/agents?limit=100`);
+  const response = await fetch(url, { headers: await authHeaders() });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
+    throw new Error(err.message || `Failed to list agents: ${response.status}`);
+  }
+  const data = await response.json() as { agents: AgentListItem[] };
+  return data.agents ?? [];
+}
+
 export async function getIntegrity(id: string): Promise<IntegrityScore> {
   return fetchApi<IntegrityScore>(`/v1/integrity/${id}`);
 }
