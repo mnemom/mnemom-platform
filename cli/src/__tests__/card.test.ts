@@ -144,7 +144,8 @@ describe("validateCardJson", () => {
         bounded_actions: ["x"],
         escalation_triggers: [
           { condition: "valid_trigger", action: "notify" },
-          { condition: "invalid trigger with spaces", action: "block" },
+          // Semicolons and backticks are disallowed (injection risk)
+          { condition: "valid; rm -rf /", action: "block" },
         ],
       },
       audit_commitment: { log_level: "full" },
@@ -154,6 +155,27 @@ describe("validateCardJson", () => {
     const triggerCheck = checks.find((c) => c.name === "escalation_triggers");
     expect(triggerCheck?.passed).toBe(false);
     expect(triggerCheck?.message).toContain("invalid conditions");
+  });
+
+  it("should pass when escalation_triggers use CLPI expression syntax", () => {
+    const card = {
+      principal: { name: "TestBot" },
+      values: { declared: ["transparency"] },
+      autonomy_envelope: {
+        bounded_actions: ["x"],
+        escalation_triggers: [
+          // Logical expression syntax (CFO-style conditions)
+          { condition: 'action_type == "expenditure" and amount > threshold', action: "escalate" },
+          // Function call syntax (gateway-style conditions)
+          { condition: "tool_matches('*external*')", action: "escalate" },
+        ],
+      },
+      audit_commitment: { log_level: "full" },
+    };
+
+    const checks = validateCardJson(JSON.stringify(card));
+    const triggerCheck = checks.find((c) => c.name === "escalation_triggers");
+    expect(triggerCheck?.passed).toBe(true);
   });
 
   it("should pass when escalation_triggers have valid conditions", () => {
