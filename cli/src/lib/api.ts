@@ -93,11 +93,38 @@ export async function listAgents(): Promise<AgentListItem[]> {
   const url = validateUrl(`${API_BASE}/v1/agents?limit=100`);
   const response = await fetch(url, { headers: await authHeaders() });
   if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not logged in. Run `smoltbot login` first.");
+    }
     const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
     throw new Error(err.message || `Failed to list agents: ${response.status}`);
   }
   const data = await response.json() as { agents: AgentListItem[] };
   return data.agents ?? [];
+}
+
+/**
+ * Look up an agent in the authenticated user's account by name.
+ * Tries exact match first, then single partial match.
+ * Throws if multiple agents partially match (ambiguous).
+ * Returns null if no match found.
+ * Note: capped at 100 agents by listAgents().
+ */
+export async function getAgentByName(name: string): Promise<AgentListItem | null> {
+  const agents = await listAgents();
+  const lower = name.toLowerCase();
+
+  const exact = agents.find(a => a.name?.toLowerCase() === lower);
+  if (exact) return exact;
+
+  const partials = agents.filter(a => a.name?.toLowerCase().includes(lower));
+  if (partials.length === 1) return partials[0];
+  if (partials.length > 1) {
+    const names = partials.map(a => a.name ?? a.id).join(", ");
+    throw new Error(`Multiple agents match '${name}': ${names}. Use a more specific name.`);
+  }
+
+  return null;
 }
 
 export async function getIntegrity(id: string): Promise<IntegrityScore> {

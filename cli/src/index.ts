@@ -16,7 +16,7 @@ import {
   policyEvaluateCommand,
 } from "./commands/policy.js";
 import { registerCommand } from "./commands/register.js";
-import { agentsListCommand, agentsRemoveCommand } from "./commands/agents.js";
+import { agentsListCommand, agentsRemoveCommand, agentsAddCommand, agentsDefaultCommand } from "./commands/agents.js";
 import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
 
 program
@@ -298,6 +298,31 @@ agentsCmd
   .action(async (name: string) => {
     try {
       await agentsRemoveCommand(name);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+agentsCmd
+  .command("add <name-or-id>")
+  .description("Register an existing API agent in local config")
+  .option("--alias <alias>", "Local alias name (default: agent's API name)")
+  .action(async (nameOrId: string, options: { alias?: string }) => {
+    try {
+      await agentsAddCommand(nameOrId, options.alias);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+agentsCmd
+  .command("default <name>")
+  .description("Set the default agent")
+  .action(async (name: string) => {
+    try {
+      await agentsDefaultCommand(name);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);

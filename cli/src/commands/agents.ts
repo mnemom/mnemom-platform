@@ -1,5 +1,5 @@
 import { loadConfig, saveConfig } from "../lib/config.js";
-import { listAgents } from "../lib/api.js";
+import { listAgents, getAgent, getAgentByName } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
 export async function agentsListCommand(): Promise<void> {
@@ -77,8 +77,8 @@ export async function agentsDefaultCommand(name: string): Promise<void> {
   }
 
   if (!config.agents[name]) {
-    console.log(fmt.error(`Agent "${name}" not found`) + "\n");
-    console.log("Available agents: " + Object.keys(config.agents).join(", ") + "\n");
+    console.log(fmt.error(`Agent "${name}" is not registered locally.`) + "\n");
+    console.log(`Run \`smoltbot agents add ${name}\` to register it first.\n`);
     process.exit(1);
   }
 
@@ -87,6 +87,67 @@ export async function agentsDefaultCommand(name: string): Promise<void> {
 
   console.log(fmt.success(`Default agent set to "${name}"`) + "\n");
   console.log(fmt.label("Agent ID:", ` ${config.agents[name].agentId}`) + "\n");
+}
+
+/**
+ * smoltbot agents add <name-or-id> [--alias <alias>]
+ * Register an existing API agent in the local config.
+ */
+export async function agentsAddCommand(nameOrId: string, alias?: string): Promise<void> {
+  const config = loadConfig();
+  if (!config) {
+    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
+    console.log("Run `smoltbot init` to get started.\n");
+    process.exit(1);
+  }
+
+  // Fetch the agent from the API
+  let agentId: string;
+  let apiName: string | null = null;
+  let createdAt: string | undefined;
+
+  try {
+    if (/^smolt-[0-9a-f]{8}$/.test(nameOrId)) {
+      const a = await getAgent(nameOrId);
+      agentId = a.id;
+      createdAt = a.created_at;
+    } else {
+      const a = await getAgentByName(nameOrId);
+      if (!a) {
+        console.log(fmt.error(`Agent not found: ${nameOrId}`) + "\n");
+        console.log("Run `smoltbot agents` to see agents in your account.\n");
+        process.exit(1);
+      }
+      agentId = a.id;
+      apiName = a.name;
+      createdAt = a.created_at;
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log("\n" + fmt.error(msg) + "\n");
+    process.exit(1);
+  }
+
+  const localAlias = alias ?? apiName ?? nameOrId;
+
+  // Check for conflicts
+  const existing = config.agents[localAlias];
+  if (existing) {
+    if (existing.agentId === agentId) {
+      console.log(fmt.success(`Agent "${localAlias}" is already registered (${agentId})`) + "\n");
+      return;
+    }
+    console.log(fmt.error(`Alias "${localAlias}" is already in use by agent ${existing.agentId}.`) + "\n");
+    console.log(`Use --alias <name> to choose a different local name.\n`);
+    process.exit(1);
+  }
+
+  config.agents[localAlias] = { agentId, configuredAt: createdAt };
+  saveConfig(config);
+
+  console.log(fmt.success(`Agent registered as "${localAlias}"`) + "\n");
+  console.log(fmt.label("Agent ID:", ` ${agentId}`) + "\n");
+  console.log(`Use --agent ${localAlias} to target this agent.\n`);
 }
 
 export async function agentsRemoveCommand(name: string): Promise<void> {

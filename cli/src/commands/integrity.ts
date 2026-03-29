@@ -3,7 +3,7 @@ import { getIntegrity } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
 export async function integrityCommand(agentName?: string): Promise<void> {
-  const agent = requireAgent(agentName);
+  const agent = await requireAgent(agentName);
 
   console.log("\nFetching integrity score...\n");
 

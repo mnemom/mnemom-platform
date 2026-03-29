@@ -8,7 +8,7 @@ export interface LogsOptions {
 }
 
 export async function logsCommand(options: LogsOptions = {}): Promise<void> {
-  const agent = requireAgent(options.agentName);
+  const agent = await requireAgent(options.agentName);
   const config = loadConfig()!;
 
   const limit = options.limit || 10;

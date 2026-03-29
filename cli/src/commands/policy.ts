@@ -256,7 +256,7 @@ export async function policyPublishCommand(
   file: string,
   agentName?: string
 ): Promise<void> {
-  const agent = requireAgent(agentName);
+  const agent = await requireAgent(agentName);
 
   const filePath = path.resolve(file);
   if (!fs.existsSync(filePath)) {
@@ -334,7 +334,7 @@ export async function policyPublishCommand(
  * smoltbot policy list — list active policies for current agent
  */
 export async function policyListCommand(agentName?: string): Promise<void> {
-  const agent = requireAgent(agentName);
+  const agent = await requireAgent(agentName);
 
   console.log("\nFetching policy...\n");
 
@@ -364,7 +364,7 @@ export async function policyTestCommand(
   file: string,
   agentName?: string
 ): Promise<void> {
-  const agent = requireAgent(agentName);
+  const agent = await requireAgent(agentName);
 
   const filePath = path.resolve(file);
   if (!fs.existsSync(filePath)) {
