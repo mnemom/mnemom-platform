@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
+import type { AgentListItem } from "./api.js";
 
 export const CONFIG_DIR = path.join(os.homedir(), ".smoltbot");
 export const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
@@ -216,33 +217,64 @@ export function getActiveAgent(agentName?: string): AgentConfig | null {
 /**
  * Require an explicit agent selection. Exits with a helpful error if
  * no agent was specified via --agent or SMOLTBOT_AGENT.
+ *
+ * Falls back to API lookup if the agent is not in local config:
+ *  - smolt-XXXXXXXX IDs: public endpoint, no auth required
+ *  - Names: authenticated account listing (requires `smoltbot login`)
  */
-export function requireAgent(agentName?: string): AgentConfig {
+export async function requireAgent(agentName?: string): Promise<AgentConfig> {
   if (!configExists()) {
     console.error("\nsmoltbot is not initialized. Run `smoltbot init` first.\n");
     process.exit(1);
   }
 
-  const agent = getActiveAgent(agentName);
-  if (!agent) {
-    if (!agentName && !process.env.SMOLTBOT_AGENT) {
-      console.error("\nAgent required. Use --agent <name> or set SMOLTBOT_AGENT.\n");
-      console.error("Available agents:");
+  // Fast path: local config hit — no network call needed
+  const localAgent = getActiveAgent(agentName);
+  if (localAgent) return localAgent;
 
-      const config = loadConfig();
-      if (config) {
-        for (const [name, a] of Object.entries(config.agents)) {
-          console.error(`  ${name} (${a.agentId})`);
-        }
+  const name = agentName ?? process.env.SMOLTBOT_AGENT;
+
+  if (!name) {
+    console.error("\nAgent required. Use --agent <name> or set SMOLTBOT_AGENT.\n");
+    console.error("Available agents:");
+    const config = loadConfig();
+    if (config) {
+      for (const [n, a] of Object.entries(config.agents)) {
+        console.error(`  ${n} (${a.agentId})`);
       }
-      console.error();
-    } else {
-      console.error(`\nAgent not found: ${agentName || process.env.SMOLTBOT_AGENT}\n`);
     }
+    console.error();
     process.exit(1);
   }
 
-  return agent;
+  // API fallback: resolve from account
+  try {
+    const { getAgent, getAgentByName } = await import("./api.js");
+    let found: AgentListItem | { id: string; created_at: string } | null = null;
+
+    if (/^smolt-[0-9a-f]{8}$/.test(name)) {
+      // Public endpoint — no auth needed
+      found = await getAgent(name);
+    } else {
+      found = await getAgentByName(name);
+    }
+
+    if (found) {
+      return { agentId: found.id };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("Not logged in")) {
+      console.error(`\n${msg}\n`);
+      process.exit(1);
+    }
+    // Other API errors: fall through to "not found" message
+  }
+
+  console.error(`\nAgent not found: ${name}`);
+  console.error(`Run \`smoltbot agents add ${name}\` to register it locally,`);
+  console.error(`or check \`smoltbot agents\` to see agents in your account.\n`);
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------

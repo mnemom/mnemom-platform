@@ -360,7 +360,7 @@ export async function cardShowCommand(agentName?: string): Promise<void> {
     process.exit(1);
   }
 
-  const agent = requireAgent(agentName);
+  const agent = await requireAgent(agentName);
   if (!agent) {
     console.log("\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
     process.exit(1);
@@ -399,7 +399,7 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
     process.exit(1);
   }
 
-  const agent = requireAgent(agentName);
+  const agent = await requireAgent(agentName);
   if (!agent) {
     console.log("\n" + fmt.error(`Agent not found${agentName ? `: ${agentName}` : ""}`) + "\n");
     process.exit(1);

@@ -52,7 +52,7 @@ export async function statusCommand(agentName?: string): Promise<void> {
   }
 
   const config = loadConfig()!;
-  const agent = requireAgent(agentName);
+  const agent = await requireAgent(agentName);
 
   // 2. Check OpenClaw configuration
   const openclawCheck = checkOpenClawConfig();
