@@ -221,6 +221,10 @@ export interface QuotaContext {
   agent_settings: AgentSettings | null;
   per_proof_price: number;
   containment_status: 'active' | 'paused' | 'killed';
+  // CFD billing fields (populated by get_quota_context_for_agent RPC)
+  cfd_included_checks?: number;
+  per_cfd_check_price?: number;
+  cfd_check_count_this_period?: number;
 }
 
 export interface QuotaDecision {
@@ -3837,7 +3841,8 @@ export async function handleProviderProxy(
       // ====================================================================
       // Phase 0.5: Context Front Door (CFD) — inbound threat screening
       // ====================================================================
-      if ((cfdConfig.mode === 'enforce' || cfdConfig.mode === 'observe') && requestBody !== null) {
+      const cfdFeatureEnabled = quotaContext.feature_flags?.cfd_enabled === true;
+      if (cfdFeatureEnabled && (cfdConfig.mode === 'enforce' || cfdConfig.mode === 'observe') && requestBody !== null) {
         const inboundMessage = extractLastUserMessage(requestBody as Record<string, unknown>, provider);
         if (inboundMessage) {
           // Observe mode: pass immediately, run full analysis in background

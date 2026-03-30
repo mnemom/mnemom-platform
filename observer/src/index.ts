@@ -2665,7 +2665,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
     // Fetch accounts with active metered subscriptions (checks and/or proofs)
     // Include stripe_customer_id for meter events API (proofs)
     const accountsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/billing_accounts?subscription_status=in.(active,trialing)&stripe_subscription_item_id=not.is.null&select=account_id,stripe_customer_id,stripe_subscription_item_id,check_count_this_period,stripe_proof_subscription_item_id,proof_count_this_period`,
+      `${env.SUPABASE_URL}/rest/v1/billing_accounts?subscription_status=in.(active,trialing)&stripe_subscription_item_id=not.is.null&select=account_id,stripe_customer_id,stripe_subscription_item_id,check_count_this_period,stripe_proof_subscription_item_id,proof_count_this_period,stripe_cfd_subscription_item_id,cfd_check_count_this_period`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -2686,6 +2686,8 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
       check_count_this_period: number;
       stripe_proof_subscription_item_id: string | null;
       proof_count_this_period: number;
+      stripe_cfd_subscription_item_id: string | null;        // NEW
+      cfd_check_count_this_period: number;                   // NEW
     }>;
 
     const today = new Date().toISOString().split('T')[0];
@@ -2785,6 +2787,42 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
           });
         }
 
+        // Report CFD check usage (follows same pattern as integrity checks)
+        let cfdQuantity = 0;
+        if (account.stripe_cfd_subscription_item_id && (account.cfd_check_count_this_period || 0) > 0) {
+          cfdQuantity = account.cfd_check_count_this_period || 0;
+          const cfdIdempotencyKey = `${account.account_id}-cfd-${today}`;
+
+          await (stripe as any).subscriptionItems.createUsageRecord(
+            account.stripe_cfd_subscription_item_id,
+            {
+              quantity: cfdQuantity,
+              timestamp: Math.floor(Date.now() / 1000),
+              action: 'set',
+            },
+            { idempotencyKey: cfdIdempotencyKey }
+          );
+
+          // Record CFD usage in stripe_usage_reports
+          const cfdReportId = `sur-${crypto.randomUUID().slice(0, 8)}`;
+          await fetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
+            method: 'POST',
+            headers: {
+              apikey: env.SUPABASE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({
+              id: cfdReportId,
+              account_id: account.account_id,
+              stripe_subscription_item_id: account.stripe_cfd_subscription_item_id,
+              reported_quantity: cfdQuantity,
+              idempotency_key: cfdIdempotencyKey,
+            }),
+          });
+        }
+
         // Log billing event (combined check + proof report)
         const eventId = `be-${crypto.randomUUID().slice(0, 8)}`;
         await fetch(`${env.SUPABASE_URL}/rest/v1/billing_events`, {
@@ -2802,6 +2840,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
             details: {
               check_quantity: checkQuantity,
               proof_quantity: proofQuantity,
+              cfd_quantity: cfdQuantity,
               date: today,
               check_idempotency_key: checkIdempotencyKey,
               proof_identifier: proofQuantity > 0
