@@ -3429,6 +3429,65 @@ async function incrementCFDUsage(agentId: string, env: Env): Promise<void> {
   }
 }
 
+/** Fetch canary values for an agent (KV cached 10 min). Returns empty array on error. */
+async function fetchAgentCanaries(agentId: string, env: Env): Promise<string[]> {
+  if (!env.BILLING_CACHE) return [];
+  const cacheKey = `cfd:canaries:${agentId}`;
+  try {
+    const cached = await env.BILLING_CACHE.get(cacheKey);
+    if (cached) return JSON.parse(cached) as string[];
+
+    const resp = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/cfd_canaries?agent_id=eq.${agentId}&triggered=eq.false&select=canary_value`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+    if (!resp.ok) return [];
+    const rows = await resp.json() as Array<{ canary_value: string }>;
+    const values = rows.map(r => r.canary_value).filter(Boolean);
+    await env.BILLING_CACHE.put(cacheKey, JSON.stringify(values), { expirationTtl: 600 }).catch(() => {});
+    return values;
+  } catch {
+    return [];
+  }
+}
+
+/** Scan text for any canary values. Returns the first triggered canary value or null. */
+function scanForCanaryUse(text: string, canaries: string[]): string | null {
+  if (!text || canaries.length === 0) return null;
+  for (const canary of canaries) {
+    if (canary.length >= 8 && text.includes(canary)) return canary;
+  }
+  return null;
+}
+
+/** Mark a canary as triggered (fire-and-forget). */
+async function markCanaryTriggered(agentId: string, canaryValue: string, env: Env): Promise<void> {
+  try {
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/cfd_canaries?agent_id=eq.${agentId}&canary_value=eq.${encodeURIComponent(canaryValue)}`,
+      {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ triggered: true, triggered_at: new Date().toISOString() }),
+      }
+    );
+    // Invalidate KV cache
+    await env.BILLING_CACHE?.delete(`cfd:canaries:${agentId}`);
+  } catch {
+    // Fire-and-forget
+  }
+}
+
 /** Write a pre-emptive CFD nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
@@ -4180,7 +4239,43 @@ export async function handleProviderProxy(
     }
 
     // Buffer the full response for analysis
+    let canaryTriggered = false;
     const responseBodyText = await response.text();
+
+    // CFD Canary detection: scan response for planted canary credentials
+    // This is in the fail-open wrapper — any error continues without blocking
+    try {
+      const canaries = await fetchAgentCanaries(agent.id, env);
+      if (canaries.length > 0) {
+        const triggered = scanForCanaryUse(responseBodyText, canaries);
+        if (triggered) {
+          canaryTriggered = true;
+          console.log(JSON.stringify({
+            event: 'cfd_canary_triggered',
+            agent_id: agent.id,
+            session_id: sessionId,
+            canary_prefix: triggered.slice(0, 6) + '****',
+          }));
+          // Mark triggered in DB and emit calibration signal (background)
+          ctx.waitUntil(markCanaryTriggered(agent.id, triggered, env));
+          ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, 'enforce', {
+            verdict: 'block',
+            overall_risk: 1.0,
+            threats: [{ type: 'indirect_injection', confidence: 1.0, reasoning: 'Canary credential detected in agent response — confirmed compromise' }],
+            l1_score: 1.0,
+            session_multiplier: 1.0,
+            detection_layer: 'l1',
+            duration_ms: 0,
+          }, 'canary', env));
+        }
+      }
+    } catch {
+      // Fail-open: canary scan errors never block response
+    }
+
+    if (canaryTriggered) {
+      responseHeaders.set('X-CFD-Canary-Triggered', 'true');
+    }
 
     // Fail-open wrapper: entire AIP pipeline wrapped in try/catch
     try {
@@ -4783,7 +4878,7 @@ export default {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },
