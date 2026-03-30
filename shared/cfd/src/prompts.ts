@@ -65,11 +65,14 @@ export function buildCFDUserPrompt(content: string, sourceType?: string): string
  */
 export function parseL2Response(rawText: string): L2Result | null {
   try {
-    // Strip markdown code fences
-    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
+    // Extract JSON object using indexOf/lastIndexOf — avoids ReDoS on [\s\S]*
+    // (equivalent to the greedy regex \{[\s\S]*\} but without backtracking)
+    const start = rawText.indexOf('{');
+    const end = rawText.lastIndexOf('}');
+    if (start === -1 || end === -1 || end <= start) return null;
+    const jsonStr = rawText.slice(start, end + 1);
 
-    const parsed = JSON.parse(jsonMatch[0]) as {
+    const parsed = JSON.parse(jsonStr) as {
       threats?: Array<{ type: string; confidence: number; reasoning: string }>;
       overall_risk?: number;
       recommendation?: string;
