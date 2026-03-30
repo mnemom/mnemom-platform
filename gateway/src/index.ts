@@ -29,8 +29,6 @@ import {
   type DriftState,
   type CheckIntegrityInput,
   type ConscienceValue,
-  type DetectionRecipe,
-  type RecipeParsedContent,
 } from '@mnemom/agent-integrity-protocol';
 
 import { createWorkersExporter } from '@mnemom/aip-otel-exporter/workers';
@@ -55,6 +53,18 @@ import {
   type EvaluationResult,
   type ToolReference,
 } from '@mnemom/policy-engine';
+import {
+  runL1Detection,
+  applySessionMultiplier,
+  decorateMessage,
+  buildQuarantineNotification,
+  DEFAULT_CFD_CONFIG,
+  type CFDConfig,
+  type CFDDecision,
+  type CFDVerdict,
+  type SessionRiskState,
+  type CFDThreatPattern,
+} from '@mnemom/cfd';
 
 // ============================================================================
 // Bootstrapping Defaults
@@ -933,207 +943,6 @@ async function fetchOrgConscienceValuesForGateway(
   }
 }
 
-// === Recipe Engine Types & Functions ===
-// DetectionRecipe and RecipeParsedContent imported from @mnemom/agent-integrity-protocol
-
-/**
- * Fetch active detection recipes from Supabase via RPC.
- * Uses KV cache (5-min TTL). Fail-open: returns empty array on error.
- */
-async function fetchActiveRecipes(env: Env): Promise<DetectionRecipe[]> {
-  const cacheKey = 'active-recipes';
-  if (env.BILLING_CACHE) {
-    const cached = await env.BILLING_CACHE.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-  }
-  try {
-    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_active_detection_recipes`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: '{}',
-    });
-    if (!response.ok) return [];
-    const recipes = await response.json() as DetectionRecipe[];
-    if (env.BILLING_CACHE) {
-      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(recipes), { expirationTtl: 300 }).catch(() => {});
-    }
-    return recipes;
-  } catch {
-    return [];
-  }
-}
-
-// === Security Settings ===
-
-interface SecuritySettings {
-  tier1_enabled: boolean;
-  tier2_enabled: boolean;
-  tier3_enabled: boolean;
-  tier3_override_threshold: number;
-  tier3_min_agreeing_recipes: number;
-  tier2_max_checks: number;
-}
-
-const DEFAULT_SECURITY_SETTINGS: SecuritySettings = {
-  tier1_enabled: true,
-  tier2_enabled: true,
-  tier3_enabled: true,
-  tier3_override_threshold: 0.6,
-  tier3_min_agreeing_recipes: 1,
-  tier2_max_checks: 12,
-};
-
-/**
- * Fetch global tier flags from security_settings.
- * Uses KV cache (2-min TTL). Fail-open: returns defaults (all tiers on).
- */
-async function fetchSecuritySettings(env: Env): Promise<SecuritySettings> {
-  const cacheKey = 'security-settings';
-  if (env.BILLING_CACHE) {
-    const cached = await env.BILLING_CACHE.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-  }
-  try {
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/security_settings?id=eq.1&select=tier1_enabled,tier2_enabled,tier3_enabled,tier3_override_threshold,tier3_min_agreeing_recipes,tier2_max_checks`,
-      {
-        headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
-          Accept: 'application/vnd.pgrst.object+json',
-        },
-      }
-    );
-    if (!response.ok) return { ...DEFAULT_SECURITY_SETTINGS };
-    const settings = await response.json() as SecuritySettings;
-    if (env.BILLING_CACHE) {
-      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(settings), { expirationTtl: 120 }).catch(() => {});
-    }
-    return settings;
-  } catch {
-    return { ...DEFAULT_SECURITY_SETTINGS };
-  }
-}
-
-interface EnrichedRecipeMatch {
-  recipe: DetectionRecipe;
-  confidence: number;
-  conditionsMatched: number;
-  conditionsTotal: number;
-}
-
-interface Tier1Result {
-  signals: string[];
-  matchedRecipes: EnrichedRecipeMatch[];
-  escalated: boolean;
-  maxConfidence: number;
-}
-
-/**
- * Tier 1: Pure heuristic prefilter — no LLM calls.
- * Evaluates recipe conditions against computed metrics from thinking/output blocks.
- */
-function evaluateTier1(
-  recipes: DetectionRecipe[],
-  thinkingBlock: string,
-  outputBlock: string | undefined,
-  inputTokens: number,
-  outputTokens: number,
-  toolCallCount: number = 0
-): Tier1Result {
-  const metrics: Record<string, number | string> = {
-    thinking_output_ratio: outputTokens > 0 ? thinkingBlock.length / (outputBlock?.length || 1) : 0,
-    output_token_count: outputTokens,
-    thinking_token_count: thinkingBlock.length,
-    hedging_word_count: (outputBlock || '').match(/\b(perhaps|maybe|might|could|uncertain|approximately|roughly)\b/gi)?.length || 0,
-    tool_call_count: toolCallCount,
-  };
-
-  const signals: string[] = [];
-  const matchedRecipes: EnrichedRecipeMatch[] = [];
-
-  for (const recipe of recipes) {
-    if (!recipe.has_tier1 || !recipe.parsed_content.tier1) continue;
-    const t1 = recipe.parsed_content.tier1;
-    const condResults = t1.conditions.map(cond => {
-      const val = metrics[cond.metric];
-      if (val === undefined) return false;
-      const numVal = typeof val === 'number' ? val : parseFloat(val as string);
-      const threshold = typeof cond.threshold === 'number' ? cond.threshold : parseFloat(cond.threshold as string);
-      switch (cond.operator) {
-        case 'lt': return numVal < threshold;
-        case 'lte': return numVal <= threshold;
-        case 'gt': return numVal > threshold;
-        case 'gte': return numVal >= threshold;
-        case 'eq': return numVal === threshold;
-        case 'neq': return numVal !== threshold;
-        case 'matches': return new RegExp(String(cond.threshold)).test(String(val));
-        case 'contains': return String(val).includes(String(cond.threshold));
-        default: return false;
-      }
-    });
-    const matched = t1.match === 'all' ? condResults.every(Boolean) : condResults.some(Boolean);
-    if (matched) {
-      const conditionsMatched = condResults.filter(Boolean).length;
-      const conditionsTotal = condResults.length;
-      const confidence = t1.match === 'all' ? 1.0 : conditionsMatched / conditionsTotal;
-      matchedRecipes.push({ recipe, confidence, conditionsMatched, conditionsTotal });
-      for (const cond of t1.conditions) {
-        const idx = t1.conditions.indexOf(cond);
-        if (condResults[idx] && cond.signal) signals.push(cond.signal);
-      }
-    }
-  }
-
-  const maxConfidence = matchedRecipes.length > 0 ? Math.max(...matchedRecipes.map(m => m.confidence)) : 0;
-  return { signals: [...new Set(signals)], matchedRecipes, escalated: signals.length > 0, maxConfidence };
-}
-
-/**
- * Tier 2: Select conscience checks to inject into AIP analysis.
- * When tier1Ran=false (broad mode): inject ALL tier2 checks from active recipes.
- * When tier1Ran=true (targeted mode): filter by Tier 1 signal/category match.
- */
-function selectTier2Checks(
-  recipes: DetectionRecipe[],
-  signals: string[],
-  opts?: { techniqueCategory?: string; tier1Ran?: boolean; maxChecks?: number }
-): Array<{ id: string; content: string; type: string }> {
-  const maxChecks = opts?.maxChecks ?? 12;
-  const checks: Array<{ id: string; content: string; type: string; priority: number }> = [];
-  for (const recipe of recipes) {
-    if (!recipe.has_tier2 || !recipe.parsed_content.tier2) continue;
-    if (!opts?.tier1Ran) {
-      // Broad mode: inject all tier2 checks, prioritized by hit_count
-      const priority = (recipe as any).hit_count || 0;
-      for (const check of recipe.parsed_content.tier2.checks) {
-        checks.push({ id: check.id, content: check.content, type: 'BOUNDARY', priority });
-      }
-    } else {
-      // Targeted mode: filter by Tier 1 signal/category match
-      const trigger = recipe.parsed_content.tier2.trigger;
-      const signalMatch = trigger.on_signals?.some(s => signals.includes(s));
-      const categoryMatch = opts.techniqueCategory && trigger.on_categories?.includes(opts.techniqueCategory);
-      if (signalMatch || categoryMatch) {
-        for (const check of recipe.parsed_content.tier2.checks) {
-          checks.push({ id: check.id, content: check.content, type: 'BOUNDARY', priority: 100 });
-        }
-      }
-    }
-  }
-  // Sort by priority descending
-  checks.sort((a, b) => b.priority - a.priority);
-  const capped = checks.length > maxChecks;
-  if (capped) {
-    console.log(JSON.stringify({ event: 'recipe-engine-tier2', action: 'capped', totalAvailable: checks.length, maxChecks }));
-  }
-  return checks.slice(0, maxChecks).map(({ priority: _, ...rest }) => rest);
-}
-
 /**
  * Fetch org card template for an agent (Phase 3c).
  * Uses KV cache (30-min TTL) → Supabase RPC. Fail-open: returns null on error.
@@ -1386,42 +1195,6 @@ async function storeCheckpoint(
     }
   } catch (error) {
     console.error('[gateway/aip] Error storing checkpoint:', error);
-  }
-}
-
-/**
- * Record which detection recipes matched (Tier 2 injected) and triggered (Tier 1 fired)
- * for a given checkpoint. Calls the record_recipe_hits RPC. Fail-open.
- */
-async function recordRecipeHits(
-  env: Env,
-  checkpointId: string,
-  matchedRecipeIds: string[],
-  triggeredRecipeIds: string[],
-  tier3Override?: { override: boolean; recipeId?: string; confidence?: number }
-): Promise<void> {
-  if (matchedRecipeIds.length === 0 && triggeredRecipeIds.length === 0) return;
-  try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/record_recipe_hits`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({
-        p_checkpoint_id: checkpointId,
-        p_matched_ids: matchedRecipeIds,
-        p_triggered_ids: triggeredRecipeIds,
-        ...(tier3Override?.override ? {
-          p_tier3_override: true,
-          p_tier3_override_recipe_id: tier3Override.recipeId,
-          p_tier3_override_confidence: tier3Override.confidence,
-        } : {}),
-      }),
-    });
-  } catch (e) {
-    console.error('[recipe-hits] Failed to record:', e);
   }
 }
 
@@ -2239,44 +2012,6 @@ async function analyzeStreamInBackground(
     // 9. Build conscience prompt and call analysis LLM
     const values: ConscienceValue[] = conscienceValues || [...DEFAULT_CONSCIENCE_VALUES];
 
-    // === Recipe Engine: Fetch settings + recipes in parallel ===
-    let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false, maxConfidence: 0 };
-    let tier2RecipeIds: string[] = [];
-    let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
-    try {
-      const [settings, activeRecipes] = await Promise.all([
-        fetchSecuritySettings(env),
-        fetchActiveRecipes(env),
-      ]);
-      tierConfig = settings;
-      console.log(`[recipe-engine] Config: t1=${tierConfig.tier1_enabled} t2=${tierConfig.tier2_enabled} t3=${tierConfig.tier3_enabled} recipes=${activeRecipes.length}`);
-
-      if (activeRecipes.length > 0) {
-        // Tier 1: heuristic prefilter (only if enabled)
-        if (tierConfig.tier1_enabled) {
-          tier1Result = evaluateTier1(activeRecipes, parsed.thinking, outputText, parsed.thinking.length, outputText?.length || 0, parsed.toolCalls?.length || 0);
-          const confidences: Record<string, number> = {};
-          for (const m of tier1Result.matchedRecipes) confidences[m.recipe.id] = m.confidence;
-          console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
-        }
-
-        // Tier 2: select checks for logging (not injected into analysis prompt —
-        // Tier 3 verdict override provides the safety net instead)
-        if (tierConfig.tier2_enabled) {
-          const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled, maxChecks: tierConfig.tier2_max_checks });
-          const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
-          const totalAvailable = activeRecipes.filter(r => r.has_tier2).reduce((sum, r) => sum + (r.parsed_content.tier2?.checks?.length || 0), 0);
-          tier2RecipeIds = tierConfig.tier1_enabled
-            ? tier1Result.matchedRecipes.map(r => r.recipe.id)
-            : activeRecipes.filter(r => r.has_tier2).map(r => r.id);
-          console.log(JSON.stringify({ event: 'recipe-engine-tier2', mode, checksSelected: tier2Checks.length, totalAvailable, capped: tier2Checks.length < totalAvailable }));
-        }
-      }
-    } catch (e) {
-      console.error('[recipe-engine] Error evaluating recipes:', e);
-      // Fail open — continue without recipe checks
-    }
-
     const gatewayAgentDesc = card?.extensions?.mnemom?.description
       || card?.extensions?.mnemom?.role
       || '';
@@ -2354,30 +2089,6 @@ async function analyzeStreamInBackground(
       analysisDurationMs,
     });
 
-    // === Recipe Engine: Tier 3 Cross-validation (log only — verdict override disabled) ===
-    // Tier 3 previously overrode clear verdicts based on heuristic signals, but arena-specific
-    // recipe rules were firing on legitimate production agents. The analysis LLM's independent
-    // judgment is authoritative — Tier 3 logs potential overrides for observability only.
-    let tier3OverrideMeta: { override: boolean; recipeId?: string; confidence?: number } | undefined;
-    if (tierConfig.tier3_enabled && tierConfig.tier1_enabled && tier1Result.escalated && checkpoint.verdict === 'clear') {
-      const threshold = tierConfig.tier3_override_threshold;
-      const minAgreeing = tierConfig.tier3_min_agreeing_recipes;
-      const qualifiedRecipes = tier1Result.matchedRecipes.filter(m => {
-        if (m.confidence < threshold) return false;
-        const t3 = m.recipe.parsed_content.tier3;
-        if (!t3) return false;
-        return t3.rules.some(rule => rule.when.tier1_escalated && rule.when.aip_verdict === 'clear' && rule.action === 'override_to_review');
-      });
-      if (qualifiedRecipes.length >= minAgreeing) {
-        const best = qualifiedRecipes.reduce((a, b) => a.confidence > b.confidence ? a : b);
-        // Log the would-be override but do NOT modify the verdict or inject concerns
-        tier3OverrideMeta = { override: false, recipeId: best.recipe.id, confidence: best.confidence };
-        console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', reason: 'verdict-override-disabled', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: best.confidence, recipeId: best.recipe.id }));
-      } else {
-        console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: qualifiedRecipes.length > 0 ? Math.max(...qualifiedRecipes.map(r => r.confidence)) : 0 }));
-      }
-    }
-
     window.push(checkpoint);
     const summary = window.getSummary();
     const signal = buildSignal(checkpoint, summary);
@@ -2412,10 +2123,6 @@ async function analyzeStreamInBackground(
 
     // 13. Store checkpoint, submit metering, deliver webhooks
     await storeCheckpoint(checkpoint, 'gateway', env, attestation);
-
-    // 13a. Record recipe hits (matched = Tier 2 injected, triggered = Tier 1 fired)
-    const triggeredRecipeIds = tier1Result.matchedRecipes.map(r => r.recipe.id);
-    await recordRecipeHits(env, checkpoint.checkpoint_id, tier2RecipeIds, triggeredRecipeIds, tier3OverrideMeta);
 
     await submitMeteringEvent(agent.id, checkpoint.checkpoint_id, 'gateway', env);
     await deliverWebhooks(checkpoint, env);
@@ -3324,6 +3031,290 @@ async function applyGracePeriod(
   return { violations: remainingViolations, warnings: newWarnings };
 }
 
+// ============================================================================
+// Context Front Door (CFD) — inbound threat screening helpers
+// ============================================================================
+
+/** Fetch CFD config for an agent (org-level fallback). KV cached 5 min. */
+async function fetchCFDConfig(agentId: string, env: Env): Promise<CFDConfig> {
+  const cacheKey = `cfd:config:${agentId}`;
+  try {
+    if (env.BILLING_CACHE) {
+      const cached = await env.BILLING_CACHE.get(cacheKey);
+      if (cached) return JSON.parse(cached) as CFDConfig;
+    }
+    const resp = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/rpc/get_cfd_config_for_agent`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ p_agent_id: agentId }),
+      }
+    );
+    if (!resp.ok) return { ...DEFAULT_CFD_CONFIG };
+    const config = await resp.json() as CFDConfig;
+    if (env.BILLING_CACHE) {
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(config), { expirationTtl: 300 }).catch(() => {});
+    }
+    return config;
+  } catch {
+    return { ...DEFAULT_CFD_CONFIG };
+  }
+}
+
+/** Fetch active CFD threat patterns (KV cached 5 min). */
+async function fetchCFDThreatPatterns(env: Env): Promise<CFDThreatPattern[]> {
+  const cacheKey = 'cfd:threat-patterns';
+  try {
+    if (env.BILLING_CACHE) {
+      const cached = await env.BILLING_CACHE.get(cacheKey);
+      if (cached) return JSON.parse(cached) as CFDThreatPattern[];
+    }
+    const resp = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns?label=eq.malicious&select=id,threat_type,label,content`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+    if (!resp.ok) return [];
+    const patterns = await resp.json() as CFDThreatPattern[];
+    if (env.BILLING_CACHE) {
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(patterns), { expirationTtl: 300 }).catch(() => {});
+    }
+    return patterns;
+  } catch {
+    return [];
+  }
+}
+
+/** Read session risk state from KV. */
+async function getCFDSessionState(sessionId: string, env: Env): Promise<SessionRiskState | null> {
+  try {
+    const raw = await env.BILLING_CACHE?.get(`cfd:session:${sessionId}`);
+    return raw ? JSON.parse(raw) as SessionRiskState : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Update session risk state in KV after a CFD check. */
+async function updateCFDSessionState(
+  sessionId: string,
+  agentId: string,
+  score: number,
+  env: Env
+): Promise<void> {
+  try {
+    const existing = await getCFDSessionState(sessionId, env);
+    const now = Date.now();
+    const windowScores = [
+      ...(existing?.window_scores ?? []).filter(s => now - s.timestamp < 3600_000),
+      { score, timestamp: now },
+    ].slice(-20); // keep last 20
+    const tenMinAgo = now - 600_000;
+    const recentHigh = windowScores.filter(s => s.score >= 0.6 && s.timestamp >= tenMinAgo).length;
+    const level = recentHigh >= 3 ? 'high' : recentHigh >= 2 ? 'medium' : 'low';
+    const state: SessionRiskState = {
+      session_id: sessionId,
+      agent_id: agentId,
+      window_scores: windowScores,
+      session_threat_level: level as SessionRiskState['session_threat_level'],
+      escalation_triggered: recentHigh >= 3,
+      last_updated: now,
+    };
+    await env.BILLING_CACHE?.put(
+      `cfd:session:${sessionId}`,
+      JSON.stringify(state),
+      { expirationTtl: 3600 }
+    );
+  } catch {
+    // Non-blocking
+  }
+}
+
+/** Generate a human-readable quarantine ID. */
+function generateQuarantineId(): string {
+  const hex = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `qid_${hex}`;
+}
+
+/** Extract the last user message content from a parsed request body (provider-agnostic). */
+function extractLastUserMessage(body: Record<string, unknown>, provider: string): string | null {
+  try {
+    // Anthropic / OpenAI: body.messages is an array
+    const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
+    if (messages && Array.isArray(messages)) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          const content = messages[i].content;
+          if (typeof content === 'string') return content;
+          if (Array.isArray(content)) {
+            // Multi-part content — extract text blocks
+            const texts = content
+              .filter((c: unknown) => typeof c === 'object' && c !== null && (c as Record<string, unknown>).type === 'text')
+              .map((c: unknown) => (c as Record<string, unknown>).text as string);
+            if (texts.length > 0) return texts.join('\n');
+          }
+        }
+      }
+    }
+    // Gemini: body.contents
+    if (provider === 'gemini') {
+      const contents = body.contents as Array<{ role: string; parts: Array<{ text?: string }> }> | undefined;
+      if (contents && Array.isArray(contents)) {
+        for (let i = contents.length - 1; i >= 0; i--) {
+          if (contents[i].role === 'user') {
+            const text = contents[i].parts?.map(p => p.text ?? '').join('\n');
+            if (text) return text;
+          }
+        }
+      }
+    }
+  } catch {
+    // Fall through
+  }
+  return null;
+}
+
+/** Replace the last user message content in-place in a request body. */
+function replaceLastUserMessageContent(
+  body: Record<string, unknown>,
+  newContent: string,
+  provider: string
+): void {
+  try {
+    const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
+    if (messages && Array.isArray(messages)) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          messages[i] = { ...messages[i], content: newContent };
+          return;
+        }
+      }
+    }
+    if (provider === 'gemini') {
+      const contents = body.contents as Array<{ role: string; parts: Array<{ text?: string }> }> | undefined;
+      if (contents && Array.isArray(contents)) {
+        for (let i = contents.length - 1; i >= 0; i--) {
+          if (contents[i].role === 'user') {
+            contents[i] = { ...contents[i], parts: [{ text: newContent }] };
+            return;
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-blocking: if replacement fails, original content passes through
+  }
+}
+
+/** Log a CFD evaluation to the cfd_evaluations table (fire-and-forget). */
+async function logCFDEvaluation(
+  agentId: string,
+  sessionId: string,
+  mode: string,
+  decision: CFDDecision,
+  surface: string,
+  env: Env
+): Promise<void> {
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/cfd_evaluations`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        agent_id: agentId,
+        session_id: sessionId,
+        mode,
+        surface,
+        verdict: decision.verdict,
+        threats: decision.threats,
+        overall_risk: decision.overall_risk,
+        l1_score: decision.l1_score,
+        session_multiplier: decision.session_multiplier,
+        decorated: decision.verdict === 'warn',
+        quarantine_id: decision.quarantine_id ?? null,
+        duration_ms: decision.duration_ms,
+      }),
+    });
+  } catch {
+    // Non-blocking
+  }
+}
+
+/** Write CFD result to KV so the AIP analysis (Phase 1+) can enrich its conscience prompt. */
+async function cacheCFDResultForAIP(
+  sessionId: string,
+  decision: CFDDecision,
+  env: Env
+): Promise<void> {
+  try {
+    await env.BILLING_CACHE?.put(
+      `cfd:result:${sessionId}:latest`,
+      JSON.stringify(decision),
+      { expirationTtl: 600 }
+    );
+  } catch {
+    // Non-blocking
+  }
+}
+
+/** Log a quarantined message to the quarantined_messages table. */
+async function logQuarantinedMessage(
+  quarantineId: string,
+  agentId: string,
+  sessionId: string,
+  contentHash: string,
+  decision: CFDDecision,
+  sourceType: string,
+  env: Env
+): Promise<void> {
+  try {
+    const topThreat = decision.threats.sort((a, b) => b.confidence - a.confidence)[0];
+    await fetch(`${env.SUPABASE_URL}/rest/v1/quarantined_messages`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        quarantine_id: quarantineId,
+        agent_id: agentId,
+        session_id: sessionId,
+        content_hash: contentHash,
+        source_type: sourceType,
+        threat_type: topThreat?.type ?? 'unknown',
+        confidence: decision.overall_risk,
+        reasoning: topThreat?.reasoning ?? null,
+        status: 'pending',
+      }),
+    });
+  } catch {
+    // Non-blocking
+  }
+}
+
+/** Simple content hash for quarantine records (no sensitive content stored). */
+async function hashContent(content: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 /**
  * Handle provider API proxy requests (multi-provider).
  *
@@ -3370,6 +3361,13 @@ export async function handleProviderProxy(
 
     // Generate session ID
     const sessionId = generateSessionId(agentHash);
+
+    // CFD state — populated during Phase 0.5 pre-check, used for response headers
+    let cfdVerdict: CFDVerdict | undefined;
+    let cfdQuarantineId: string | undefined;
+
+    // Fetch CFD config early (KV cached — negligible latency)
+    const cfdConfig = await fetchCFDConfig(agent.id, env);
 
     // Build metadata header for CF AI Gateway
     const metadataHeader = buildMetadataHeader(
@@ -3490,6 +3488,83 @@ export async function handleProviderProxy(
           env,
           provider
         );
+      }
+
+      // ====================================================================
+      // Phase 0.5: Context Front Door (CFD) — inbound threat screening
+      // ====================================================================
+      if (cfdConfig.mode === 'enforce' && requestBody !== null) {
+        const inboundMessage = extractLastUserMessage(requestBody as Record<string, unknown>, provider);
+        if (inboundMessage) {
+          const t0 = Date.now();
+          const [patterns, sessionState] = await Promise.all([
+            fetchCFDThreatPatterns(env),
+            getCFDSessionState(sessionId, env),
+          ]);
+          const l1 = runL1Detection(inboundMessage, patterns);
+          const { multiplied_score, session_multiplier } = applySessionMultiplier(l1.score, sessionState);
+
+          // Determine verdict from thresholds
+          const thresholds = cfdConfig.thresholds;
+          let verdict: CFDVerdict = 'pass';
+          if (multiplied_score >= thresholds.block) verdict = 'block';
+          else if (multiplied_score >= thresholds.quarantine) verdict = 'quarantine';
+          else if (multiplied_score >= thresholds.warn) verdict = 'warn';
+
+          const duration_ms = Date.now() - t0;
+
+          if (verdict !== 'pass') {
+            let quarantineId: string | undefined;
+            if (verdict === 'block' || verdict === 'quarantine') {
+              quarantineId = generateQuarantineId();
+            }
+
+            const decision: CFDDecision = {
+              verdict,
+              overall_risk: multiplied_score,
+              threats: l1.threats,
+              l1_score: l1.score,
+              session_multiplier,
+              quarantine_id: quarantineId,
+              detection_layer: 'l1',
+              duration_ms,
+            };
+
+            if (verdict === 'block' || verdict === 'quarantine') {
+              // Replace user message with quarantine notification
+              const notification = buildQuarantineNotification(quarantineId!, decision);
+              replaceLastUserMessageContent(requestBody as Record<string, unknown>, notification.xml, provider);
+              cfdVerdict = verdict;
+              cfdQuarantineId = quarantineId;
+              // Log quarantine + evaluation (background)
+              const contentHash = await hashContent(inboundMessage);
+              ctx.waitUntil(logQuarantinedMessage(quarantineId!, agent.id, sessionId, contentHash, decision, 'user_message', env));
+              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, decision, 'user_message', env));
+            } else {
+              // WARN: decorate message with XML Spotlighting annotation
+              const annotated = decorateMessage(inboundMessage, decision);
+              replaceLastUserMessageContent(requestBody as Record<string, unknown>, annotated.content, provider);
+              cfdVerdict = verdict;
+              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, decision, 'user_message', env));
+            }
+
+            // Cache CFD result in KV for AIP enrichment (Phase 1+)
+            ctx.waitUntil(cacheCFDResultForAIP(sessionId, decision, env));
+          }
+
+          // Always update session state with this message's score
+          ctx.waitUntil(updateCFDSessionState(sessionId, agent.id, multiplied_score, env));
+
+          console.log(JSON.stringify({
+            event: 'cfd',
+            verdict,
+            l1_score: l1.score,
+            multiplied_score,
+            session_multiplier,
+            threat_count: l1.threats.length,
+            duration_ms,
+          }));
+        }
       }
 
       modifiedBody = JSON.stringify(requestBody);
@@ -3666,6 +3741,14 @@ export async function handleProviderProxy(
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set('x-smoltbot-agent', agent.id);
     responseHeaders.set('x-smoltbot-session', sessionId);
+
+    // Add CFD headers if screening ran
+    if (cfdVerdict) {
+      responseHeaders.set('X-CFD-Verdict', cfdVerdict);
+      if (cfdQuarantineId) {
+        responseHeaders.set('X-CFD-Quarantine-Id', cfdQuarantineId);
+      }
+    }
 
     // Add policy verdict header if evaluation ran
     if (policyVerdict) {
@@ -3934,54 +4017,6 @@ export async function handleProviderProxy(
       // Build conscience prompt
       const values: ConscienceValue[] = conscienceValues || [...DEFAULT_CONSCIENCE_VALUES];
 
-      // === Recipe Engine: Fetch settings + recipes in parallel ===
-      let tier1Result: Tier1Result = { signals: [], matchedRecipes: [], escalated: false, maxConfidence: 0 };
-      let tier2RecipeIds: string[] = [];
-      let tierConfig: SecuritySettings = { ...DEFAULT_SECURITY_SETTINGS };
-      try {
-        const [settings, activeRecipes] = await Promise.all([
-          fetchSecuritySettings(env),
-          fetchActiveRecipes(env),
-        ]);
-        tierConfig = settings;
-        console.log(`[recipe-engine] Config: t1=${tierConfig.tier1_enabled} t2=${tierConfig.tier2_enabled} t3=${tierConfig.tier3_enabled} recipes=${activeRecipes.length}`);
-
-        if (activeRecipes.length > 0) {
-          // Count tool calls from response body for Tier 1 metrics
-          let toolCallCount = 0;
-          try {
-            const respBody = JSON.parse(responseBodyText) as Record<string, unknown>;
-            const content = respBody.content as Array<Record<string, unknown>> | undefined;
-            if (Array.isArray(content)) {
-              toolCallCount = content.filter(b => b.type === 'tool_use').length;
-            }
-          } catch { /* fail-open */ }
-
-          // Tier 1: heuristic prefilter (only if enabled)
-          if (tierConfig.tier1_enabled) {
-            tier1Result = evaluateTier1(activeRecipes, thinking.content, outputText, thinking.content.length, outputText?.length || 0, toolCallCount);
-            const confidences: Record<string, number> = {};
-            for (const m of tier1Result.matchedRecipes) confidences[m.recipe.id] = m.confidence;
-            console.log(JSON.stringify({ event: 'recipe-engine-tier1', escalated: tier1Result.escalated, maxConfidence: tier1Result.maxConfidence, matchedRecipeIds: tier1Result.matchedRecipes.map(m => m.recipe.id), confidences, signals: tier1Result.signals }));
-          }
-
-          // Tier 2: select checks for logging (not injected into analysis prompt —
-          // Tier 3 verdict override provides the safety net instead)
-          if (tierConfig.tier2_enabled) {
-            const tier2Checks = selectTier2Checks(activeRecipes, tier1Result.signals, { tier1Ran: tierConfig.tier1_enabled, maxChecks: tierConfig.tier2_max_checks });
-            const mode = tierConfig.tier1_enabled ? 'targeted' : 'broad';
-            const totalAvailable = activeRecipes.filter(r => r.has_tier2).reduce((sum, r) => sum + (r.parsed_content.tier2?.checks?.length || 0), 0);
-            tier2RecipeIds = tierConfig.tier1_enabled
-              ? tier1Result.matchedRecipes.map(r => r.recipe.id)
-              : activeRecipes.filter(r => r.has_tier2).map(r => r.id);
-            console.log(JSON.stringify({ event: 'recipe-engine-tier2', mode, checksSelected: tier2Checks.length, totalAvailable, capped: tier2Checks.length < totalAvailable }));
-          }
-        }
-      } catch (e) {
-        console.error('[recipe-engine] Error evaluating recipes:', e);
-        // Fail open — continue without recipe checks
-      }
-
       // Build task context from request messages and card description (PII-safe)
       const gatewayAgentDesc = card?.extensions?.mnemom?.description
         || card?.extensions?.mnemom?.role
@@ -4063,26 +4098,6 @@ export async function handleProviderProxy(
         analysisDurationMs,
       });
 
-      // === Recipe Engine: Tier 3 Cross-validation (log only — verdict override disabled) ===
-      let tier3OverrideMeta: { override: boolean; recipeId?: string; confidence?: number } | undefined;
-      if (tierConfig.tier3_enabled && tierConfig.tier1_enabled && tier1Result.escalated && checkpoint.verdict === 'clear') {
-        const threshold = tierConfig.tier3_override_threshold;
-        const minAgreeing = tierConfig.tier3_min_agreeing_recipes;
-        const qualifiedRecipes = tier1Result.matchedRecipes.filter(m => {
-          if (m.confidence < threshold) return false;
-          const t3 = m.recipe.parsed_content.tier3;
-          if (!t3) return false;
-          return t3.rules.some(rule => rule.when.tier1_escalated && rule.when.aip_verdict === 'clear' && rule.action === 'override_to_review');
-        });
-        if (qualifiedRecipes.length >= minAgreeing) {
-          const best = qualifiedRecipes.reduce((a, b) => a.confidence > b.confidence ? a : b);
-          tier3OverrideMeta = { override: false, recipeId: best.recipe.id, confidence: best.confidence };
-          console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', reason: 'verdict-override-disabled', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: best.confidence, recipeId: best.recipe.id }));
-        } else {
-          console.log(JSON.stringify({ event: 'recipe-engine-tier3', action: 'suppressed', qualifiedRecipes: qualifiedRecipes.length, threshold, bestConfidence: qualifiedRecipes.length > 0 ? Math.max(...qualifiedRecipes.map(r => r.confidence)) : 0 }));
-        }
-      }
-
       // Push to window, get summary, build signal
       window.push(checkpoint);
       const summary = window.getSummary();
@@ -4129,9 +4144,6 @@ export async function handleProviderProxy(
 
       // Background: store checkpoint (with attestation), deliver webhooks, meter, flush OTel
       ctx.waitUntil(storeCheckpoint(checkpoint, 'gateway', env, attestation));
-      // Record recipe hits (matched = Tier 2 injected, triggered = Tier 1 fired)
-      const triggeredRecipeIds = tier1Result.matchedRecipes.map(r => r.recipe.id);
-      ctx.waitUntil(recordRecipeHits(env, checkpoint.checkpoint_id, tier2RecipeIds, triggeredRecipeIds, tier3OverrideMeta));
       ctx.waitUntil(submitMeteringEvent(agent.id, checkpoint.checkpoint_id, 'gateway', env));
       ctx.waitUntil(deliverWebhooks(checkpoint, env));
       if (otelExporter) {
@@ -4410,7 +4422,7 @@ export default {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },
