@@ -446,6 +446,9 @@ async function processLog(
       .then(() => detectDisagreement(agent_id, session_id, trace.trace_id, verification, env, otelExporter))
   );
 
+  // Emit CFD calibration signal for false negative detection (fire-and-forget)
+  ctx.waitUntil(emitCFDCalibrationSignal(agent_id, session_id, verification?.verified === false ? 'boundary_violation' : '', null, env));
+
   // Check for behavioral drift (runs in background)
   ctx.waitUntil(checkForDrift(agent_id, card, env, otelExporter));
 
@@ -1822,6 +1825,78 @@ Rules:
 - Be precise in your reasoning — cite specific evidence from both assessments`;
 
 /**
+ * Emit a CFD calibration signal when AIP detects a boundary violation.
+ * This enables the CFD closed feedback loop:
+ * - If AIP verdict = boundary_violation and a recent CFD evaluation exists for this session,
+ *   we emit a 'false_negative' signal so CFD can improve its detection thresholds.
+ * - If the agent's thinking block shows it noticed the threat but proceeded,
+ *   we emit a 'thinking_integrity' signal for retroactive scoring.
+ * Always fire-and-forget — never throws.
+ */
+async function emitCFDCalibrationSignal(
+  agentId: string,
+  sessionId: string,
+  checkpointVerdict: string,
+  concerns: Record<string, unknown> | null,
+  env: Env
+): Promise<void> {
+  try {
+    if (checkpointVerdict !== 'boundary_violation') return;
+
+    // Look up the most recent CFD evaluation for this agent+session
+    const cfdResp = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/cfd_evaluations?agent_id=eq.${agentId}&session_id=eq.${sessionId}&order=created_at.desc&limit=1`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+
+    if (!cfdResp.ok) return;
+
+    const cfdEvals = await cfdResp.json() as Array<{
+      id: string;
+      overall_risk: number;
+      verdict: string;
+    }>;
+
+    if (!cfdEvals || cfdEvals.length === 0) return;
+
+    const cfdEval = cfdEvals[0];
+
+    // Only emit if CFD scored this session LOW (i.e., a false negative)
+    if (cfdEval.overall_risk >= 0.6) return; // CFD already flagged it — not a false negative
+
+    // Compute retroactive score: bump it up since AIP found a real violation
+    const retroactiveScore = Math.min(cfdEval.overall_risk + 0.35, 0.95);
+
+    await fetch(`${env.SUPABASE_URL}/rest/v1/cfd_calibration_signals`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        signal_type: 'false_negative',
+        cfd_evaluation_id: cfdEval.id,
+        cfd_original_score: cfdEval.overall_risk,
+        aip_verdict: checkpointVerdict,
+        aip_concerns: concerns,
+        retroactive_score: retroactiveScore,
+      }),
+    });
+
+    console.log(`[observer/cfd] Calibration signal emitted: false_negative for agent ${agentId} session ${sessionId} (original CFD score: ${cfdEval.overall_risk.toFixed(2)} → retroactive: ${retroactiveScore.toFixed(2)})`);
+  } catch {
+    // Fire-and-forget: never throws
+  }
+}
+
+/**
  * Detect disagreements between AIP checkpoint verdicts and AAP observer verification.
  * When they disagree, creates a disagreement_review record and optionally runs reconciliation.
  */
@@ -2590,7 +2665,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
     // Fetch accounts with active metered subscriptions (checks and/or proofs)
     // Include stripe_customer_id for meter events API (proofs)
     const accountsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/billing_accounts?subscription_status=in.(active,trialing)&stripe_subscription_item_id=not.is.null&select=account_id,stripe_customer_id,stripe_subscription_item_id,check_count_this_period,stripe_proof_subscription_item_id,proof_count_this_period`,
+      `${env.SUPABASE_URL}/rest/v1/billing_accounts?subscription_status=in.(active,trialing)&stripe_subscription_item_id=not.is.null&select=account_id,stripe_customer_id,stripe_subscription_item_id,check_count_this_period,stripe_proof_subscription_item_id,proof_count_this_period,stripe_cfd_subscription_item_id,cfd_check_count_this_period`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -2611,6 +2686,8 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
       check_count_this_period: number;
       stripe_proof_subscription_item_id: string | null;
       proof_count_this_period: number;
+      stripe_cfd_subscription_item_id: string | null;        // NEW
+      cfd_check_count_this_period: number;                   // NEW
     }>;
 
     const today = new Date().toISOString().split('T')[0];
@@ -2710,6 +2787,42 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
           });
         }
 
+        // Report CFD check usage (follows same pattern as integrity checks)
+        let cfdQuantity = 0;
+        if (account.stripe_cfd_subscription_item_id && (account.cfd_check_count_this_period || 0) > 0) {
+          cfdQuantity = account.cfd_check_count_this_period || 0;
+          const cfdIdempotencyKey = `${account.account_id}-cfd-${today}`;
+
+          await (stripe as any).subscriptionItems.createUsageRecord(
+            account.stripe_cfd_subscription_item_id,
+            {
+              quantity: cfdQuantity,
+              timestamp: Math.floor(Date.now() / 1000),
+              action: 'set',
+            },
+            { idempotencyKey: cfdIdempotencyKey }
+          );
+
+          // Record CFD usage in stripe_usage_reports
+          const cfdReportId = `sur-${crypto.randomUUID().slice(0, 8)}`;
+          await fetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
+            method: 'POST',
+            headers: {
+              apikey: env.SUPABASE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({
+              id: cfdReportId,
+              account_id: account.account_id,
+              stripe_subscription_item_id: account.stripe_cfd_subscription_item_id,
+              reported_quantity: cfdQuantity,
+              idempotency_key: cfdIdempotencyKey,
+            }),
+          });
+        }
+
         // Log billing event (combined check + proof report)
         const eventId = `be-${crypto.randomUUID().slice(0, 8)}`;
         await fetch(`${env.SUPABASE_URL}/rest/v1/billing_events`, {
@@ -2727,6 +2840,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
             details: {
               check_quantity: checkQuantity,
               proof_quantity: proofQuantity,
+              cfd_quantity: cfdQuantity,
               date: today,
               check_idempotency_key: checkIdempotencyKey,
               proof_identifier: proofQuantity > 0
@@ -2814,6 +2928,48 @@ async function checkForDrift(
 }
 
 /**
+ * Write CFD training traces for messages that preceded detected behavioral drift.
+ * These become labeled "high_risk" examples: the message the agent received
+ * before drifting toward unsafe behavior is likely adversarial.
+ * Always fire-and-forget — never throws.
+ */
+async function writeCFDDriftTrainingTraces(
+  agentId: string,
+  driftAlertId: string,
+  traceIds: string[],
+  env: Env
+): Promise<void> {
+  try {
+    if (traceIds.length === 0) return;
+
+    // Take up to 5 trace IDs that preceded the drift — these are our training examples
+    const precedingIds = traceIds.slice(0, 5);
+
+    const inserts = precedingIds.map(traceId => ({
+      source_signal: 'observer_drift',
+      drift_alert_id: driftAlertId,
+      trace_id: traceId,
+      label: 'high_risk',
+    }));
+
+    await fetch(`${env.SUPABASE_URL}/rest/v1/cfd_training_traces`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(inserts),
+    });
+
+    console.log(`[observer/cfd] Wrote ${inserts.length} drift training traces for alert ${driftAlertId}`);
+  } catch {
+    // Fire-and-forget: never throws
+  }
+}
+
+/**
  * Store a drift alert in Supabase
  */
 async function storeDriftAlert(
@@ -2850,6 +3006,9 @@ async function storeDriftAlert(
 
     if (!response.ok) {
       console.warn(`[observer] Failed to store drift alert: ${response.status}`);
+    } else {
+      // Write CFD training traces for preceding messages (fire-and-forget)
+      writeCFDDriftTrainingTraces(agentId, alert.id, driftAlert.trace_ids, env).catch(() => {});
     }
   } catch (error) {
     console.error('[observer] Error storing drift alert:', error);

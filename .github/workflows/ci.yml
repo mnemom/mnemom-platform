@@ -86,6 +86,10 @@ jobs:
         working-directory: shared/policy-engine
         run: npm ci && npm run build
 
+      - name: Build cfd
+        working-directory: shared/cfd
+        run: npm ci && npm run build
+
       - name: Type check
         working-directory: gateway
         run: npx tsc --noEmit
@@ -163,6 +167,10 @@ jobs:
 
       - name: Build policy-engine
         working-directory: shared/policy-engine
+        run: npm ci && npm run build
+
+      - name: Build cfd
+        working-directory: shared/cfd
         run: npm ci && npm run build
 
       - name: Run tests
