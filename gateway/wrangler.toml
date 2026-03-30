@@ -42,6 +42,7 @@ workers_dev = true
 [env.staging.vars]
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "false"
+CFD_ENABLED = "true"
 
 [[env.staging.kv_namespaces]]
 binding = "BILLING_CACHE"
