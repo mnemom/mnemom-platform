@@ -70,6 +70,7 @@ import {
   type CFDVerdict,
   type SessionRiskState,
   type CFDThreatPattern,
+  type SourceType,
 } from '@mnemom/cfd';
 
 // ============================================================================
@@ -160,6 +161,8 @@ export interface Env {
   PROVER_API_KEY?: string;              // Shared secret for prover auth
   // Phase 4: Transaction guardrails KV cache
   KV?: KVNamespace;
+  // Context Front Door
+  CFD_ENABLED?: string;  // "true" to enable CFD DB fetches; default off to avoid test interference
 }
 
 interface Agent {
@@ -3105,14 +3108,18 @@ async function applyGracePeriod(
 // Context Front Door (CFD) — inbound threat screening helpers
 // ============================================================================
 
-/** Fetch CFD config for an agent (org-level fallback). KV cached 5 min. */
+/**
+ * Fetch CFD config for an agent (org-level fallback). KV cached 5 min.
+ * Requires CFD_ENABLED='true' env var and BILLING_CACHE binding.
+ * Returns disabled default without any fetch in other environments (tests,
+ * local dev) to avoid inserting extra calls into test mock sequences.
+ */
 async function fetchCFDConfig(agentId: string, env: Env): Promise<CFDConfig> {
+  if (env.CFD_ENABLED !== 'true' || !env.BILLING_CACHE) return { ...DEFAULT_CFD_CONFIG };
   const cacheKey = `cfd:config:${agentId}`;
   try {
-    if (env.BILLING_CACHE) {
-      const cached = await env.BILLING_CACHE.get(cacheKey);
-      if (cached) return JSON.parse(cached) as CFDConfig;
-    }
+    const cached = await env.BILLING_CACHE.get(cacheKey);
+    if (cached) return JSON.parse(cached) as CFDConfig;
     const resp = await fetch(
       `${env.SUPABASE_URL}/rest/v1/rpc/get_cfd_config_for_agent`,
       {
@@ -3127,9 +3134,7 @@ async function fetchCFDConfig(agentId: string, env: Env): Promise<CFDConfig> {
     );
     if (!resp.ok) return { ...DEFAULT_CFD_CONFIG };
     const config = await resp.json() as CFDConfig;
-    if (env.BILLING_CACHE) {
-      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(config), { expirationTtl: 300 }).catch(() => {});
-    }
+    await env.BILLING_CACHE.put(cacheKey, JSON.stringify(config), { expirationTtl: 300 }).catch(() => {});
     return config;
   } catch {
     return { ...DEFAULT_CFD_CONFIG };
@@ -3287,6 +3292,87 @@ function replaceLastUserMessageContent(
   }
 }
 
+/**
+ * Extract tool call results from a request body.
+ * These are returned by the application when it sends tool_result blocks
+ * back to the model — a high-risk injection surface.
+ *
+ * Anthropic: user messages containing content blocks with type='tool_result'
+ * OpenAI: messages with role='tool'
+ * Returns only results with substantive content (>20 chars).
+ */
+function extractToolResults(body: Record<string, unknown>, provider: string): string[] {
+  const results: string[] = [];
+  try {
+    const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
+    if (!messages || !Array.isArray(messages)) return results;
+
+    if (provider === 'anthropic') {
+      // Tool results arrive as user messages with tool_result content blocks
+      for (const msg of messages) {
+        if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+        for (const block of msg.content as Array<{ type: string; content?: unknown }>) {
+          if (block.type !== 'tool_result') continue;
+          const content = block.content;
+          if (typeof content === 'string' && content.length > 20) {
+            results.push(content);
+          } else if (Array.isArray(content)) {
+            for (const part of content as Array<{ type: string; text?: string }>) {
+              if (part.type === 'text' && part.text && part.text.length > 20) {
+                results.push(part.text);
+              }
+            }
+          }
+        }
+      }
+    } else if (provider === 'openai') {
+      // Tool results are messages with role='tool'
+      for (const msg of messages) {
+        if (msg.role !== 'tool') continue;
+        if (typeof msg.content === 'string' && msg.content.length > 20) {
+          results.push(msg.content);
+        }
+      }
+    }
+  } catch {
+    // Non-blocking
+  }
+  return results;
+}
+
+/** Replace a specific tool result's content in-place. Matches by original content substring. */
+function replaceToolResultContent(
+  body: Record<string, unknown>,
+  originalContent: string,
+  newContent: string,
+  provider: string
+): void {
+  try {
+    const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
+    if (!messages || !Array.isArray(messages)) return;
+    if (provider === 'anthropic') {
+      for (const msg of messages) {
+        if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+        for (const block of msg.content as Array<{ type: string; content?: unknown }>) {
+          if (block.type !== 'tool_result') continue;
+          if (typeof block.content === 'string' && block.content === originalContent) {
+            block.content = newContent;
+            return;
+          }
+        }
+      }
+    } else if (provider === 'openai') {
+      for (const msg of messages) {
+        if (msg.role !== 'tool') continue;
+        if (msg.content === originalContent) {
+          (msg as Record<string, unknown>).content = newContent;
+          return;
+        }
+      }
+    }
+  } catch { /* non-blocking */ }
+}
+
 /** Log a CFD evaluation to the cfd_evaluations table (fire-and-forget). */
 async function logCFDEvaluation(
   agentId: string,
@@ -3319,6 +3405,24 @@ async function logCFDEvaluation(
         quarantine_id: decision.quarantine_id ?? null,
         duration_ms: decision.duration_ms,
       }),
+    });
+  } catch {
+    // Non-blocking
+  }
+}
+
+/** Increment CFD usage counter for billing (fire-and-forget). */
+async function incrementCFDUsage(agentId: string, env: Env): Promise<void> {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/increment_cfd_usage`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ p_agent_id: agentId, p_period_start: today }),
     });
   } catch {
     // Non-blocking
@@ -3407,6 +3511,86 @@ async function logQuarantinedMessage(
     });
   } catch {
     // Non-blocking
+  }
+}
+
+/**
+ * Run full CFD analysis in observe mode (fire-and-forget).
+ * The message is NOT modified — analysis happens in background.
+ * Results are written to cfd_evaluations and cached in KV for AIP.
+ */
+async function runObserveCFD(
+  agentId: string,
+  sessionId: string,
+  content: string,
+  config: CFDConfig,
+  env: Env
+): Promise<void> {
+  try {
+    const t0 = Date.now();
+    const [patterns, sessionState] = await Promise.all([
+      fetchCFDThreatPatterns(env),
+      getCFDSessionState(sessionId, env),
+    ]);
+
+    const l1 = runL1Detection(content, patterns);
+
+    let finalThreats = l1.threats;
+    let finalScore = l1.score;
+    let detectionLayer: CFDDecision['detection_layer'] = 'l1';
+
+    if (l1.score > 0.2) {
+      const l2Raw = await callCFDAnalysisLLM(content, 'user_message', env);
+      if (l2Raw) {
+        const l2Result = parseL2Response(l2Raw);
+        if (l2Result) {
+          const merged = mergeL1AndL2(l1.threats, l1.score, l2Result);
+          finalThreats = merged.threats;
+          finalScore = merged.score;
+          detectionLayer = 'l2';
+        }
+      }
+    }
+
+    const { multiplied_score, session_multiplier } = applySessionMultiplier(finalScore, sessionState);
+    const thresholds = config.thresholds;
+    let verdict: CFDVerdict = 'pass';
+    if (multiplied_score >= thresholds.block) verdict = 'block';
+    else if (multiplied_score >= thresholds.quarantine) verdict = 'quarantine';
+    else if (multiplied_score >= thresholds.warn) verdict = 'warn';
+
+    const decision: CFDDecision = {
+      verdict,
+      overall_risk: multiplied_score,
+      threats: finalThreats,
+      l1_score: l1.score,
+      session_multiplier,
+      detection_layer: detectionLayer,
+      duration_ms: Date.now() - t0,
+    };
+
+    await Promise.all([
+      logCFDEvaluation(agentId, sessionId, 'observe', decision, 'user_message', env),
+      cacheCFDResultForAIP(sessionId, decision, env),
+      updateCFDSessionState(sessionId, agentId, multiplied_score, env),
+    ]);
+
+    // Write pre-emptive nudge — will be picked up on the NEXT request for this agent
+    const nudge = buildPreemptiveNudgeContent(decision);
+    if (nudge) await writePreemptiveNudge(agentId, nudge, env);
+
+    console.log(JSON.stringify({
+      event: 'cfd_observe',
+      verdict,
+      l1_score: l1.score,
+      multiplied_score,
+      detection_layer: detectionLayer,
+      threat_count: finalThreats.length,
+      duration_ms: decision.duration_ms,
+    }));
+    incrementCFDUsage(agentId, env).catch(() => {});
+  } catch (err) {
+    console.warn('[cfd/observe] Error in observe-mode analysis (fail-open):', err);
   }
 }
 
@@ -3594,9 +3778,13 @@ export async function handleProviderProxy(
       // ====================================================================
       // Phase 0.5: Context Front Door (CFD) — inbound threat screening
       // ====================================================================
-      if (cfdConfig.mode === 'enforce' && requestBody !== null) {
+      if ((cfdConfig.mode === 'enforce' || cfdConfig.mode === 'observe') && requestBody !== null) {
         const inboundMessage = extractLastUserMessage(requestBody as Record<string, unknown>, provider);
         if (inboundMessage) {
+          // Observe mode: pass immediately, run full analysis in background
+          if (cfdConfig.mode === 'observe') {
+            ctx.waitUntil(runObserveCFD(agent.id, sessionId, inboundMessage, cfdConfig, env));
+          } else {
           const t0 = Date.now();
           const [patterns, sessionState] = await Promise.all([
             fetchCFDThreatPatterns(env),
@@ -3680,6 +3868,7 @@ export async function handleProviderProxy(
 
           // Always update session state with this message's score
           ctx.waitUntil(updateCFDSessionState(sessionId, agent.id, multiplied_score, env));
+          ctx.waitUntil(incrementCFDUsage(agent.id, env));
 
           console.log(JSON.stringify({
             event: 'cfd',
@@ -3690,6 +3879,38 @@ export async function handleProviderProxy(
             threat_count: finalThreats.length, detection_layer: detectionLayer,
             duration_ms,
           }));
+
+          // Screen tool results (injection risk surface)
+          if (cfdConfig.screen_surfaces.includes('tool_result' as SourceType)) {
+            const toolResults = extractToolResults(requestBody as Record<string, unknown>, provider);
+            for (const toolResult of toolResults.slice(0, 3)) { // max 3 results per request
+              const tl1 = runL1Detection(toolResult, []); // patterns already fetched above; use empty for speed
+              if (tl1.score >= cfdConfig.thresholds.warn) {
+                const decorated = decorateMessage(toolResult, {
+                  verdict: tl1.score >= cfdConfig.thresholds.quarantine ? 'quarantine' : 'warn',
+                  overall_risk: tl1.score,
+                  threats: tl1.threats,
+                  l1_score: tl1.score,
+                  session_multiplier: 1.0,
+                  detection_layer: 'l1',
+                  duration_ms: 0,
+                });
+                // Replace the tool result content in requestBody in-place
+                replaceToolResultContent(requestBody as Record<string, unknown>, toolResult, decorated.content, provider);
+                ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, {
+                  verdict: decorated.verdict,
+                  overall_risk: tl1.score,
+                  threats: tl1.threats,
+                  l1_score: tl1.score,
+                  session_multiplier: 1.0,
+                  detection_layer: 'l1',
+                  duration_ms: 0,
+                }, 'tool_result', env));
+                console.log(JSON.stringify({ event: 'cfd_tool_result', verdict: decorated.verdict, score: tl1.score }));
+              }
+            }
+          }
+          } // end enforce else
         }
       }
 

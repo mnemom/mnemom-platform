@@ -1,4 +1,5 @@
 import { scanDLP } from './dlp.js';
+import { computeMinHash, isSimilarToPattern } from './fingerprint.js';
 import type { ThreatDetection, ThreatType, CFDThreatPattern, SessionRiskState } from './types.js';
 
 // Urgency / authority pressure word patterns
@@ -164,8 +165,27 @@ export function runL1Detection(
   }
 
   // 6. Known threat pattern matching (from cfd_threat_patterns table)
+  // Uses MinHash similarity when minhash is stored; falls back to substring match
+  const contentSig = computeMinHash(content);
   for (const pattern of patterns) {
-    if (pattern.label === 'malicious' && content.toLowerCase().includes(pattern.content.toLowerCase())) {
+    if (pattern.label !== 'malicious') continue;
+
+    let isMatch = false;
+    let matchConfidence = 0.70;
+
+    if (pattern.minhash) {
+      // MinHash similarity — catches near-duplicate variants of known attacks
+      const { similar, similarity } = isSimilarToPattern(contentSig, pattern.minhash);
+      if (similar) {
+        isMatch = true;
+        matchConfidence = 0.60 + similarity * 0.35; // 0.60 at threshold → 0.95 at perfect match
+      }
+    } else {
+      // Fallback: substring match
+      isMatch = content.toLowerCase().includes(pattern.content.toLowerCase());
+    }
+
+    if (isMatch) {
       const existing = threats.find(t => t.type === pattern.threat_type);
       if (existing) {
         existing.confidence = Math.min(existing.confidence + 0.1, 0.98);
@@ -173,8 +193,10 @@ export function runL1Detection(
       } else {
         threats.push({
           type: pattern.threat_type,
-          confidence: 0.70,
-          reasoning: `Matched known threat pattern from library`,
+          confidence: matchConfidence,
+          reasoning: pattern.minhash
+            ? `MinHash similarity match against known threat pattern (library match)`
+            : `Substring match against known threat pattern`,
           matched_pattern: `known_pattern:${pattern.id}`,
         });
       }
