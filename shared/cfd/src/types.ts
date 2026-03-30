@@ -112,3 +112,19 @@ export interface DLPMatch {
   value_masked: string;    // e.g. "****-****-****-1234"
   offset: number;
 }
+
+// Result from L2 LLM analysis
+export interface L2Result {
+  threats: ThreatDetection[];
+  overall_risk: number;
+  recommendation: CFDVerdict;
+  raw_response: string;
+}
+
+// Pre-emptive nudge content for injection into enforcement channel
+export interface PreemptiveNudge {
+  nudge_content: string;
+  threat_type: ThreatType;
+  cfd_score: number;
+  pre_emptive: true;
+}

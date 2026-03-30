@@ -58,6 +58,12 @@ import {
   applySessionMultiplier,
   decorateMessage,
   buildQuarantineNotification,
+  buildCFDAnalysisPrompt,
+  buildCFDUserPrompt,
+  parseL2Response,
+  mergeL1AndL2,
+  buildThreatContextForAIP,
+  buildPreemptiveNudgeContent,
   DEFAULT_CFD_CONFIG,
   type CFDConfig,
   type CFDDecision,
@@ -2038,12 +2044,19 @@ async function analyzeStreamInBackground(
     ].filter(Boolean);
     const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
+    // Retrieve cached CFD result for this session (written during pre-check, Phase 0.5)
+    const cachedCFDResult = await env.BILLING_CACHE?.get(`cfd:result:${sessionId}:latest`)
+      .then(raw => raw ? JSON.parse(raw) as CFDDecision : null)
+      .catch(() => null) ?? null;
+    const cfdThreatContext = cachedCFDResult ? buildThreatContextForAIP(cachedCFDResult) : undefined;
+    const enrichedTaskContext = [gatewayTaskContext, cfdThreatContext].filter(Boolean).join('\n\n') || undefined;
+
     const prompt = buildConsciencePrompt({
       card: aipCard,
       conscienceValues: values,
       windowContext: window.getState().checkpoints,
       thinkingBlock: parsed.thinking,
-      taskContext: gatewayTaskContext,
+      taskContext: enrichedTaskContext,
       ...(outputText ? { outputBlock: outputText, outputTokenBudget: DEFAULT_OUTPUT_TOKEN_BUDGET } : {}),
     });
 
@@ -2111,11 +2124,18 @@ async function analyzeStreamInBackground(
     }
 
     // 12. Attestation
-    const windowContext = window.getState().checkpoints.map((cp: IntegrityCheckpoint) => ({
-      checkpoint_id: cp.checkpoint_id,
-      verdict: cp.verdict,
-      reasoning_summary: cp.reasoning_summary,
-    }));
+    const windowContext = [
+      ...window.getState().checkpoints.map((cp: IntegrityCheckpoint) => ({
+        checkpoint_id: cp.checkpoint_id,
+        verdict: cp.verdict,
+        reasoning_summary: cp.reasoning_summary,
+      })),
+      ...(cachedCFDResult ? [{
+        checkpoint_id: `cfd:${sessionId}:latest`,
+        verdict: cachedCFDResult.verdict as string,
+        reasoning_summary: `CFD pre-screen: risk=${cachedCFDResult.overall_risk.toFixed(2)} threats=${cachedCFDResult.threats.map((t: { type: string }) => t.type).join(',')}`,
+      }] : []),
+    ];
     const attestation = await attestCheckpoint(
       checkpoint, agent, sessionId, thinkingHash,
       aipCard, values, windowContext, quotaContext, env
@@ -2300,6 +2320,56 @@ async function callAnalysisLLM(
     throw error;
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Call Haiku for CFD L2 threat analysis.
+ * Uses the existing Anthropic API key — NOT routed through CF AI Gateway
+ * (to avoid the gateway calling itself in an infinite loop).
+ * Separate from the AIP circuit breaker — CFD failures never block AIP.
+ * Fail-open: returns null on any error.
+ */
+async function callCFDAnalysisLLM(
+  content: string,
+  sourceType: string,
+  env: Env
+): Promise<string | null> {
+  if (!env.ANTHROPIC_API_KEY) return null;
+
+  const systemPrompt = buildCFDAnalysisPrompt();
+  const userPrompt = buildCFDUserPrompt(content, sourceType);
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout for CFD
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 512,
+          system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) return null;
+      const body = (await response.json()) as Record<string, unknown>;
+      const content_blocks = body.content as Array<Record<string, unknown>> | undefined;
+      const textBlock = content_blocks?.find(b => b.type === 'text');
+      return typeof textBlock?.text === 'string' ? textBlock.text : null;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch {
+    return null;
   }
 }
 
@@ -3255,6 +3325,37 @@ async function logCFDEvaluation(
   }
 }
 
+/** Write a pre-emptive CFD nudge to the enforcement_nudges table. */
+async function writePreemptiveNudge(
+  agentId: string,
+  nudge: { nudge_content: string; threat_type: string; cfd_score: number; pre_emptive: true },
+  env: Env
+): Promise<void> {
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/enforcement_nudges`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        agent_id: agentId,
+        status: 'pending',
+        concerns_summary: nudge.nudge_content,
+        metadata: {
+          pre_emptive: true,
+          threat_type: nudge.threat_type,
+          cfd_score: nudge.cfd_score,
+        },
+      }),
+    });
+  } catch {
+    // Non-blocking
+  }
+}
+
 /** Write CFD result to KV so the AIP analysis (Phase 1+) can enrich its conscience prompt. */
 async function cacheCFDResultForAIP(
   sessionId: string,
@@ -3502,7 +3603,26 @@ export async function handleProviderProxy(
             getCFDSessionState(sessionId, env),
           ]);
           const l1 = runL1Detection(inboundMessage, patterns);
-          const { multiplied_score, session_multiplier } = applySessionMultiplier(l1.score, sessionState);
+
+          // L2: call Haiku for deeper analysis when L1 score > 0.2 (fast path below threshold)
+          let finalThreats = l1.threats;
+          let finalScore = l1.score;
+          let detectionLayer: CFDDecision['detection_layer'] = 'l1';
+
+          if (l1.score > 0.2) {
+            const l2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
+            if (l2Raw) {
+              const l2Result = parseL2Response(l2Raw);
+              if (l2Result) {
+                const merged = mergeL1AndL2(l1.threats, l1.score, l2Result);
+                finalThreats = merged.threats;
+                finalScore = merged.score;
+                detectionLayer = 'l2';
+              }
+            }
+          }
+
+          const { multiplied_score, session_multiplier } = applySessionMultiplier(finalScore, sessionState);
 
           // Determine verdict from thresholds
           const thresholds = cfdConfig.thresholds;
@@ -3522,11 +3642,11 @@ export async function handleProviderProxy(
             const decision: CFDDecision = {
               verdict,
               overall_risk: multiplied_score,
-              threats: l1.threats,
+              threats: finalThreats,
               l1_score: l1.score,
               session_multiplier,
               quarantine_id: quarantineId,
-              detection_layer: 'l1',
+              detection_layer: detectionLayer,
               duration_ms,
             };
 
@@ -3550,6 +3670,12 @@ export async function handleProviderProxy(
 
             // Cache CFD result in KV for AIP enrichment (Phase 1+)
             ctx.waitUntil(cacheCFDResultForAIP(sessionId, decision, env));
+            // Write pre-emptive nudge to enforcement channel when score >= 0.6
+            // Gateway's existing injectPendingNudges() picks this up automatically
+            const nudge = buildPreemptiveNudgeContent(decision);
+            if (nudge) {
+              ctx.waitUntil(writePreemptiveNudge(agent.id, nudge, env));
+            }
           }
 
           // Always update session state with this message's score
@@ -3561,7 +3687,7 @@ export async function handleProviderProxy(
             l1_score: l1.score,
             multiplied_score,
             session_multiplier,
-            threat_count: l1.threats.length,
+            threat_count: finalThreats.length, detection_layer: detectionLayer,
             duration_ms,
           }));
         }
@@ -4042,12 +4168,19 @@ export async function handleProviderProxy(
       ].filter(Boolean);
       const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
+      // Retrieve cached CFD result for this session (written during pre-check, Phase 0.5)
+      const cachedCFDResult = await env.BILLING_CACHE?.get(`cfd:result:${sessionId}:latest`)
+        .then(raw => raw ? JSON.parse(raw) as CFDDecision : null)
+        .catch(() => null) ?? null;
+      const cfdThreatContext = cachedCFDResult ? buildThreatContextForAIP(cachedCFDResult) : undefined;
+      const enrichedTaskContext = [gatewayTaskContext, cfdThreatContext].filter(Boolean).join('\n\n') || undefined;
+
       const prompt = buildConsciencePrompt({
         card: aipCard,
         conscienceValues: values,
         windowContext: window.getState().checkpoints,
         thinkingBlock: thinking.content,
-        taskContext: gatewayTaskContext,
+        taskContext: enrichedTaskContext,
         ...(outputText ? { outputBlock: outputText, outputTokenBudget: DEFAULT_OUTPUT_TOKEN_BUDGET } : {}),
       });
 
@@ -4121,11 +4254,18 @@ export async function handleProviderProxy(
       }
 
       // Cryptographic Checkpoint Attestation (extracted to reusable function)
-      const windowContext = window.getState().checkpoints.map((cp: IntegrityCheckpoint) => ({
-        checkpoint_id: cp.checkpoint_id,
-        verdict: cp.verdict,
-        reasoning_summary: cp.reasoning_summary,
-      }));
+      const windowContext = [
+        ...window.getState().checkpoints.map((cp: IntegrityCheckpoint) => ({
+          checkpoint_id: cp.checkpoint_id,
+          verdict: cp.verdict,
+          reasoning_summary: cp.reasoning_summary,
+        })),
+        ...(cachedCFDResult ? [{
+          checkpoint_id: `cfd:${sessionId}:latest`,
+          verdict: cachedCFDResult.verdict as string,
+          reasoning_summary: `CFD pre-screen: risk=${cachedCFDResult.overall_risk.toFixed(2)} threats=${cachedCFDResult.threats.map((t: { type: string }) => t.type).join(',')}`,
+        }] : []),
+      ];
       const attestation = await attestCheckpoint(
         checkpoint, agent, sessionId, thinkingHash,
         aipCard, values, windowContext, quotaContext, env
