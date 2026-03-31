@@ -51,6 +51,11 @@ function countWords(text: string, words: string[]): number {
   return words.filter(w => lower.includes(w.toLowerCase())).length;
 }
 
+function matchedWords(text: string, words: string[]): string[] {
+  const lower = text.toLowerCase();
+  return words.filter(w => lower.includes(w.toLowerCase()));
+}
+
 function matchesAny(text: string, patterns: RegExp[]): { matched: boolean; pattern?: string } {
   for (const re of patterns) {
     if (re.test(text)) return { matched: true, pattern: re.source };
@@ -117,10 +122,14 @@ export function runL1Detection(
   }
 
   // 3. BEC / social engineering scoring
-  const urgencyCount = countWords(text, URGENCY);
-  const authorityCount = countWords(text, AUTHORITY);
-  const secrecyCount = countWords(text, SECRECY);
-  const financialCount = countWords(text, FINANCIAL) + countWords(text, FINANCIAL_TARGET);
+  const urgencyMatched = matchedWords(text, URGENCY);
+  const authorityMatched = matchedWords(text, AUTHORITY);
+  const secrecyMatched = matchedWords(text, SECRECY);
+  const financialMatched = matchedWords(text, FINANCIAL);
+  const urgencyCount = urgencyMatched.length;
+  const authorityCount = authorityMatched.length;
+  const secrecyCount = secrecyMatched.length;
+  const financialCount = financialMatched.length + countWords(text, FINANCIAL_TARGET);
 
   // BEC fraud: financial action + urgency/authority + secrecy
   if (financialCount > 0 && (urgencyCount > 0 || authorityCount > 0)) {
@@ -131,7 +140,12 @@ export function runL1Detection(
     threats.push({
       type: 'bec_fraud',
       confidence,
-      reasoning: `Financial action (${financialCount}) + urgency (${urgencyCount}) + authority (${authorityCount}) + secrecy (${secrecyCount}) signals`,
+      reasoning: [
+        financialMatched.length > 0 ? `Financial action (${financialMatched.slice(0,3).map(w=>`'${w}'`).join(', ')})` : '',
+        urgencyMatched.length > 0  ? `Urgency (${urgencyMatched.slice(0,3).map(w=>`'${w}'`).join(', ')})` : '',
+        authorityMatched.length > 0 ? `Authority (${authorityMatched.slice(0,2).map(w=>`'${w}'`).join(', ')})` : '',
+        secrecyMatched.length > 0  ? `Secrecy (${secrecyMatched.slice(0,2).map(w=>`'${w}'`).join(', ')})` : '',
+      ].filter(Boolean).join(' · '),
     });
   }
 
@@ -142,7 +156,11 @@ export function runL1Detection(
       threats.push({
         type: 'social_engineering',
         confidence,
-        reasoning: `Urgency (${urgencyCount}) + authority (${authorityCount}) + secrecy (${secrecyCount}) signals without financial action`,
+        reasoning: [
+          urgencyMatched.length > 0  ? `Urgency (${urgencyMatched.slice(0,3).map(w=>`'${w}'`).join(', ')})` : '',
+          authorityMatched.length > 0 ? `Authority (${authorityMatched.slice(0,2).map(w=>`'${w}'`).join(', ')})` : '',
+          secrecyMatched.length > 0  ? `Secrecy (${secrecyMatched.slice(0,2).map(w=>`'${w}'`).join(', ')})` : '',
+        ].filter(Boolean).join(' · '),
       });
     }
   }

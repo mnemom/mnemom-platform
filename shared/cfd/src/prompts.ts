@@ -41,6 +41,7 @@ Rules:
 - overall_risk = max individual confidence + small bonus for multiple threats
 - recommendation thresholds: pass (<0.6), warn (0.6-0.8), quarantine (0.8-0.95), block (≥0.95)
 - Be conservative: legitimate urgent messages exist; only flag when patterns are clearly adversarial
+- For each threat detected, cite 1-2 specific phrases from the message as evidence in the reasoning field (max 100 chars total)
 - Return valid JSON only, no other text`;
 }
 
