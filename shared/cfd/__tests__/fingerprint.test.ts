@@ -88,14 +88,29 @@ describe('serializeMinHash / deserializeMinHash', () => {
     expect(restored).toEqual(sig);
   });
 
-  it('serialized string has correct length (512 chars = 64 * 8)', () => {
+  it('serialized string has correct length (515 chars = "v1:" prefix + 64 * 8)', () => {
     const sig = computeMinHash('check the serialized length of the minhash hex string');
-    expect(serializeMinHash(sig)).toHaveLength(512);
+    const serialized = serializeMinHash(sig);
+    expect(serialized).toHaveLength(515); // 3 ("v1:") + 512 (64 * 8 hex chars)
+    expect(serialized.startsWith('v1:')).toBe(true);
   });
 
   it('deserializing a malformed (non-hex) string returns null', () => {
-    const bad = 'z'.repeat(512); // 'z' is not valid hex
+    // Non-hex content after valid prefix
+    const bad = 'v1:' + 'z'.repeat(512); // 'z' is not valid hex
     expect(deserializeMinHash(bad)).toBeNull();
+    // No prefix, wrong length
+    expect(deserializeMinHash('z'.repeat(512))).toBeNull();
+  });
+
+  it('round-trip with legacy unversioned format (backward compatibility)', () => {
+    // Legacy format: 512 hex chars, no "v1:" prefix
+    const sig = computeMinHash('legacy format test');
+    const legacyHex = sig.map(n => (n >>> 0).toString(16).padStart(8, '0')).join('');
+    expect(legacyHex).toHaveLength(512);
+    const deserialized = deserializeMinHash(legacyHex);
+    expect(deserialized).not.toBeNull();
+    expect(deserialized).toEqual(sig);
   });
 
   it('deserializing a wrong-length string returns null', () => {

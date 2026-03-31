@@ -1956,6 +1956,39 @@ async function analyzeStreamInBackground(
     const outputText = analyzeOutput && parsed.text ? parsed.text : undefined;
     const outputHash = outputText ? await sha256(outputText) : undefined;
 
+    // CFD Canary detection — streaming path
+    // Scan assembled output text for planted canary credentials.
+    // Note: streaming headers cannot be modified retroactively; compromise is
+    // logged to cfd_evaluations and retrievable via /v1/cfd/evaluations.
+    if (env.BILLING_CACHE && outputText) {
+      try {
+        const streamCanaries = await fetchAgentCanaries(agent.id, env);
+        if (streamCanaries.length > 0) {
+          const streamTriggered = scanForCanaryUse(outputText, streamCanaries);
+          if (streamTriggered) {
+            console.log(JSON.stringify({
+              event: 'cfd_canary_triggered',
+              agent_id: agent.id,
+              session_id: sessionId,
+              path: 'streaming',
+              canary_prefix: streamTriggered.slice(0, 6) + '****',
+            }));
+            void markCanaryTriggered(agent.id, streamTriggered, env);
+            void logCFDEvaluation(agent.id, sessionId, 'enforce', {
+              verdict: 'block',
+              overall_risk: 1.0,
+              threats: [{ type: 'indirect_injection' as const, confidence: 1.0,
+                reasoning: 'Canary credential detected in streaming agent response — confirmed compromise' }],
+              l1_score: 1.0,
+              session_multiplier: 1.0,
+              detection_layer: 'l1',
+              duration_ms: 0,
+            }, 'canary', env);
+          }
+        }
+      } catch { /* fail-open: canary scan errors never block analysis */ }
+    }
+
     // 7. Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
     if (!env.ANTHROPIC_API_KEY && env.MNEMOM_ANALYZE_URL && env.MNEMOM_API_KEY) {
       try {
@@ -3154,7 +3187,7 @@ async function fetchCFDThreatPatterns(env: Env): Promise<CFDThreatPattern[]> {
       if (cached) return JSON.parse(cached) as CFDThreatPattern[];
     }
     const resp = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns?label=eq.malicious&select=id,threat_type,label,content`,
+      `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns?label=eq.malicious&is_active=eq.true&select=id,threat_type,label,content,minhash&order=created_at.desc&limit=500`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -3713,6 +3746,7 @@ export async function handleProviderProxy(
     // CFD state — populated during Phase 0.5 pre-check, used for response headers
     let cfdVerdict: CFDVerdict | undefined;
     let cfdQuarantineId: string | undefined;
+    let cfdSessionRisk: string | undefined; // set in observe mode
 
     // Fetch CFD config early (KV cached — negligible latency)
     const cfdConfig = await fetchCFDConfig(agent.id, env);
@@ -3848,6 +3882,9 @@ export async function handleProviderProxy(
           // Observe mode: pass immediately, run full analysis in background
           if (cfdConfig.mode === 'observe') {
             ctx.waitUntil(runObserveCFD(agent.id, sessionId, inboundMessage, cfdConfig, env));
+            // Sync session risk read for observe mode header (KV, ~1ms)
+            const observeSession = await getCFDSessionState(sessionId, env).catch(() => null);
+            cfdSessionRisk = observeSession?.session_threat_level ?? 'low';
           } else {
           const t0 = Date.now();
           const [patterns, sessionState] = await Promise.all([
@@ -4160,6 +4197,12 @@ export async function handleProviderProxy(
         responseHeaders.set('X-CFD-Quarantine-Id', cfdQuarantineId);
       }
     }
+    if (cfdSessionRisk) {
+      responseHeaders.set('X-CFD-Session-Risk', cfdSessionRisk);
+    }
+    if (cfdConfig.mode === 'observe') {
+      responseHeaders.set('X-CFD-Mode', 'observe');
+    }
 
     // Add policy verdict header if evaluation ran
     if (policyVerdict) {
@@ -4252,7 +4295,24 @@ export async function handleProviderProxy(
     try {
       const canaries = await fetchAgentCanaries(agent.id, env);
       if (canaries.length > 0) {
-        const triggered = scanForCanaryUse(responseBodyText, canaries);
+        // Scan extracted text content only, not the full JSON envelope
+        // (prevents false positives from canary values in JSON metadata fields)
+        const canaryTextToScan = (() => {
+          try {
+            const parsed = JSON.parse(responseBodyText);
+            const content = parsed?.content as Array<{ type: string; text?: string }> | undefined;
+            if (Array.isArray(content)) {
+              return content.filter(b => b.type === 'text').map(b => b.text ?? '').join('\n');
+            }
+            // OpenAI format
+            const choices = parsed?.choices as Array<{ message?: { content?: string } }> | undefined;
+            if (Array.isArray(choices)) {
+              return choices.map(c => c.message?.content ?? '').join('\n');
+            }
+          } catch { /* fall through to full text scan */ }
+          return responseBodyText;
+        })();
+        const triggered = scanForCanaryUse(canaryTextToScan, canaries);
         if (triggered) {
           canaryTriggered = true;
           console.log(JSON.stringify({
@@ -4883,7 +4943,7 @@ export default {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered, X-CFD-Session-Risk, X-CFD-Mode',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },
