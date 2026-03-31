@@ -1,6 +1,7 @@
-import { loadConfig, saveConfig } from "../lib/config.js";
-import { listAgents, getAgent, getAgentByName } from "../lib/api.js";
+import { loadConfig, saveConfig, computeAgentHash } from "../lib/config.js";
+import { listAgents, getAgent, getAgentByName, postApi } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
+import { askInput } from "../lib/prompt.js";
 
 export async function agentsListCommand(): Promise<void> {
   const config = loadConfig();
@@ -182,4 +183,96 @@ export async function agentsRemoveCommand(name: string): Promise<void> {
   saveConfig(config);
 
   console.log(fmt.success(`Agent "${name}" removed (${removedId})`) + "\n");
+}
+
+/**
+ * smoltbot agents rekey [agent-name]
+ * Re-bind a claimed agent to a new provider API key.
+ * The raw key is hashed locally (SHA-256) and never transmitted.
+ */
+export async function agentsRekeyCommand(name?: string): Promise<void> {
+  const config = loadConfig();
+  if (!config) {
+    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
+    console.log("Run `smoltbot init` to get started.\n");
+    process.exit(1);
+  }
+
+  // Resolve which agent to rekey
+  const agentName = name ?? config.defaultAgent;
+  const agentEntry = config.agents[agentName];
+  if (!agentEntry) {
+    console.log(fmt.error(`Agent "${agentName}" not found`) + "\n");
+    console.log("Available agents: " + Object.keys(config.agents).join(", ") + "\n");
+    process.exit(1);
+  }
+  const { agentId } = agentEntry;
+
+  // Fetch canonical name from API — required for named-agent hash computation
+  // (named agents: hash = SHA256(key + '|' + name), unnamed: SHA256(key))
+  let agentApiName: string | null = null;
+  try {
+    const agent = await getAgent(agentId);
+    agentApiName = (agent as any).name ?? null;
+  } catch {
+    console.log(fmt.warn("Could not fetch agent details from API — proceeding without name confirmation"));
+  }
+
+  console.log("\n" + fmt.header("Rekey Agent"));
+  console.log();
+  console.log(`  Agent:   ${agentName} (${agentId})`);
+  if (agentApiName) {
+    console.log(`  Name:    ${agentApiName}`);
+  }
+  console.log();
+  console.log(fmt.warn("Your new provider key will be hashed locally. The raw key never leaves your machine."));
+  console.log();
+
+  // Read new key — prefer env var for CI, otherwise prompt interactively
+  let newKey = (process.env.SMOLTBOT_NEW_KEY ?? "").trim();
+  if (!newKey) {
+    newKey = (await askInput("Enter your new provider API key:", true)).trim();
+  }
+  if (!newKey) {
+    console.log(fmt.error("No key provided") + "\n");
+    process.exit(1);
+  }
+
+  // Compute hash client-side — raw key never sent to API
+  const newKeyHash = computeAgentHash(newKey, agentApiName);
+
+  console.log("  Computing hash and calling API...\n");
+
+  // Call API
+  let result: { success: boolean; agent_id: string; rekeyed_at: string };
+  try {
+    result = await postApi<{ success: boolean; agent_id: string; rekeyed_at: string }>(
+      `/v1/agents/${agentId}/rekey`,
+      { new_key_hash: newKeyHash },
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.startsWith("409") || msg.includes("conflict")) {
+      // Extract conflict agent ID if present
+      const match = msg.match(/conflict: (smolt-[0-9a-f]{8})/);
+      const shadowId = match ? match[1] : "(unknown)";
+      console.log(fmt.error("Key conflict: a different agent was already auto-created for this key.\n"));
+      console.log(`  Shadow agent ID: ${shadowId}`);
+      console.log("  Steps to resolve:");
+      console.log("    1. Open the Mnemom dashboard and deactivate the shadow agent.");
+      console.log("    2. Run `smoltbot agents rekey` again.\n");
+      console.log("  Or visit: https://www.mnemom.ai/docs/guides/agent-key-rotation\n");
+    } else {
+      console.log(fmt.error(msg) + "\n");
+    }
+    process.exit(1);
+  }
+
+  // Agent ID is stable — no config changes needed
+  console.log(fmt.success("Agent rekeyed successfully") + "\n");
+  console.log(fmt.label("Agent ID:  ", ` ${result.agent_id}`));
+  console.log(fmt.label("Rekeyed at:", ` ${new Date(result.rekeyed_at).toLocaleString()}`));
+  console.log();
+  console.log("Your agent history, alignment card, and integrity score are preserved.");
+  console.log("Update your ANTHROPIC_API_KEY (or equivalent) to the new key.\n");
 }
