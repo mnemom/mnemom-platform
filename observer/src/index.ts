@@ -134,16 +134,29 @@ export default {
       // Roll up metering events for billing (idempotent, safe every tick)
       ctx.waitUntil(triggerMeteringRollup(env));
 
-      // Report daily usage to Stripe (midnight UTC only)
+      // CFD pattern auto-promotion (every 5 minutes when enabled)
       const now = new Date();
+      const now5 = now;
+      if (now5.getUTCMinutes() % 5 === 0) {
+        ctx.waitUntil(runCFDAutoPromotion(env));
+      }
+
+      // CFD adaptive threshold analysis (hourly)
+      if (now.getUTCMinutes() === 30) {
+        ctx.waitUntil(runCFDAdaptiveThresholds(env));
+      }
+
+      // Report daily usage to Stripe (midnight UTC only)
       if (now.getUTCHours() === 0 && now.getUTCMinutes() === 0) {
         ctx.waitUntil(reportDailyUsageToStripe(env));
       }
 
       // Run retention cleanup weekly (Sundays at midnight UTC)
       const now2 = new Date();
+      // Pattern TTL expiry — stale patterns deactivated weekly
       if (now2.getUTCDay() === 0 && now2.getUTCHours() === 0 && now2.getUTCMinutes() === 0) {
         ctx.waitUntil(runCFDRetentionCleanup(env));
+        ctx.waitUntil(runCFDPatternExpiry(env)); // NEW
       }
 
       // Flush OTel spans for all processed logs in one batch
@@ -2620,6 +2633,95 @@ async function runCFDRetentionCleanup(env: Env): Promise<void> {
     }
   } catch (err) {
     console.warn('[observer/retention] CFD cleanup failed:', err);
+  }
+}
+
+/**
+ * Auto-promote high-confidence CFD patterns to active status.
+ * Called every 5 minutes by the observer cron.
+ * Only runs when cfd_auto_promote_enabled = true in security_settings.
+ */
+async function runCFDAutoPromotion(env: Env): Promise<void> {
+  try {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/auto_promote_cfd_patterns`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    if (resp.ok) {
+      const result = await resp.json() as { promoted: number; reason?: string };
+      if (result.promoted > 0) {
+        console.log(`[observer/cfd-evolution] Auto-promoted ${result.promoted} CFD patterns`);
+      }
+    }
+  } catch (err) {
+    console.warn('[observer/cfd-evolution] Auto-promotion failed:', err);
+  }
+}
+
+/**
+ * Check false positive rates and emit threshold suggestions when FP rate exceeds threshold.
+ * Called hourly by the observer cron.
+ * Suggestions are stored in cfd_configs.suggested_warn_threshold (if the column exists)
+ * or logged for admin review.
+ */
+async function runCFDAdaptiveThresholds(env: Env): Promise<void> {
+  try {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_cfd_threshold_suggestions`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    if (!resp.ok) return;
+
+    const suggestions = await resp.json() as Array<{
+      confidence_band: number;
+      fp_rate: number;
+      suggested_threshold: number;
+      estimated_fp_reduction: number;
+    }>;
+
+    if (suggestions.length > 0) {
+      console.log(`[observer/cfd-evolution] Threshold suggestions: ${suggestions.length} bands with high FP rate`);
+      for (const s of suggestions) {
+        console.log(`[observer/cfd-evolution] Band ${s.confidence_band}-${(s.confidence_band + 0.1).toFixed(1)}: FP rate ${s.fp_rate}% → suggest warn threshold ${s.suggested_threshold}`);
+      }
+    }
+  } catch (err) {
+    console.warn('[observer/cfd-evolution] Adaptive threshold check failed:', err);
+  }
+}
+
+/**
+ * Deactivate CFD threat patterns that haven't been matched recently (TTL expired).
+ * Prevents the pattern library from accumulating stale entries that slow down L1 matching.
+ * Called weekly (Sunday midnight UTC).
+ */
+async function runCFDPatternExpiry(env: Env): Promise<void> {
+  try {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/expire_stale_cfd_patterns`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    if (resp.ok) {
+      const result = await resp.json() as { expired: number; ttl_days: number };
+      console.log(`[observer/cfd-evolution] Pattern TTL: ${result.expired} patterns expired (TTL: ${result.ttl_days}d)`);
+    }
+  } catch (err) {
+    console.warn('[observer/cfd-evolution] Pattern expiry failed:', err);
   }
 }
 
