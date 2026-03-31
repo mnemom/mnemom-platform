@@ -3558,7 +3558,7 @@ function applySourceTrust(
     } else if (pattern.startsWith('email:')) {
       matches = sourceType === 'email' && (pattern === 'email:*' || sourceType.includes(pattern.slice(6)));
     } else {
-      matches = sourceType === pattern || sourceType.startsWith(pattern.replace('*', ''));
+      matches = sourceType === pattern || sourceType.startsWith(pattern.replaceAll('*', ''));
     }
 
     if (matches) {
