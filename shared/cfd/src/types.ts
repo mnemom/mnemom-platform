@@ -20,7 +20,7 @@ export type CFDVerdict = 'pass' | 'warn' | 'quarantine' | 'block';
 export type TrustTier = 'high' | 'medium' | 'low' | 'unknown';
 
 // Source type of inbound content
-export type SourceType = 'user_message' | 'tool_result' | 'agent_message' | 'email' | 'api' | 'system_prompt' | 'unknown';
+export type SourceType = 'user_message' | 'tool_result' | 'agent_message' | 'email' | 'api' | 'system_prompt' | 'outbound' | 'canary' | 'unknown';
 
 // A single detected threat
 export interface ThreatDetection {
