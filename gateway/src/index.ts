@@ -2591,6 +2591,131 @@ async function deliverWebhooks(
   }
 }
 
+/**
+ * Deliver CFD-specific webhook events to registered endpoints.
+ * Reuses the same aip_webhook_registrations table and HMAC signing.
+ * CFD events use event types: cfd.evaluation.warn, cfd.evaluation.quarantine,
+ * cfd.evaluation.block, cfd.canary.triggered, cfd.session.escalated
+ */
+async function deliverCFDWebhooks(
+  decision: CFDDecision,
+  agentId: string,
+  sessionId: string,
+  env: Env
+): Promise<void> {
+  // Only deliver for non-pass verdicts
+  if (decision.verdict === 'pass') return;
+
+  try {
+    // Fetch registrations that have CFD events enabled
+    const regResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?agent_id=eq.${agentId}&select=*`,
+      {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      }
+    );
+
+    if (!regResponse.ok) return;
+    const registrations = (await regResponse.json()) as Array<{
+      id: string;
+      agent_id: string;
+      callback_url: string;
+      secret: string;
+      event_types: string[];
+      failure_count: number;
+    }>;
+    if (registrations.length === 0) return;
+
+    // Map verdict to event type
+    const eventType = decision.verdict === 'quarantine' || decision.verdict === 'block'
+      ? `cfd.evaluation.${decision.verdict}`
+      : 'cfd.evaluation.warn';
+
+    // Filter registrations that subscribe to this event type
+    const matching = registrations.filter(reg =>
+      reg.event_types.some(et =>
+        et === '*' || et === 'cfd.*' || et === eventType
+      )
+    );
+    if (matching.length === 0) return;
+
+    // Build payload
+    const topThreat = decision.threats.sort((a, b) => b.confidence - a.confidence)[0];
+    const webhookPayload = {
+      event: eventType,
+      timestamp: new Date().toISOString(),
+      agent_id: agentId,
+      session_id: sessionId,
+      data: {
+        verdict: decision.verdict,
+        quarantine_id: decision.quarantine_id ?? null,
+        overall_risk: decision.overall_risk,
+        top_threat: topThreat
+          ? { type: topThreat.type, confidence: topThreat.confidence, reasoning: topThreat.reasoning }
+          : null,
+        detection_layer: decision.detection_layer,
+        ...(decision.quarantine_id
+          ? { review_url: `https://app.mnemom.com/cfd/quarantine/${decision.quarantine_id}` }
+          : {}),
+      },
+    };
+    const payloadString = JSON.stringify(webhookPayload);
+
+    // Deliver to each matching registration (same retry pattern as AIP webhooks)
+    for (const reg of matching) {
+      let delivered = false;
+      let lastError: string | null = null;
+      const retryDelays = [...WEBHOOK_RETRY_DELAYS_MS];
+      const signature = await hmacSign(reg.secret, payloadString);
+
+      for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, retryDelays[attempt - 1]));
+        }
+        try {
+          const webhookResponse = await fetch(reg.callback_url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-AIP-Signature': `sha256=${signature}`,
+              'X-CFD-Event': eventType,
+            },
+            body: payloadString,
+          });
+          if (webhookResponse.ok) { delivered = true; break; }
+          lastError = `HTTP ${webhookResponse.status}`;
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : 'Unknown error';
+        }
+      }
+
+      // Track delivery (fire-and-forget)
+      fetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          registration_id: reg.id,
+          event_type: eventType,
+          payload: webhookPayload,
+          delivered,
+          error: lastError,
+          attempts: delivered ? 1 : retryDelays.length + 1,
+        }),
+      }).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('[cfd/webhooks] Error delivering CFD webhooks:', err);
+  }
+}
+
 // ============================================================================
 // OTel Exporter
 // ============================================================================
@@ -3671,6 +3796,9 @@ async function runObserveCFD(
       updateCFDSessionState(sessionId, agentId, multiplied_score, env),
     ]);
 
+    // Deliver CFD webhooks
+    await deliverCFDWebhooks(decision, agentId, sessionId, env);
+
     // Write pre-emptive nudge — will be picked up on the NEXT request for this agent
     const nudge = buildPreemptiveNudgeContent(decision);
     if (nudge) await writePreemptiveNudge(agentId, nudge, env);
@@ -3956,6 +4084,9 @@ export async function handleProviderProxy(
               cfdVerdict = verdict;
               ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, decision, 'user_message', env));
             }
+
+            // Deliver CFD webhooks for warn/quarantine/block events
+            ctx.waitUntil(deliverCFDWebhooks(decision, agent.id, sessionId, env));
 
             // Cache CFD result in KV for AIP enrichment (Phase 1+)
             ctx.waitUntil(cacheCFDResultForAIP(sessionId, decision, env));
