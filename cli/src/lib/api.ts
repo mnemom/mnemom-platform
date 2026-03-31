@@ -98,6 +98,13 @@ export async function postApi<T>(endpoint: string, body: unknown): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export async function verifyBinding(
+  agentId: string,
+  keyHash: string,
+): Promise<{ bound: boolean; key_prefix: string | null }> {
+  return postApi(`/v1/agents/${agentId}/verify-binding`, { key_hash: keyHash });
+}
+
 /**
  * Build auth headers if a token is available.
  * Returns empty object when unauthenticated (read-only calls).
@@ -119,6 +126,7 @@ export interface AgentListItem {
   created_at: string;
   last_seen: string | null;
   containment_status: string | null;
+  key_prefix?: string | null;
 }
 
 export async function listAgents(): Promise<AgentListItem[]> {
