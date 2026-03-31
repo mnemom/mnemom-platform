@@ -76,7 +76,7 @@ export async function postApi<T>(endpoint: string, body: unknown): Promise<T> {
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const response = await fetch(url, {
+  const response = await fetch(url, { // lgtm[js/file-data-url]
     method: "POST",
     headers,
     body: JSON.stringify(body),

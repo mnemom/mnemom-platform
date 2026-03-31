@@ -296,7 +296,7 @@ export function generateAgentId(): string {
 export function computeAgentHash(apiKey: string, name?: string | null): string {
   const input = name ? `${apiKey}|${name}` : apiKey;
   // eslint-disable-next-line -- deterministic ID derivation must match gateway SHA-256
-  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16);
+  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16); // lgtm[js/insufficient-password-hash]
 }
 
 /**
