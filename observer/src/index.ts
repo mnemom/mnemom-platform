@@ -140,6 +140,12 @@ export default {
         ctx.waitUntil(reportDailyUsageToStripe(env));
       }
 
+      // Run retention cleanup weekly (Sundays at midnight UTC)
+      const now2 = new Date();
+      if (now2.getUTCDay() === 0 && now2.getUTCHours() === 0 && now2.getUTCMinutes() === 0) {
+        ctx.waitUntil(runCFDRetentionCleanup(env));
+      }
+
       // Flush OTel spans for all processed logs in one batch
       if (otelExporter) {
         ctx.waitUntil(otelExporter.flush());
@@ -2590,6 +2596,32 @@ async function applyCardAmendment(
   }
 }
 
+
+/**
+ * Call cleanup_expired_cfd_data() RPC to enforce retention policies.
+ * Runs weekly (Sundays at midnight UTC).
+ */
+async function runCFDRetentionCleanup(env: Env): Promise<void> {
+  try {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/cleanup_expired_cfd_data`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    if (resp.ok) {
+      const result = await resp.json() as { quarantine_deleted: number; evaluations_deleted: number };
+      console.log(`[observer/retention] CFD cleanup: ${result.quarantine_deleted} quarantine, ${result.evaluations_deleted} evaluations deleted`);
+    } else {
+      console.warn(`[observer/retention] CFD cleanup RPC failed: ${resp.status}`);
+    }
+  } catch (err) {
+    console.warn('[observer/retention] CFD cleanup failed:', err);
+  }
+}
 
 /**
  * Trigger metering rollup for all active billing accounts.
