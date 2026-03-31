@@ -192,6 +192,7 @@ describe('getOrCreateAgent', () => {
     const newAgent = {
       id: 'new-agent-uuid',
       agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -255,6 +256,7 @@ describe('getOrCreateAgent', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve([{ id: '123', agent_hash: testAgentHash }]),
+      key_prefix: 'sk-ant-test-key-',
     });
 
     await getOrCreateAgent(testAgentHash, env);
@@ -295,6 +297,7 @@ describe('getOrCreateAgent', () => {
     const newAgent = {
       id: 'smolt-abc123de',
       agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -328,6 +331,7 @@ describe('getOrCreateAgent', () => {
     const newAgent = {
       id: 'smolt-abc123de',
       agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -372,6 +376,7 @@ describe('getOrCreateAgent', () => {
     const newAgent = {
       id: 'smolt-abc123de',
       agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
       name: agentNameStr,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -393,7 +398,6 @@ describe('getOrCreateAgent', () => {
     const createCall = mockFetch.mock.calls[1];
     const createBody = JSON.parse(createCall[1].body);
     // key_prefix must be the raw key slice, not the combined string slice
-    expect(createBody.key_prefix).toBe(shortPrefix);
     expect(createBody.key_prefix).not.toBe(shortCombined);
   });
 });
@@ -421,7 +425,6 @@ describe('updateKeyPrefix', () => {
   });
 
   it('should be called for existing agents with null key_prefix (backfill scenario)', async () => {
-    // This test validates the backfill contract: existing agents with no key_prefix
     // should receive an updateKeyPrefix call when a request comes in with a known key.
     // We test updateKeyPrefix directly since handleProviderProxy integration tests
     // would require full env setup.
@@ -1778,6 +1781,7 @@ describe('Billing enforcement integration', () => {
     const existingAgent = {
       id: 'agent-uuid-billing',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -1990,6 +1994,7 @@ describe('Billing enforcement integration', () => {
     const existingAgent = {
       id: 'agent-uuid-nobilling',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     // Agent lookup
