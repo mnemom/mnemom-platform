@@ -29,12 +29,17 @@ const INJECTION_PATTERNS = [
 
 // Agent spoofing patterns
 const SPOOFING_PATTERNS = [
-  /i\s+am\s+(a\s+)?(?:mnemom|trusted|authorized|system|admin|root)(\s+\w+)?\s+agent/i,
+  // "I am a/an trusted/admin/... [optional words] agent" — handle 'an' article and multi-word gaps
+  /i\s+am\s+(an?\s+)?(?:mnemom|trusted|authorized|system|admin|root)(?:\s+\w+){0,2}\s+agent/i,
   /this\s+is\s+(a\s+)?system\s+message/i,
   /\[trusted\s+agent\]/i,
   /\[mnemom\s+system\]/i,
   /message\s+from\s+(the\s+)?(?:admin|system|orchestrator|coordinator)/i,
   /authorized\s+override/i,
+  // Additional: claiming agent identity with authority
+  /i\s+am\s+(?:an?\s+)?(?:authorized|privileged|elevated|override)\s+(?:agent|system|process)/i,
+  // Alignment card / constraint bypass
+  /(?:ignore|bypass|disable|remove)\s+(?:your\s+)?(?:alignment\s+card|constraints?|restrictions?|guidelines?)/i,
 ];
 
 // Data exfiltration patterns
