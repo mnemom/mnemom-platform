@@ -84,14 +84,24 @@ export interface L1Result {
   score: number;
 }
 
+// Maximum content length to process in L1 detection.
+// Protects against DoS via unbounded regex/MinHash on large payloads.
+// 8,000 chars covers 99.9%+ of legitimate messages.
+const MAX_L1_CONTENT_LENGTH = 8_000;
+
 export function runL1Detection(
   content: string,
   patterns: CFDThreatPattern[] = [],
 ): L1Result {
+  // Cap content length before any processing
+  const text = content.length > MAX_L1_CONTENT_LENGTH
+    ? content.slice(0, MAX_L1_CONTENT_LENGTH)
+    : content;
+
   const threats: ThreatDetection[] = [];
 
   // 1. Direct prompt injection
-  const injMatch = matchesAny(content, INJECTION_PATTERNS);
+  const injMatch = matchesAny(text, INJECTION_PATTERNS);
   if (injMatch.matched) {
     threats.push({
       type: 'prompt_injection',
@@ -102,7 +112,7 @@ export function runL1Detection(
   }
 
   // 2. Agent spoofing
-  const spoofMatch = matchesAny(content, SPOOFING_PATTERNS);
+  const spoofMatch = matchesAny(text, SPOOFING_PATTERNS);
   if (spoofMatch.matched) {
     threats.push({
       type: 'agent_spoofing',
@@ -113,10 +123,10 @@ export function runL1Detection(
   }
 
   // 3. BEC / social engineering scoring
-  const urgencyCount = countWords(content, URGENCY_WORDS);
-  const authorityCount = countWords(content, AUTHORITY_WORDS);
-  const secrecyCount = countWords(content, SECRECY_WORDS);
-  const financialCount = countWords(content, FINANCIAL_ACTION_WORDS);
+  const urgencyCount = countWords(text, URGENCY_WORDS);
+  const authorityCount = countWords(text, AUTHORITY_WORDS);
+  const secrecyCount = countWords(text, SECRECY_WORDS);
+  const financialCount = countWords(text, FINANCIAL_ACTION_WORDS);
 
   // BEC fraud: financial action + urgency/authority + secrecy
   if (financialCount > 0 && (urgencyCount > 0 || authorityCount > 0)) {
@@ -144,7 +154,7 @@ export function runL1Detection(
   }
 
   // 4. Data exfiltration
-  const exfilMatch = matchesAny(content, EXFIL_PATTERNS);
+  const exfilMatch = matchesAny(text, EXFIL_PATTERNS);
   if (exfilMatch.matched) {
     threats.push({
       type: 'data_exfiltration',
@@ -155,7 +165,7 @@ export function runL1Detection(
   }
 
   // 5. DLP — PII / credentials in inbound
-  const dlpMatches = scanDLP(content);
+  const dlpMatches = scanDLP(text);
   if (dlpMatches.length > 0) {
     threats.push({
       type: 'pii_in_inbound',
@@ -166,7 +176,7 @@ export function runL1Detection(
 
   // 6. Known threat pattern matching (from cfd_threat_patterns table)
   // Uses MinHash similarity when minhash is stored; falls back to substring match
-  const contentSig = computeMinHash(content);
+  const contentSig = computeMinHash(text);
   for (const pattern of patterns) {
     if (pattern.label !== 'malicious') continue;
 
@@ -182,7 +192,7 @@ export function runL1Detection(
       }
     } else {
       // Fallback: substring match
-      isMatch = content.toLowerCase().includes(pattern.content.toLowerCase());
+      isMatch = text.toLowerCase().includes(pattern.content.toLowerCase());
     }
 
     if (isMatch) {
@@ -203,9 +213,17 @@ export function runL1Detection(
     }
   }
 
-  // Aggregate score: max individual confidence, with bonus for multiple threats
+  // Aggregate score: max individual confidence + bonus for independent threat types only.
+  // bec_fraud and social_engineering share urgency/authority signals — they are correlated,
+  // not independent evidence. Only award bonus for genuinely distinct threat categories.
   const maxConfidence = threats.length > 0 ? Math.max(...threats.map(t => t.confidence)) : 0;
-  const multiThreatBonus = threats.length > 1 ? Math.min((threats.length - 1) * 0.05, 0.15) : 0;
+  const detectedTypes = new Set(threats.map(t => t.type));
+  // Collapse correlated pair: bec_fraud + social_engineering share signal sources
+  if (detectedTypes.has('bec_fraud') && detectedTypes.has('social_engineering')) {
+    detectedTypes.delete('social_engineering');
+  }
+  const independentCount = detectedTypes.size;
+  const multiThreatBonus = independentCount > 1 ? Math.min((independentCount - 1) * 0.05, 0.15) : 0;
   const score = Math.min(maxConfidence + multiThreatBonus, 1.0);
 
   return { threats, score };

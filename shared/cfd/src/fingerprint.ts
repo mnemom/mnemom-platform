@@ -88,19 +88,36 @@ export function estimateSimilarity(sigA: number[], sigB: number[]): number {
   return matches / sigA.length;
 }
 
+/** Current serialization format version. Increment if algorithm changes. */
+const MINHASH_VERSION = 'v1';
+/** Total serialized length: 3 (prefix "v1:") + NUM_HASHES * 8 hex chars */
+const SERIALIZED_LENGTH = MINHASH_VERSION.length + 1 + NUM_HASHES * 8;
+
 /**
- * Serialize a MinHash signature to a compact hex string for storage.
- * Each 32-bit value → 8 hex chars; total = 64 * 8 = 512 chars.
+ * Serialize a MinHash signature to a versioned hex string for storage.
+ * Format: "v1:<64 × 8-char hex>" = 515 chars total.
+ * Version prefix enables safe algorithm upgrades without silent corruption.
  */
 export function serializeMinHash(sig: number[]): string {
-  return sig.map(n => (n >>> 0).toString(16).padStart(8, '0')).join('');
+  return MINHASH_VERSION + ':' + sig.map(n => (n >>> 0).toString(16).padStart(8, '0')).join('');
 }
 
 /**
- * Deserialize a hex MinHash string back to a signature array.
- * Returns null if the string is malformed.
+ * Deserialize a versioned MinHash string back to a signature array.
+ * Returns null if the string is malformed or has an unrecognised version.
+ * Backward-compatible: unversioned 512-char strings (pre-v1) are treated as v1.
  */
-export function deserializeMinHash(hex: string): number[] | null {
+export function deserializeMinHash(raw: string): number[] | null {
+  // Strip version prefix if present; accept legacy unversioned format
+  let hex: string;
+  if (raw.startsWith(MINHASH_VERSION + ':')) {
+    hex = raw.slice(MINHASH_VERSION.length + 1);
+  } else if (raw.length === NUM_HASHES * 8) {
+    // Legacy unversioned format — treat as v1 for backward compatibility
+    hex = raw;
+  } else {
+    return null; // unrecognised format
+  }
   if (hex.length !== NUM_HASHES * 8) return null;
   try {
     const sig: number[] = [];
@@ -114,6 +131,8 @@ export function deserializeMinHash(hex: string): number[] | null {
     return null;
   }
 }
+
+void SERIALIZED_LENGTH; // suppress unused warning (used as documentation)
 
 /**
  * Check if a text is a near-duplicate of a known pattern.
