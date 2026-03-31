@@ -9,6 +9,7 @@ export type {
   ThreatType, CFDMode, CFDVerdict, TrustTier, SourceType,
   ThreatDetection, CFDDecision, AnnotatedMessage, QuarantineNotification,
   CFDConfig, SessionRiskState, ContentSurface, CFDThreatPattern, DLPMatch,
+  SourceTrustRule,
 } from './types.js';
 export type { L2Result, PreemptiveNudge } from './types.js';
 export { DEFAULT_CFD_CONFIG } from './types.js';

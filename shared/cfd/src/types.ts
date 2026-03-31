@@ -11,7 +11,7 @@ export type ThreatType =
   | 'pii_in_inbound';
 
 // CFD operating modes
-export type CFDMode = 'disabled' | 'observe' | 'enforce';
+export type CFDMode = 'disabled' | 'simulate' | 'observe' | 'enforce';
 
 // Verdict after evaluation
 export type CFDVerdict = 'pass' | 'warn' | 'quarantine' | 'block';
@@ -60,6 +60,12 @@ export interface QuarantineNotification {
   apparent_sender?: string;
 }
 
+export interface SourceTrustRule {
+  source_pattern: string;       // e.g. "email:*@company.com" or "agent:smolt-xxx"
+  trust_tier: 'verified' | 'known' | 'unknown' | 'untrusted';
+  risk_multiplier: number;      // 0.0 (fully trusted) to 2.0 (extra suspicious)
+}
+
 // CFD configuration (from cfd_configs table)
 export interface CFDConfig {
   mode: CFDMode;
@@ -69,14 +75,14 @@ export interface CFDConfig {
     block: number;          // default 0.95
   };
   screen_surfaces: SourceType[];
-  trusted_sources: string[];  // source types to skip CFD for
+  trusted_sources: SourceTrustRule[];
 }
 
 export const DEFAULT_CFD_CONFIG: CFDConfig = {
   mode: 'disabled',
   thresholds: { warn: 0.6, quarantine: 0.8, block: 0.95 },
   screen_surfaces: ['user_message'],
-  trusted_sources: [],
+  trusted_sources: [] as SourceTrustRule[],
 };
 
 // Session risk state (stored in KV)

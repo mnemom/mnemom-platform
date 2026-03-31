@@ -3535,6 +3535,39 @@ function replaceToolResultContent(
   } catch { /* non-blocking */ }
 }
 
+/**
+ * Apply source trust rules to a base risk score.
+ * Verified/known sources get a risk reduction; untrusted sources get amplification.
+ */
+function applySourceTrust(
+  baseScore: number,
+  sourceType: string,
+  agentId: string,
+  trustedSources: import('@mnemom/cfd').SourceTrustRule[]
+): number {
+  if (!trustedSources || trustedSources.length === 0) return baseScore;
+
+  // Check for matching rules (first match wins)
+  for (const rule of trustedSources) {
+    const pattern = rule.source_pattern;
+    let matches = false;
+    if (pattern === '*') {
+      matches = true;
+    } else if (pattern.startsWith('agent:')) {
+      matches = agentId === pattern.slice(6) || pattern === 'agent:smolt-*' && agentId.startsWith('smolt-');
+    } else if (pattern.startsWith('email:')) {
+      matches = sourceType === 'email' && (pattern === 'email:*' || sourceType.includes(pattern.slice(6)));
+    } else {
+      matches = sourceType === pattern || sourceType.startsWith(pattern.replaceAll('*', ''));
+    }
+
+    if (matches) {
+      return Math.min(1.0, Math.max(0.0, baseScore * rule.risk_multiplier));
+    }
+  }
+  return baseScore;
+}
+
 /** Log a CFD evaluation to the cfd_evaluations table (fire-and-forget). */
 async function logCFDEvaluation(
   agentId: string,
@@ -4004,11 +4037,51 @@ export async function handleProviderProxy(
       // Phase 0.5: Context Front Door (CFD) — inbound threat screening
       // ====================================================================
       const cfdFeatureEnabled = quotaContext.feature_flags?.cfd_enabled === true;
-      if (cfdFeatureEnabled && (cfdConfig.mode === 'enforce' || cfdConfig.mode === 'observe') && requestBody !== null) {
+      if (cfdFeatureEnabled && (cfdConfig.mode === 'enforce' || cfdConfig.mode === 'observe' || cfdConfig.mode === 'simulate') && requestBody !== null) {
         const inboundMessage = extractLastUserMessage(requestBody as Record<string, unknown>, provider);
         if (inboundMessage) {
-          // Observe mode: pass immediately, run full analysis in background
-          if (cfdConfig.mode === 'observe') {
+          if (cfdConfig.mode === 'simulate') {
+            // Simulate: run full analysis but touch NOTHING — no message modification,
+            // no quarantine entries, no session state updates.
+            // Result goes only to cfd_evaluations with mode='simulate' and response header.
+            const t0 = Date.now();
+            const [simPatterns, simSession] = await Promise.all([
+              fetchCFDThreatPatterns(env),
+              getCFDSessionState(sessionId, env),
+            ]);
+            const simL1 = runL1Detection(inboundMessage, simPatterns);
+            let simThreats = simL1.threats;
+            let simScore = simL1.score;
+            if (simL1.score > 0.2) {
+              const simL2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
+              if (simL2Raw) {
+                const simL2 = parseL2Response(simL2Raw);
+                if (simL2) {
+                  const merged = mergeL1AndL2(simL1.threats, simL1.score, simL2);
+                  simThreats = merged.threats;
+                  simScore = merged.score;
+                }
+              }
+            }
+            const { multiplied_score: simMultiplied } = applySessionMultiplier(simScore, simSession);
+            const thresholds = cfdConfig.thresholds;
+            let simVerdict: CFDVerdict = 'pass';
+            if (simMultiplied >= thresholds.block) simVerdict = 'block';
+            else if (simMultiplied >= thresholds.quarantine) simVerdict = 'quarantine';
+            else if (simMultiplied >= thresholds.warn) simVerdict = 'warn';
+
+            // Log to cfd_evaluations but with mode='simulate' — no quarantine, no session update
+            if (simVerdict !== 'pass') {
+              const simDecision: CFDDecision = {
+                verdict: simVerdict, overall_risk: simMultiplied, threats: simThreats,
+                l1_score: simL1.score, session_multiplier: 1.0, detection_layer: 'l2', duration_ms: Date.now() - t0,
+              };
+              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, 'simulate', simDecision, 'user_message', env));
+            }
+            // Set simulated verdict — will be emitted as X-CFD-Simulated-Verdict below
+            cfdVerdict = simVerdict;
+          } else if (cfdConfig.mode === 'observe') {
+            // Observe mode: pass immediately, run full analysis in background
             ctx.waitUntil(runObserveCFD(agent.id, sessionId, inboundMessage, cfdConfig, env));
             // Sync session risk read for observe mode header (KV, ~1ms)
             const observeSession = await getCFDSessionState(sessionId, env).catch(() => null);
@@ -4041,12 +4114,16 @@ export async function handleProviderProxy(
 
           const { multiplied_score, session_multiplier } = applySessionMultiplier(finalScore, sessionState);
 
+          // Apply source trust rules (risk_multiplier from trusted_sources config)
+          const sourceType = (requestBody as Record<string, unknown>)?.['x_cfd_source_type'] as string ?? 'user_message';
+          const trustAdjustedScore = applySourceTrust(multiplied_score, sourceType, agent.id, cfdConfig.trusted_sources ?? []);
+
           // Determine verdict from thresholds
           const thresholds = cfdConfig.thresholds;
           let verdict: CFDVerdict = 'pass';
-          if (multiplied_score >= thresholds.block) verdict = 'block';
-          else if (multiplied_score >= thresholds.quarantine) verdict = 'quarantine';
-          else if (multiplied_score >= thresholds.warn) verdict = 'warn';
+          if (trustAdjustedScore >= thresholds.block) verdict = 'block';
+          else if (trustAdjustedScore >= thresholds.quarantine) verdict = 'quarantine';
+          else if (trustAdjustedScore >= thresholds.warn) verdict = 'warn';
 
           const duration_ms = Date.now() - t0;
 
@@ -4058,7 +4135,7 @@ export async function handleProviderProxy(
 
             const decision: CFDDecision = {
               verdict,
-              overall_risk: multiplied_score,
+              overall_risk: trustAdjustedScore,
               threats: finalThreats,
               l1_score: l1.score,
               session_multiplier,
@@ -4099,14 +4176,14 @@ export async function handleProviderProxy(
           }
 
           // Always update session state with this message's score
-          ctx.waitUntil(updateCFDSessionState(sessionId, agent.id, multiplied_score, env));
+          ctx.waitUntil(updateCFDSessionState(sessionId, agent.id, trustAdjustedScore, env));
           ctx.waitUntil(incrementCFDUsage(agent.id, env));
 
           console.log(JSON.stringify({
             event: 'cfd',
             verdict,
             l1_score: l1.score,
-            multiplied_score,
+            multiplied_score: trustAdjustedScore,
             session_multiplier,
             threat_count: finalThreats.length, detection_layer: detectionLayer,
             duration_ms,
@@ -4323,9 +4400,12 @@ export async function handleProviderProxy(
 
     // Add CFD headers if screening ran
     if (cfdVerdict) {
-      responseHeaders.set('X-CFD-Verdict', cfdVerdict);
-      if (cfdQuarantineId) {
-        responseHeaders.set('X-CFD-Quarantine-Id', cfdQuarantineId);
+      if (cfdConfig.mode === 'simulate') {
+        responseHeaders.set('X-CFD-Simulated-Verdict', cfdVerdict);
+        responseHeaders.set('X-CFD-Mode', 'simulate');
+      } else {
+        responseHeaders.set('X-CFD-Verdict', cfdVerdict);
+        if (cfdQuarantineId) responseHeaders.set('X-CFD-Quarantine-Id', cfdQuarantineId);
       }
     }
     if (cfdSessionRisk) {
@@ -5074,7 +5154,7 @@ export default {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered, X-CFD-Session-Risk, X-CFD-Mode',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },
