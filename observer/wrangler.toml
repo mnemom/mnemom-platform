@@ -6,6 +6,9 @@ compatibility_flags = ["nodejs_compat"]
 # ─── Production ───────────────────────────────────────────────────────────────
 [env.production]
 name = "smoltbot-observer"
+# CF Workers Paid Standard ($5/month) plan required: CFD analysis + OTel export per cron tick
+# can exceed 10ms bundled CPU on bulk log processing. Standard plan provides 30s CPU.
+usage_model = "standard"
 
 [env.production.triggers]
 crons = ["* * * * *"]
