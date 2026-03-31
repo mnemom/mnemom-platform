@@ -370,17 +370,16 @@ describe('getOrCreateAgent', () => {
     // shortKey is only 6 chars so prefix is "sk-XYZ"
     // combined starts with "sk-XYZ|my-named" (16 chars)
     expect(shortPrefix).toBe('sk-XYZ');
-    expect(shortCombined).toBe('sk-XYZ|my-named');
+    expect(shortCombined).toBe('sk-XYZ|my-named-');
     expect(shortPrefix).not.toBe(shortCombined);
 
     const newAgent = {
       id: 'smolt-abc123de',
       agent_hash: testAgentHash,
-      key_prefix: 'sk-ant-test-key-',
+      key_prefix: shortPrefix,
       name: agentNameStr,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
-      key_prefix: shortPrefix,
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -1125,7 +1124,7 @@ describe('Request handler integration', () => {
     // Mock agent lookup for proxy handler
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve([{ id: 'agent-123' }]),
+      json: () => Promise.resolve([{ id: 'agent-123', agent_hash: 'abcdef0123456789', key_prefix: 'sk-ant-test-key-' }]),
     });
 
     // Quota context RPC (always called for agent_settings)
