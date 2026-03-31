@@ -16,6 +16,7 @@ workers_dev = true
 [env.production.vars]
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "true"
+CFD_ENABLED = "true"   # Enables CFD DB lookups; per-agent mode controlled via cfd_configs table
 
 [[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
