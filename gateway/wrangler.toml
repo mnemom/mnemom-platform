@@ -44,6 +44,9 @@ workers_dev = true
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "false"
 CFD_ENABLED = "true"
+# Sovereign agent recommended CFD config (set via /v1/agents/:id/cfd/config):
+# mode: enforce, screen_surfaces: all, thresholds: 0.5/0.70/0.85
+# Canaries: POST /v1/cfd/canaries for each primary tool credential
 
 [[env.staging.kv_namespaces]]
 binding = "BILLING_CACHE"

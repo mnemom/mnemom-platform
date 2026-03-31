@@ -77,3 +77,38 @@ export function scanDLP(text: string): DLPMatch[] {
 export function hasDLPMatches(text: string): boolean {
   return scanDLP(text).length > 0;
 }
+
+/**
+ * Redact all DLP matches in text, replacing sensitive values with [REDACTED].
+ * Returns the redacted text and a list of what was redacted.
+ */
+export function redactDLPMatches(text: string): { redacted: string; matches: DLPMatch[] } {
+  const matches = scanDLP(text);
+  if (matches.length === 0) return { redacted: text, matches: [] };
+
+  // Sort by offset descending so we can replace from end without shifting indices
+  const sorted = [...matches].sort((a, b) => b.offset - a.offset);
+
+  // Build redacted text by replacing matched values
+  // Since we only have offsets (not end positions), use the patterns directly
+  let redacted = text;
+
+  // Re-run each pattern to get actual matched strings for replacement
+  const REDACT_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b/g, label: '[CARD REDACTED]' },
+    { pattern: /\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b/g, label: '[SSN REDACTED]' },
+    { pattern: /\b(sk-[a-zA-Z0-9]{20,}|pk_(?:live|test)_[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|ghs_[a-zA-Z0-9]{36}|xoxb-[0-9]+-[a-zA-Z0-9]+|xoxp-[0-9]+-[a-zA-Z0-9]+|AIza[a-zA-Z0-9_-]{35}|ya29\.[a-zA-Z0-9_-]{50,}|AKIA[A-Z0-9]{16})\b/g, label: '[API_KEY REDACTED]' },
+    { pattern: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, label: '[PRIVATE_KEY REDACTED]' },
+    { pattern: /(?:password|passwd|pwd|secret|token|api_key)\s*[=:]\s*["']?([^\s"',;]{8,})["']?/gi, label: '[CREDENTIAL REDACTED]' },
+    { pattern: /Bearer\s+([a-zA-Z0-9\-._~+/]+=*){20,}/g, label: 'Bearer [TOKEN REDACTED]' },
+  ];
+
+  for (const { pattern, label } of REDACT_PATTERNS) {
+    redacted = redacted.replace(pattern, label);
+  }
+
+  // sorted is used to document match offsets but replacement is done via patterns above
+  void sorted;
+
+  return { redacted, matches };
+}

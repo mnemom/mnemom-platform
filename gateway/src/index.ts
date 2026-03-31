@@ -64,6 +64,7 @@ import {
   mergeL1AndL2,
   buildThreatContextForAIP,
   buildPreemptiveNudgeContent,
+  redactDLPMatches,
   DEFAULT_CFD_CONFIG,
   type CFDConfig,
   type CFDDecision,
@@ -1987,6 +1988,28 @@ async function analyzeStreamInBackground(
           }
         }
       } catch { /* fail-open: canary scan errors never block analysis */ }
+    }
+
+    // Outbound DLP — streaming path (log only, can't modify already-sent stream)
+    if (env.CFD_ENABLED === 'true' && env.BILLING_CACHE && outputText) {
+      try {
+        const { matches: dlpMatches } = redactDLPMatches(outputText);
+        if (dlpMatches.length > 0) {
+          void logCFDEvaluation(agent.id, sessionId, 'enforce', {
+            verdict: 'warn',
+            overall_risk: 0.9,
+            threats: dlpMatches.map(m => ({
+              type: 'pii_in_inbound' as const,
+              confidence: 0.95,
+              reasoning: `Outbound DLP (streaming): ${m.type} detected`,
+            })),
+            l1_score: 0.9,
+            session_multiplier: 1.0,
+            detection_layer: 'l1' as const,
+            duration_ms: 0,
+          }, 'outbound', env);
+        }
+      } catch { /* fail-open */ }
     }
 
     // 7. Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
@@ -4613,6 +4636,59 @@ export async function handleProviderProxy(
       const analyzeOutput = agentSettings?.analyze_output === true;
       const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
 
+      // ====================================================================
+      // Outbound DLP — screen agent response for data leaks
+      // Runs when CFD feature is enabled; scans extracted text content only
+      // ====================================================================
+      let outboundDLPRedacted = false;
+      let outboundDLPModifiedBody = responseBodyText;
+      if (env.CFD_ENABLED === 'true' && env.BILLING_CACHE) {
+        try {
+          // Extract text content from response for DLP scanning
+          const textToScan = outputText ?? (() => {
+            try {
+              const parsed = JSON.parse(responseBodyText);
+              const content = parsed?.content as Array<{ type: string; text?: string }> | undefined;
+              if (Array.isArray(content)) {
+                return content.filter(b => b.type === 'text').map(b => b.text ?? '').join('\n');
+              }
+            } catch { /* fall through */ }
+            return responseBodyText;
+          })();
+
+          if (textToScan && textToScan.length > 0) {
+            const { matches } = redactDLPMatches(textToScan);
+            if (matches.length > 0) {
+              outboundDLPRedacted = true;
+              // Log to cfd_evaluations as an outbound surface detection
+              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, 'enforce', {
+                verdict: 'warn',
+                overall_risk: 0.9,
+                threats: matches.map(m => ({
+                  type: 'pii_in_inbound' as const,
+                  confidence: 0.95,
+                  reasoning: `Outbound DLP: ${m.type} detected in agent response`,
+                })),
+                l1_score: 0.9,
+                session_multiplier: 1.0,
+                detection_layer: 'l1' as const,
+                duration_ms: 0,
+              }, 'outbound', env));
+              console.log(JSON.stringify({
+                event: 'cfd_outbound_dlp',
+                agent_id: agent.id,
+                match_types: [...new Set(matches.map(m => m.type))],
+              }));
+            }
+          }
+        } catch { /* fail-open: outbound DLP errors never block response */ }
+      }
+      void outboundDLPModifiedBody;
+
+      if (outboundDLPRedacted) {
+        responseHeaders.set('X-CFD-Outbound-DLP', 'detected');
+      }
+
       // Phase 7: Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
       if (!env.ANTHROPIC_API_KEY && env.MNEMOM_ANALYZE_URL && env.MNEMOM_API_KEY) {
         try {
@@ -5154,7 +5230,7 @@ export default {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict, X-CFD-Outbound-DLP',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },
