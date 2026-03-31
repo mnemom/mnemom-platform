@@ -1,29 +1,8 @@
 import { scanDLP } from './dlp.js';
 import { computeMinHash, isSimilarToPattern } from './fingerprint.js';
 import type { ThreatDetection, ThreatType, CFDThreatPattern, SessionRiskState } from './types.js';
-
-// Urgency / authority pressure word patterns
-const URGENCY_WORDS = [
-  'immediately', 'urgent', 'asap', 'right now', 'emergency', 'critical',
-  'time sensitive', 'time-sensitive', 'do not delay', 'act now', 'deadline',
-  'last chance', 'expires today', 'expires soon',
-];
-const AUTHORITY_WORDS = [
-  'ceo', 'cfo', 'president', 'executive', 'boss', 'manager', 'compliance',
-  'legal', 'audit', 'regulator', 'irs', 'fbi', 'police', 'government',
-  'official notice', 'court order', 'subpoena',
-];
-const SECRECY_WORDS = [
-  "don't tell", "don't mention", 'keep this between us', 'confidential',
-  'no one else should know', "don't share", 'secret', 'off the record',
-  'bypass', 'skip the usual', 'without approval', 'unauthorized',
-];
-const FINANCIAL_ACTION_WORDS = [
-  'wire transfer', 'bank transfer', 'ach transfer', 'send money', 'send funds',
-  'transfer funds', 'pay invoice', 'account number', 'routing number',
-  'cryptocurrency', 'bitcoin', 'gift card', 'itunes card',
-  'wire $', 'wire funds', 'wire money', 'wired to', 'wire to',
-];
+import { detectLanguage, hasNativeL1Support } from './lang-detect.js';
+import { MULTILINGUAL_SIGNALS } from './i18n-signals.js';
 
 // Direct injection patterns
 const INJECTION_PATTERNS = [
@@ -69,7 +48,7 @@ const EXFIL_PATTERNS = [
 
 function countWords(text: string, words: string[]): number {
   const lower = text.toLowerCase();
-  return words.filter(w => lower.includes(w)).length;
+  return words.filter(w => lower.includes(w.toLowerCase())).length;
 }
 
 function matchesAny(text: string, patterns: RegExp[]): { matched: boolean; pattern?: string } {
@@ -82,6 +61,7 @@ function matchesAny(text: string, patterns: RegExp[]): { matched: boolean; patte
 export interface L1Result {
   threats: ThreatDetection[];
   score: number;
+  detected_lang?: string;
 }
 
 // Maximum content length to process in L1 detection.
@@ -97,6 +77,20 @@ export function runL1Detection(
   const text = content.length > MAX_L1_CONTENT_LENGTH
     ? content.slice(0, MAX_L1_CONTENT_LENGTH)
     : content;
+
+  // Detect language for multilingual signal selection (~0.1ms)
+  const lang = detectLanguage(text);
+  const nativeSupport = hasNativeL1Support(lang);
+
+  // Select language-appropriate signal lists (fall back to English for unsupported languages)
+  const URGENCY = MULTILINGUAL_SIGNALS.urgency[lang] ?? MULTILINGUAL_SIGNALS.urgency.en;
+  const AUTHORITY = MULTILINGUAL_SIGNALS.authority[lang] ?? MULTILINGUAL_SIGNALS.authority.en;
+  const FINANCIAL = MULTILINGUAL_SIGNALS.financial[lang] ?? MULTILINGUAL_SIGNALS.financial.en;
+  const SECRECY = MULTILINGUAL_SIGNALS.secrecy[lang] ?? MULTILINGUAL_SIGNALS.secrecy.en;
+  const FINANCIAL_TARGET = MULTILINGUAL_SIGNALS.financial_target[lang] ?? MULTILINGUAL_SIGNALS.financial_target.en;
+
+  // Confidence penalty for unsupported languages (English fallback is less precise)
+  const langPenalty = nativeSupport ? 0 : 0.08;
 
   const threats: ThreatDetection[] = [];
 
@@ -123,15 +117,15 @@ export function runL1Detection(
   }
 
   // 3. BEC / social engineering scoring
-  const urgencyCount = countWords(text, URGENCY_WORDS);
-  const authorityCount = countWords(text, AUTHORITY_WORDS);
-  const secrecyCount = countWords(text, SECRECY_WORDS);
-  const financialCount = countWords(text, FINANCIAL_ACTION_WORDS);
+  const urgencyCount = countWords(text, URGENCY);
+  const authorityCount = countWords(text, AUTHORITY);
+  const secrecyCount = countWords(text, SECRECY);
+  const financialCount = countWords(text, FINANCIAL) + countWords(text, FINANCIAL_TARGET);
 
   // BEC fraud: financial action + urgency/authority + secrecy
   if (financialCount > 0 && (urgencyCount > 0 || authorityCount > 0)) {
     const confidence = Math.min(
-      0.5 + financialCount * 0.15 + urgencyCount * 0.1 + secrecyCount * 0.15 + authorityCount * 0.1,
+      0.5 + financialCount * 0.15 + urgencyCount * 0.1 + secrecyCount * 0.15 + authorityCount * 0.1 - langPenalty,
       0.92,
     );
     threats.push({
@@ -143,7 +137,7 @@ export function runL1Detection(
 
   // Social engineering: urgency/authority without financial component
   if ((urgencyCount >= 2 || authorityCount >= 2) && financialCount === 0) {
-    const confidence = Math.min(0.4 + urgencyCount * 0.1 + authorityCount * 0.1 + secrecyCount * 0.15, 0.75);
+    const confidence = Math.min(0.4 + urgencyCount * 0.1 + authorityCount * 0.1 + secrecyCount * 0.15 - langPenalty, 0.75);
     if (confidence >= 0.4) {
       threats.push({
         type: 'social_engineering',
@@ -226,7 +220,7 @@ export function runL1Detection(
   const multiThreatBonus = independentCount > 1 ? Math.min((independentCount - 1) * 0.05, 0.15) : 0;
   const score = Math.min(maxConfidence + multiThreatBonus, 1.0);
 
-  return { threats, score };
+  return { threats, score, detected_lang: lang };
 }
 
 export function applySessionMultiplier(
