@@ -170,6 +170,7 @@ describe('getOrCreateAgent', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
       name: 'Test Agent',
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -569,6 +570,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -639,6 +641,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -698,6 +701,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -764,6 +768,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -820,6 +825,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -897,6 +903,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -1047,6 +1054,7 @@ describe('Request handler integration', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
