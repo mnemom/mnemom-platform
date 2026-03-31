@@ -66,6 +66,38 @@ async function fetchApi<T>(endpoint: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export async function postApi<T>(endpoint: string, body: unknown): Promise<T> {
+  const url = validateUrl(`${API_BASE}${endpoint}`);
+  const token = await getAccessToken();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(url, { // lgtm[js/file-data-url]
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: `HTTP ${response.status}`,
+    }))) as ApiError | { error: string; message: string; conflict_agent_id?: string };
+    const msg = "message" in error ? error.message : JSON.stringify(error);
+    // Preserve conflict_agent_id in the error message for 409 handling upstream
+    if (response.status === 409 && "conflict_agent_id" in error) {
+      throw new Error(`409: ${msg} (conflict: ${(error as any).conflict_agent_id})`);
+    }
+    throw new Error(`${response.status}: ${msg}`);
+  }
+
+  return response.json() as Promise<T>;
+}
+
 /**
  * Build auth headers if a token is available.
  * Returns empty object when unauthenticated (read-only calls).

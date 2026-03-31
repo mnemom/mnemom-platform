@@ -16,7 +16,7 @@ import {
   policyEvaluateCommand,
 } from "./commands/policy.js";
 import { registerCommand } from "./commands/register.js";
-import { agentsListCommand, agentsRemoveCommand, agentsAddCommand, agentsDefaultCommand } from "./commands/agents.js";
+import { agentsListCommand, agentsRemoveCommand, agentsAddCommand, agentsDefaultCommand, agentsRekeyCommand } from "./commands/agents.js";
 import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
 
 program
@@ -323,6 +323,18 @@ agentsCmd
   .action(async (name: string) => {
     try {
       await agentsDefaultCommand(name);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+agentsCmd
+  .command("rekey [name]")
+  .description("Re-bind an agent to a new provider API key (key hashed locally, never transmitted)")
+  .action(async (name?: string) => {
+    try {
+      await agentsRekeyCommand(name);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
