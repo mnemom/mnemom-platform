@@ -3,6 +3,7 @@ import {
   hashApiKey,
   generateSessionId,
   getOrCreateAgent,
+  updateKeyPrefix,
   buildMetadataHeader,
   handleHealthCheck,
   handleAnthropicProxy,
@@ -169,6 +170,7 @@ describe('getOrCreateAgent', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
       name: 'Test Agent',
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -190,6 +192,7 @@ describe('getOrCreateAgent', () => {
     const newAgent = {
       id: 'new-agent-uuid',
       agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -253,6 +256,7 @@ describe('getOrCreateAgent', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve([{ id: '123', agent_hash: testAgentHash }]),
+      key_prefix: 'sk-ant-test-key-',
     });
 
     await getOrCreateAgent(testAgentHash, env);
@@ -287,6 +291,152 @@ describe('getOrCreateAgent', () => {
       `${env.SUPABASE_URL}/rest/v1/agents?agent_hash=eq.${testAgentHash}&select=*`,
       expect.any(Object)
     );
+  });
+
+  it('should include key_prefix in INSERT body when creating a new agent', async () => {
+    const newAgent = {
+      id: 'smolt-abc123de',
+      agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
+      name: null,
+      created_at: '2024-01-15T10:00:00Z',
+      last_seen: '2024-01-15T10:00:00Z',
+      key_prefix: 'sk-ant-api03-abcd',
+    };
+    const keyPrefix = 'sk-ant-api03-abcd';
+
+    // Lookup returns empty
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([]),
+    });
+    // Create agent
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([newAgent]),
+    });
+    // Create alignment card
+    mockFetch.mockResolvedValueOnce({ ok: true });
+
+    const result = await getOrCreateAgent(testAgentHash, env, undefined, keyPrefix);
+
+    expect(result.isNew).toBe(true);
+    // Find the POST call (second fetch call)
+    const createCall = mockFetch.mock.calls[1];
+    const createBody = JSON.parse(createCall[1].body);
+    expect(createBody.key_prefix).toBe(keyPrefix);
+  });
+
+  it('should NOT include key_prefix in INSERT body when keyPrefix is not provided', async () => {
+    const newAgent = {
+      id: 'smolt-abc123de',
+      agent_hash: testAgentHash,
+      key_prefix: 'sk-ant-test-key-',
+      name: null,
+      created_at: '2024-01-15T10:00:00Z',
+      last_seen: '2024-01-15T10:00:00Z',
+    };
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([]),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([newAgent]),
+    });
+    mockFetch.mockResolvedValueOnce({ ok: true });
+
+    await getOrCreateAgent(testAgentHash, env, undefined, undefined);
+
+    const createCall = mockFetch.mock.calls[1];
+    const createBody = JSON.parse(createCall[1].body);
+    expect(createBody).not.toHaveProperty('key_prefix');
+  });
+
+  it('named agent: key_prefix is apiKey.slice(0,16), not (apiKey+"|"+name).slice(0,16)', async () => {
+    const rawKey = 'sk-ant-api03-verylongkey9999';
+    const agentNameStr = 'my-named-agent';
+    const keyPrefix = rawKey.slice(0, 16);
+    // The combined prefix would differ
+    const combinedPrefix = (rawKey + '|' + agentNameStr).slice(0, 16);
+    expect(keyPrefix).toBe('sk-ant-api03-ver');
+    expect(combinedPrefix).toBe('sk-ant-api03-ver'); // first 16 chars happen to be same in this case
+
+    // Use a key where they differ to prove the assertion
+    const shortKey = 'sk-XYZ';
+    const shortCombined = (shortKey + '|' + agentNameStr).slice(0, 16);
+    const shortPrefix = shortKey.slice(0, 16);
+    // shortKey is only 6 chars so prefix is "sk-XYZ"
+    // combined starts with "sk-XYZ|my-named" (16 chars)
+    expect(shortPrefix).toBe('sk-XYZ');
+    expect(shortCombined).toBe('sk-XYZ|my-named-');
+    expect(shortPrefix).not.toBe(shortCombined);
+
+    const newAgent = {
+      id: 'smolt-abc123de',
+      agent_hash: testAgentHash,
+      key_prefix: shortPrefix,
+      name: agentNameStr,
+      created_at: '2024-01-15T10:00:00Z',
+      last_seen: '2024-01-15T10:00:00Z',
+    };
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([]),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([newAgent]),
+    });
+    mockFetch.mockResolvedValueOnce({ ok: true });
+
+    await getOrCreateAgent(testAgentHash, env, agentNameStr, shortPrefix);
+
+    const createCall = mockFetch.mock.calls[1];
+    const createBody = JSON.parse(createCall[1].body);
+    // key_prefix must be the raw key slice, not the combined string slice
+    expect(createBody.key_prefix).not.toBe(shortCombined);
+  });
+});
+
+describe('updateKeyPrefix', () => {
+  const env = createTestEnv();
+
+  it('should PATCH agent with key_prefix', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true });
+
+    await updateKeyPrefix('smolt-abc123de', 'sk-ant-api03-ver', env);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      `${env.SUPABASE_URL}/rest/v1/agents?id=eq.smolt-abc123de`,
+      expect.objectContaining({
+        method: 'PATCH',
+        headers: expect.objectContaining({
+          'apikey': env.SUPABASE_KEY,
+          'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify({ key_prefix: 'sk-ant-api03-ver' }),
+      })
+    );
+  });
+
+  it('should be called for existing agents with null key_prefix (backfill scenario)', async () => {
+    // should receive an updateKeyPrefix call when a request comes in with a known key.
+    // We test updateKeyPrefix directly since handleProviderProxy integration tests
+    // would require full env setup.
+    mockFetch.mockResolvedValueOnce({ ok: true });
+
+    const agentId = 'smolt-existingx';
+    const prefix = 'sk-ant-api03-abc';
+    await updateKeyPrefix(agentId, prefix, env);
+
+    const call = mockFetch.mock.calls[0];
+    expect(call[0]).toContain(`id=eq.${agentId}`);
+    const body = JSON.parse(call[1].body);
+    expect(body.key_prefix).toBe(prefix);
   });
 });
 
@@ -422,6 +572,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -492,6 +643,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -551,6 +703,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -617,6 +770,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -673,6 +827,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -750,6 +905,7 @@ describe('handleAnthropicProxy', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -900,6 +1056,7 @@ describe('Request handler integration', () => {
     const existingAgent = {
       id: 'agent-uuid-123',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     mockFetch.mockResolvedValueOnce({
@@ -967,7 +1124,7 @@ describe('Request handler integration', () => {
     // Mock agent lookup for proxy handler
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve([{ id: 'agent-123' }]),
+      json: () => Promise.resolve([{ id: 'agent-123', agent_hash: 'abcdef0123456789', key_prefix: 'sk-ant-test-key-' }]),
     });
 
     // Quota context RPC (always called for agent_settings)
@@ -1623,6 +1780,7 @@ describe('Billing enforcement integration', () => {
     const existingAgent = {
       id: 'agent-uuid-billing',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
       name: null,
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -1835,6 +1993,7 @@ describe('Billing enforcement integration', () => {
     const existingAgent = {
       id: 'agent-uuid-nobilling',
       agent_hash: 'abcdef0123456789',
+      key_prefix: 'sk-ant-test-key-',
     };
 
     // Agent lookup

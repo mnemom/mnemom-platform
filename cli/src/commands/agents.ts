@@ -1,5 +1,5 @@
 import { loadConfig, saveConfig, computeAgentHash } from "../lib/config.js";
-import { listAgents, getAgent, getAgentByName, postApi } from "../lib/api.js";
+import { listAgents, getAgent, getAgentByName, postApi, verifyBinding } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 import { askInput } from "../lib/prompt.js";
 
@@ -40,6 +40,9 @@ export async function agentsListCommand(): Promise<void> {
 
       console.log(`  ${fmt.label(displayName + defaultMarker, "")}`);
       console.log(`    ${fmt.label("Agent ID: ", agent.id)}`);
+      if (agent.key_prefix) {
+        console.log(`    ${fmt.label("Key:      ", ` ${agent.key_prefix}…`)}`);
+      }
       if (localName && localName !== displayName) {
         console.log(`    ${fmt.label("Local alias:", " " + localName)}`);
       }
@@ -275,4 +278,64 @@ export async function agentsRekeyCommand(name?: string): Promise<void> {
   console.log();
   console.log("Your agent history, alignment card, and integrity score are preserved.");
   console.log("Update your ANTHROPIC_API_KEY (or equivalent) to the new key.\n");
+}
+
+export async function agentsCheckBindingCommand(name?: string): Promise<void> {
+  const config = loadConfig();
+  if (!config) {
+    console.log('\n' + fmt.error('smoltbot is not initialized') + '\n');
+    console.log('Run `smoltbot init` to get started.\n');
+    process.exit(1);
+  }
+
+  const agentName = name ?? config.defaultAgent;
+  const agentEntry = config.agents[agentName];
+  if (!agentEntry) {
+    console.log(fmt.error(`Agent "${agentName}" not found`) + '\n');
+    console.log('Available agents: ' + Object.keys(config.agents).join(', ') + '\n');
+    process.exit(1);
+  }
+  const { agentId } = agentEntry;
+
+  // Fetch canonical name from API (needed for named-agent hash)
+  let agentApiName: string | null = null;
+  try {
+    const agent = await getAgent(agentId);
+    agentApiName = (agent as any).name ?? null;
+  } catch {
+    console.log(fmt.warn('Could not fetch agent details — proceeding without name confirmation'));
+  }
+
+  console.log('\n' + fmt.header('Check Key Binding'));
+  console.log(`  Agent: ${agentName} (${agentId})`);
+  console.log();
+
+  let key = (process.env.SMOLTBOT_CHECK_KEY ?? '').trim();
+  if (!key) {
+    key = (await askInput('Enter the API key to check:', true)).trim();
+  }
+  if (!key) {
+    console.log(fmt.error('No key provided') + '\n');
+    process.exit(1);
+  }
+
+  const keyHash = computeAgentHash(key, agentApiName);
+
+  let result: { bound: boolean; key_prefix: string | null };
+  try {
+    result = await verifyBinding(agentId, keyHash);
+  } catch (err) {
+    console.log(fmt.error(err instanceof Error ? err.message : String(err)) + '\n');
+    process.exit(1);
+  }
+
+  if (result.bound) {
+    console.log(fmt.success('Key is bound to this agent') + '\n');
+  } else {
+    console.log(fmt.error('Key is NOT bound to this agent') + '\n');
+  }
+  if (result.key_prefix) {
+    const label = result.bound ? 'Key prefix:    ' : 'Current prefix:';
+    console.log(fmt.label(label, ` ${result.key_prefix}…`) + '\n');
+  }
 }

@@ -177,6 +177,7 @@ interface Agent {
   email: string | null;
   aip_enforcement_mode?: string;
   linked_agent_id?: string | null;
+  key_prefix?: string | null;
 }
 
 interface AlignmentCard {
@@ -524,7 +525,8 @@ async function sha256(content: string): Promise<string> {
 export async function getOrCreateAgent(
   agentHash: string,
   env: Env,
-  agentName?: string
+  agentName?: string,
+  keyPrefix?: string
 ): Promise<{ agent: Agent; isNew: boolean }> {
   const headers = {
     'apikey': env.SUPABASE_KEY,
@@ -576,6 +578,7 @@ export async function getOrCreateAgent(
         id: agentId,
         agent_hash: agentHash,
         ...(agentName ? { name: agentName } : {}),
+        ...(keyPrefix ? { key_prefix: keyPrefix } : {}),
         last_seen: new Date().toISOString(),
       }),
     }
@@ -689,6 +692,19 @@ export async function updateLastSeen(agentId: string, env: Env): Promise<void> {
       }),
     }
   );
+}
+
+export async function updateKeyPrefix(agentId: string, keyPrefix: string, env: Env): Promise<void> {
+  const headers = {
+    'apikey': env.SUPABASE_KEY,
+    'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+    'Content-Type': 'application/json',
+  };
+  await fetch(`${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ key_prefix: keyPrefix }),
+  });
 }
 
 /**
@@ -3916,13 +3932,22 @@ export async function handleProviderProxy(
   const otelExporter = createOTelExporter(env);
 
   try {
+    // key_prefix is always raw provider key prefix — for named agents SHA256 uses key|name
+    // but the prefix stored is always apiKey.slice(0, 16) (not the combined string prefix)
+    const keyPrefix = apiKey ? apiKey.slice(0, 16) : undefined;
+
     // Hash the API key for agent identification
     const agentHash = agentName
       ? await hashApiKey(apiKey + '|' + agentName)
       : await hashApiKey(apiKey);
 
     // Get or create the agent
-    const { agent } = await getOrCreateAgent(agentHash, env, agentName);
+    const { agent, isNew } = await getOrCreateAgent(agentHash, env, agentName, keyPrefix);
+
+    // Backfill key_prefix for existing agents that predate key prefix tracking
+    if (!isNew && !agent.key_prefix && keyPrefix) {
+      ctx.waitUntil(updateKeyPrefix(agent.id, keyPrefix, env));
+    }
 
     // Generate session ID
     const sessionId = generateSessionId(agentHash);
