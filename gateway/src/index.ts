@@ -73,6 +73,7 @@ import {
   type CFDThreatPattern,
   type SourceType,
 } from '@mnemom/cfd';
+import { jwtVerify } from 'jose';
 
 // ============================================================================
 // Bootstrapping Defaults
@@ -164,6 +165,7 @@ export interface Env {
   KV?: KVNamespace;
   // Context Front Door
   CFD_ENABLED?: string;  // "true" to enable CFD DB fetches; default off to avoid test interference
+  SUPABASE_JWT_SECRET?: string;  // HS256 secret for Supabase JWT signature verification
 }
 
 interface Agent {
@@ -478,6 +480,23 @@ export async function hashApiKey(apiKey: string): Promise<string> {
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   return hashHex.substring(0, 16);
+}
+
+/**
+ * Returns true if the token is structurally JWT-shaped (three dot-separated parts).
+ * Supabase JWTs always match this pattern; raw LLM API keys (sk-ant-..., sk-proj-...) do not.
+ */
+function looksLikeJwt(token: string): boolean {
+  return token.split('.').length === 3;
+}
+
+/**
+ * Verify a Supabase-issued HS256 JWT using the project JWT secret.
+ * Throws if the token is invalid, expired, or uses an unexpected algorithm.
+ */
+async function verifySupabaseJwt(token: string, secret: string): Promise<void> {
+  const key = new TextEncoder().encode(secret);
+  await jwtVerify(token, key, { algorithms: ['HS256'] });
 }
 
 /**
@@ -3927,6 +3946,26 @@ export async function handleProviderProxy(
         headers: { 'Content-Type': 'application/json' },
       }
     );
+  }
+
+  // JWT signature verification for Supabase-issued tokens.
+  // Only applies to JWT-shaped Bearer tokens (3 dot-separated parts).
+  // Raw LLM provider API keys (sk-ant-..., sk-proj-...) pass through unchanged.
+  if (looksLikeJwt(apiKey)) {
+    if (!env.SUPABASE_JWT_SECRET) {
+      // Secret not yet configured — fail open to allow safe deploy-before-secret-set.
+      // Once the secret is set in both environments, all JWTs will be verified.
+      console.warn('[gateway] SUPABASE_JWT_SECRET not set; skipping JWT verification');
+    } else {
+      try {
+        await verifySupabaseJwt(apiKey, env.SUPABASE_JWT_SECRET);
+      } catch {
+        return new Response(
+          JSON.stringify({ error: 'Invalid or expired token', type: 'authentication_error' }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+    }
   }
 
   const otelExporter = createOTelExporter(env);

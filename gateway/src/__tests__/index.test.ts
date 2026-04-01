@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { SignJWT } from 'jose';
 import {
   hashApiKey,
   generateSessionId,
@@ -7,6 +8,7 @@ import {
   buildMetadataHeader,
   handleHealthCheck,
   handleAnthropicProxy,
+  handleProviderProxy,
   evaluateQuota,
   hashMnemomApiKey,
   resolveQuotaContext,
@@ -2272,5 +2274,157 @@ describe('License validation', () => {
 
     // Expired JWT with no grace period → should reject
     expect(response.status).toBe(403);
+  });
+});
+
+// ============================================================================
+// JWT Signature Verification (scale/step-03)
+// ============================================================================
+
+describe('handleProviderProxy — JWT signature verification', () => {
+  const TEST_SECRET = 'test-supabase-jwt-secret-32chars!!';
+
+  async function makeJwt(signingSecret: string, expiresIn = '1h'): Promise<string> {
+    const key = new TextEncoder().encode(signingSecret);
+    return new SignJWT({ sub: 'test-user-id' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuedAt()
+      .setExpirationTime(expiresIn)
+      .sign(key);
+  }
+
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it('rejects a JWT-shaped Bearer token with an invalid signature (401)', async () => {
+    const env = createTestEnv({ SUPABASE_JWT_SECRET: TEST_SECRET });
+    // Valid JWT structure but signature is garbage — jose will reject it
+    const badJwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.invalidsignatureXXX';
+    const request = new Request('https://gateway.mnemom.ai/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${badJwt}` },
+    });
+
+    const response = await handleProviderProxy(request, env, createMockContext(), 'openai');
+
+    expect(response.status).toBe(401);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.type).toBe('authentication_error');
+    expect(body.error).toBe('Invalid or expired token');
+    // Verify no downstream calls were made — auth failed before agent lookup
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('accepts a valid HS256 JWT and proceeds to agent identification', async () => {
+    const env = createTestEnv({ SUPABASE_JWT_SECRET: TEST_SECRET });
+    const jwt = await makeJwt(TEST_SECRET);
+
+    const existingAgent = {
+      id: 'agent-uuid-jwt',
+      agent_hash: 'abcdef0123456789',
+      key_prefix: 'eyJhbGciOiJIUzI1',
+      name: null,
+      created_at: '2024-01-01T00:00:00Z',
+      last_seen: '2024-01-15T10:00:00Z',
+    };
+
+    // Agent lookup
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve([existingAgent]) });
+    // Quota context RPC
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        plan_id: 'plan-free',
+        billing_model: 'none',
+        subscription_status: 'none',
+        included_checks: 0,
+        check_count_this_period: 0,
+        overage_threshold: null,
+        per_check_price: 0,
+        feature_flags: {},
+        limits: {},
+        account_id: null,
+        current_period_end: null,
+        past_due_since: null,
+        is_suspended: false,
+        agent_settings: null,
+        per_proof_price: 0,
+      }),
+    });
+    // Policy fetch RPC
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(null) });
+    // Forward to CF AI Gateway
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ id: 'chatcmpl-123' }), {
+        status: 200,
+        statusText: 'OK',
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+
+    const request = new Request('https://gateway.mnemom.ai/openai/v1/models', {
+      method: 'GET',
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+
+    const response = await handleProviderProxy(request, env, createMockContext(), 'openai');
+
+    // Must not be rejected by JWT verification
+    expect(response.status).not.toBe(401);
+    // Agent lookup must have been called (JWT passed verification, reached agent identification)
+    expect(mockFetch).toHaveBeenCalled();
+  });
+
+  it('passes a raw (non-JWT-shaped) API key through unchanged when SUPABASE_JWT_SECRET is set', async () => {
+    const env = createTestEnv({ SUPABASE_JWT_SECRET: TEST_SECRET });
+    // Raw API keys do not contain dots — not JWT-shaped, skips verification
+    const rawKey = 'sk-proj-rawkey1234567890abcdef';
+
+    const existingAgent = {
+      id: 'agent-uuid-raw',
+      agent_hash: 'fedcba9876543210',
+      key_prefix: 'sk-proj-rawkey12',
+      name: null,
+      created_at: '2024-01-01T00:00:00Z',
+      last_seen: '2024-01-15T10:00:00Z',
+    };
+
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve([existingAgent]) });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        plan_id: 'plan-free',
+        billing_model: 'none',
+        subscription_status: 'none',
+        included_checks: 0,
+        check_count_this_period: 0,
+        overage_threshold: null,
+        per_check_price: 0,
+        feature_flags: {},
+        limits: {},
+        account_id: null,
+        current_period_end: null,
+        past_due_since: null,
+        is_suspended: false,
+        agent_settings: null,
+        per_proof_price: 0,
+      }),
+    });
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(null) });
+    mockFetch.mockResolvedValueOnce(
+      new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    );
+
+    const request = new Request('https://gateway.mnemom.ai/openai/v1/models', {
+      method: 'GET',
+      headers: { authorization: `Bearer ${rawKey}` },
+    });
+
+    const response = await handleProviderProxy(request, env, createMockContext(), 'openai');
+
+    // JWT verification must not have fired — no 401 from JWT check
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.error).not.toBe('Invalid or expired token');
   });
 });
