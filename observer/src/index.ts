@@ -2826,7 +2826,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
     // Import Stripe dynamically to avoid import errors when key is not set
     const { default: Stripe } = await import('stripe');
     const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
-      apiVersion: '2026-01-28.clover',
+      apiVersion: '2026-02-25.clover',
       httpClient: Stripe.createFetchHttpClient(),
     });
 
