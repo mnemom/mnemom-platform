@@ -59,6 +59,7 @@ interface Env {
   TRIGGER_SECRET: string;
   PROVER_URL?: string;
   PROVER_API_KEY?: string;
+  OBSERVER_MAX_LOGS?: string; // Max logs per cron tick; default "5000"; parsed as int
 }
 
 interface GatewayLog {
@@ -102,6 +103,7 @@ interface ExtractedContext {
 interface ProcessingStats {
   processed: number;
   skipped: number;
+  logs_fetched: number;
   errors: number;
 }
 
@@ -125,7 +127,7 @@ export default {
     try {
       const stats = await processAllLogs(env, ctx, otelExporter);
       console.log(
-        `[observer] Completed - processed: ${stats.processed}, skipped: ${stats.skipped}, errors: ${stats.errors}`
+        `[observer] Completed - fetched: ${stats.logs_fetched}, processed: ${stats.processed}, skipped: ${stats.skipped}, errors: ${stats.errors}`
       );
 
       // Expire stale nudges (>4h old pending nudges)
@@ -271,37 +273,69 @@ function createOTelExporter(env: Env) {
 // ============================================================================
 
 /**
- * Process all pending logs from the AI Gateway
+ * Process all pending logs from the AI Gateway.
+ *
+ * Fetches logs in batches until the queue is exhausted or the per-tick safety
+ * limit (OBSERVER_MAX_LOGS, default 5000) is hit. Each processed/skipped log
+ * is deleted from CF AI Gateway by processLog(), which advances the queue.
+ * Because deletions advance the queue, we always fetch page 1 — incrementing
+ * the page number would skip logs that shifted into lower positions after deletion.
  */
 async function processAllLogs(
   env: Env,
   ctx: ExecutionContext,
   otelExporter?: WorkersOTelExporter | null
 ): Promise<ProcessingStats> {
-  const stats: ProcessingStats = { processed: 0, skipped: 0, errors: 0 };
+  const stats: ProcessingStats = { processed: 0, skipped: 0, errors: 0, logs_fetched: 0 };
+  const safetyLimit = parseInt(env.OBSERVER_MAX_LOGS ?? '5000', 10);
+  const batchSize = 100;
+  let lastBatchSize = batchSize; // initialize to batchSize to enter the loop
 
   try {
-    const logs = await fetchLogs(env);
-    const withMeta = logs.filter((l) => l.metadata != null).length;
-    console.log(`[observer] Found ${logs.length} logs to process (${withMeta} with metadata)`);
+    do {
+      const batch = await fetchLogs(env, batchSize);
+      lastBatchSize = batch.length;
+      stats.logs_fetched += batch.length;
 
-    for (const log of logs) {
-      try {
-        const wasProcessed = await processLog(log, env, ctx, otelExporter);
-        if (wasProcessed) {
-          stats.processed++;
-        } else {
-          stats.skipped++;
+      const withMeta = batch.filter((l) => l.metadata != null).length;
+      console.log(
+        `[observer] Batch: ${batch.length} logs (${withMeta} with metadata), total_fetched=${stats.logs_fetched}`
+      );
+
+      for (const log of batch) {
+        try {
+          const wasProcessed = await processLog(log, env, ctx, otelExporter);
+          if (wasProcessed) {
+            stats.processed++;
+          } else {
+            stats.skipped++;
+          }
+        } catch (error) {
+          console.error(`[observer] Failed to process log ${log.id}:`, error);
+          stats.errors++;
+          // Continue processing remaining logs even if one fails
         }
-      } catch (error) {
-        console.error(`[observer] Failed to process log ${log.id}:`, error);
-        stats.errors++;
-        // Continue processing other logs even if one fails
       }
-    }
+    } while (lastBatchSize === batchSize && stats.logs_fetched < safetyLimit);
   } catch (error) {
     console.error('[observer] Failed to fetch logs:', error);
     throw error;
+  }
+
+  // Structured tick summary for dashboards / alerting
+  const backlog_estimate = stats.logs_fetched >= safetyLimit ? `>=${safetyLimit}` : 0;
+  console.log(
+    JSON.stringify({
+      logs_fetched: stats.logs_fetched,
+      logs_processed: stats.processed,
+      logs_errored: stats.errors,
+      logs_skipped: stats.skipped,
+      backlog_estimate,
+    })
+  );
+
+  if (stats.logs_fetched >= safetyLimit) {
+    console.warn(`[observer] Hit safety limit (${safetyLimit} logs) — observer may be behind`);
   }
 
   return stats;
@@ -489,7 +523,7 @@ async function processLog(
 /**
  * Fetch logs from Cloudflare AI Gateway
  */
-async function fetchLogs(env: Env, limit: number = 50): Promise<GatewayLog[]> {
+async function fetchLogs(env: Env, limit: number = 100): Promise<GatewayLog[]> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai-gateway/gateways/${env.GATEWAY_ID}/logs?per_page=${limit}&order_by=created_at&order_by_direction=asc&meta_info=true`;
 
   const response = await fetch(url, {
