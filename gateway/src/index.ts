@@ -73,7 +73,7 @@ import {
   type CFDThreatPattern,
   type SourceType,
 } from '@mnemom/cfd';
-import { jwtVerify } from 'jose';
+import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ============================================================================
 // Bootstrapping Defaults
@@ -165,7 +165,6 @@ export interface Env {
   KV?: KVNamespace;
   // Context Front Door
   CFD_ENABLED?: string;  // "true" to enable CFD DB fetches; default off to avoid test interference
-  SUPABASE_JWT_SECRET?: string;  // HS256 secret for Supabase JWT signature verification
 }
 
 interface Agent {
@@ -491,12 +490,36 @@ function looksLikeJwt(token: string): boolean {
 }
 
 /**
- * Verify a Supabase-issued HS256 JWT using the project JWT secret.
- * Throws if the token is invalid, expired, or uses an unexpected algorithm.
+ * Cached JWKS remote key set per Supabase URL.
+ * Persists within a Worker isolate lifetime — jose handles key refresh internally.
  */
-async function verifySupabaseJwt(token: string, secret: string): Promise<void> {
-  const key = new TextEncoder().encode(secret);
-  await jwtVerify(token, key, { algorithms: ['HS256'] });
+let _jwksCache: ReturnType<typeof createRemoteJWKSet> | undefined;
+let _jwksCacheUrl: string | undefined;
+
+function getSupabaseJwks(supabaseUrl: string) {
+  if (!_jwksCache || _jwksCacheUrl !== supabaseUrl) {
+    _jwksCache = createRemoteJWKSet(
+      new URL('/auth/v1/.well-known/jwks.json', supabaseUrl)
+    );
+    _jwksCacheUrl = supabaseUrl;
+  }
+  return _jwksCache;
+}
+
+/** Reset the JWKS cache — for use in tests only. */
+export function _resetJwksCacheForTests(): void {
+  _jwksCache = undefined;
+  _jwksCacheUrl = undefined;
+}
+
+/**
+ * Verify a Supabase-issued JWT using the project's JWKS endpoint (ES256).
+ * Uses createRemoteJWKSet — supports key rotation automatically.
+ * Throws if the token is invalid, expired, or fails signature verification.
+ */
+async function verifySupabaseJwt(token: string, supabaseUrl: string): Promise<void> {
+  const jwks = getSupabaseJwks(supabaseUrl);
+  await jwtVerify(token, jwks, { algorithms: ['ES256'] });
 }
 
 /**
@@ -3951,20 +3974,15 @@ export async function handleProviderProxy(
   // JWT signature verification for Supabase-issued tokens.
   // Only applies to JWT-shaped Bearer tokens (3 dot-separated parts).
   // Raw LLM provider API keys (sk-ant-..., sk-proj-...) pass through unchanged.
+  // Uses JWKS (ES256) — no extra secret needed, key rotation handled automatically.
   if (looksLikeJwt(apiKey)) {
-    if (!env.SUPABASE_JWT_SECRET) {
-      // Secret not yet configured — fail open to allow safe deploy-before-secret-set.
-      // Once the secret is set in both environments, all JWTs will be verified.
-      console.warn('[gateway] SUPABASE_JWT_SECRET not set; skipping JWT verification');
-    } else {
-      try {
-        await verifySupabaseJwt(apiKey, env.SUPABASE_JWT_SECRET);
-      } catch {
-        return new Response(
-          JSON.stringify({ error: 'Invalid or expired token', type: 'authentication_error' }),
-          { status: 401, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
+    try {
+      await verifySupabaseJwt(apiKey, env.SUPABASE_URL);
+    } catch {
+      return new Response(
+        JSON.stringify({ error: 'Invalid or expired token', type: 'authentication_error' }),
+        { status: 401, headers: { 'Content-Type': 'application/json' } },
+      );
     }
   }
 
