@@ -1,5 +1,13 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SignJWT } from 'jose';
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from 'vitest';
+import { SignJWT, generateKeyPair } from 'jose';
+
+// Mock createRemoteJWKSet so JWT tests can control the returned JWKS key function.
+// All other jose exports are passed through unchanged.
+vi.mock('jose', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('jose')>();
+  return { ...actual, createRemoteJWKSet: vi.fn() };
+});
+import { createRemoteJWKSet } from 'jose';
 import {
   hashApiKey,
   generateSessionId,
@@ -9,6 +17,7 @@ import {
   handleHealthCheck,
   handleAnthropicProxy,
   handleProviderProxy,
+  _resetJwksCacheForTests,
   evaluateQuota,
   hashMnemomApiKey,
   resolveQuotaContext,
@@ -2278,29 +2287,53 @@ describe('License validation', () => {
 });
 
 // ============================================================================
-// JWT Signature Verification (scale/step-03)
+// JWT Signature Verification — ES256 via JWKS (scale/step-03b)
 // ============================================================================
 
-describe('handleProviderProxy — JWT signature verification', () => {
-  const TEST_SECRET = 'test-supabase-jwt-secret-32chars!!';
+describe('handleProviderProxy — JWT signature verification (ES256/JWKS)', () => {
+  // Generated once per describe block — ES256 P-256 key pair
+  let privateKey: CryptoKey;
+  let publicKey: CryptoKey;
 
-  async function makeJwt(signingSecret: string, expiresIn = '1h'): Promise<string> {
-    const key = new TextEncoder().encode(signingSecret);
+  beforeAll(async () => {
+    const pair = await generateKeyPair('ES256');
+    privateKey = pair.privateKey;
+    publicKey = pair.publicKey;
+  });
+
+  async function makeJwt(expiresIn = '1h'): Promise<string> {
     return new SignJWT({ sub: 'test-user-id' })
-      .setProtectedHeader({ alg: 'HS256' })
+      .setProtectedHeader({ alg: 'ES256' })
       .setIssuedAt()
       .setExpirationTime(expiresIn)
-      .sign(key);
+      .sign(privateKey);
+  }
+
+  // Configure createRemoteJWKSet (already mocked via vi.mock at top of file)
+  // to return a JWKS key function that resolves to the given CryptoKey.
+  function stubJwksWithKey(key: CryptoKey) {
+    vi.mocked(createRemoteJWKSet).mockReturnValue(async () => key);
+    _resetJwksCacheForTests(); // force getSupabaseJwks() to call createRemoteJWKSet again
+  }
+
+  // Configure createRemoteJWKSet to return a function that throws — simulates bad/missing key.
+  function stubJwksThrows() {
+    vi.mocked(createRemoteJWKSet).mockReturnValue(async () => {
+      throw new Error('JWSSignatureVerificationFailed');
+    });
+    _resetJwksCacheForTests();
   }
 
   beforeEach(() => {
     mockFetch.mockReset();
+    _resetJwksCacheForTests();
   });
 
   it('rejects a JWT-shaped Bearer token with an invalid signature (401)', async () => {
-    const env = createTestEnv({ SUPABASE_JWT_SECRET: TEST_SECRET });
-    // Valid JWT structure but signature is garbage — jose will reject it
-    const badJwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.invalidsignatureXXX';
+    stubJwksThrows(); // JWKS returns a key that won't match the bad token's sig
+    const env = createTestEnv();
+    // Structurally valid JWT but with a garbage signature
+    const badJwt = 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.invalidsignatureXXXXXXXXX';
     const request = new Request('https://gateway.mnemom.ai/openai/v1/chat/completions', {
       method: 'POST',
       headers: { authorization: `Bearer ${badJwt}` },
@@ -2312,26 +2345,25 @@ describe('handleProviderProxy — JWT signature verification', () => {
     const body = await response.json() as Record<string, unknown>;
     expect(body.type).toBe('authentication_error');
     expect(body.error).toBe('Invalid or expired token');
-    // Verify no downstream calls were made — auth failed before agent lookup
+    // No downstream calls — auth failed before agent lookup
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it('accepts a valid HS256 JWT and proceeds to agent identification', async () => {
-    const env = createTestEnv({ SUPABASE_JWT_SECRET: TEST_SECRET });
-    const jwt = await makeJwt(TEST_SECRET);
+  it('accepts a valid ES256 JWT and proceeds to agent identification', async () => {
+    stubJwksWithKey(publicKey); // JWKS returns the matching public key
+    const env = createTestEnv();
+    const jwt = await makeJwt();
 
     const existingAgent = {
       id: 'agent-uuid-jwt',
       agent_hash: 'abcdef0123456789',
-      key_prefix: 'eyJhbGciOiJIUzI1',
+      key_prefix: 'eyJhbGciOiJFUzI1',
       name: null,
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
     };
 
-    // Agent lookup
     mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve([existingAgent]) });
-    // Quota context RPC
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve({
@@ -2352,9 +2384,7 @@ describe('handleProviderProxy — JWT signature verification', () => {
         per_proof_price: 0,
       }),
     });
-    // Policy fetch RPC
     mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(null) });
-    // Forward to CF AI Gateway
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ id: 'chatcmpl-123' }), {
         status: 200,
@@ -2370,15 +2400,14 @@ describe('handleProviderProxy — JWT signature verification', () => {
 
     const response = await handleProviderProxy(request, env, createMockContext(), 'openai');
 
-    // Must not be rejected by JWT verification
     expect(response.status).not.toBe(401);
-    // Agent lookup must have been called (JWT passed verification, reached agent identification)
-    expect(mockFetch).toHaveBeenCalled();
+    expect(mockFetch).toHaveBeenCalled(); // agent lookup happened — JWT cleared verification
   });
 
-  it('passes a raw (non-JWT-shaped) API key through unchanged when SUPABASE_JWT_SECRET is set', async () => {
-    const env = createTestEnv({ SUPABASE_JWT_SECRET: TEST_SECRET });
-    // Raw API keys do not contain dots — not JWT-shaped, skips verification
+  it('passes a raw (non-JWT-shaped) API key through without calling createRemoteJWKSet', async () => {
+    vi.mocked(createRemoteJWKSet).mockClear();
+    _resetJwksCacheForTests();
+    const env = createTestEnv();
     const rawKey = 'sk-proj-rawkey1234567890abcdef';
 
     const existingAgent = {
@@ -2423,8 +2452,9 @@ describe('handleProviderProxy — JWT signature verification', () => {
 
     const response = await handleProviderProxy(request, env, createMockContext(), 'openai');
 
-    // JWT verification must not have fired — no 401 from JWT check
     const body = await response.json() as Record<string, unknown>;
     expect(body.error).not.toBe('Invalid or expired token');
+    // JWKS was never invoked — raw key skips JWT verification entirely
+    expect(vi.mocked(createRemoteJWKSet)).not.toHaveBeenCalled();
   });
 });
