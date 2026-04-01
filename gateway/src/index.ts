@@ -1577,9 +1577,14 @@ async function injectPendingNudges(
   agentId: string,
   enforcementMode: string,
   env: Env,
-  provider: GatewayProvider = 'anthropic'
+  provider: GatewayProvider = 'anthropic',
+  options?: { includePreemptive?: boolean }
 ): Promise<string[]> {
-  if (enforcementMode !== 'nudge' && enforcementMode !== 'enforce') {
+  const shouldInject =
+    enforcementMode === 'nudge' ||
+    enforcementMode === 'enforce' ||
+    options?.includePreemptive === true;
+  if (!shouldInject) {
     return [];
   }
 
@@ -2038,9 +2043,9 @@ async function analyzeStreamInBackground(
               overall_risk: 1.0,
               threats: [{ type: 'indirect_injection' as const, confidence: 1.0,
                 reasoning: 'Canary credential detected in streaming agent response — confirmed compromise' }],
-              l1_score: 1.0,
+              detector_scores: { CanaryMatcher: 1.0, PatternMatcher: null, SemanticAnalyzer: null },
+              detection_sources: ['CanaryMatcher'],
               session_multiplier: 1.0,
-              detection_layer: 'l1',
               duration_ms: 0,
             }, 'canary', env);
           }
@@ -2061,9 +2066,9 @@ async function analyzeStreamInBackground(
               confidence: 0.95,
               reasoning: `Outbound DLP (streaming): ${m.type} detected`,
             })),
-            l1_score: 0.9,
+            detector_scores: { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
+            detection_sources: ['DLPScanner'],
             session_multiplier: 1.0,
-            detection_layer: 'l1' as const,
             duration_ms: 0,
           }, 'outbound', env);
         }
@@ -2737,7 +2742,7 @@ async function deliverCFDWebhooks(
         top_threat: topThreat
           ? { type: topThreat.type, confidence: topThreat.confidence, reasoning: topThreat.reasoning }
           : null,
-        detection_layer: decision.detection_layer,
+        detection_sources: decision.detection_sources,
         ...(decision.quarantine_id
           ? { review_url: `https://app.mnemom.com/cfd/quarantine/${decision.quarantine_id}` }
           : {}),
@@ -3675,7 +3680,8 @@ async function logCFDEvaluation(
         verdict: decision.verdict,
         threats: decision.threats,
         overall_risk: decision.overall_risk,
-        l1_score: decision.l1_score,
+        detector_scores: decision.detector_scores,
+        detection_sources: decision.detection_sources,
         session_multiplier: decision.session_multiplier,
         decorated: decision.verdict === 'warn',
         quarantine_id: decision.quarantine_id ?? null,
@@ -3767,6 +3773,7 @@ async function markCanaryTriggered(agentId: string, canaryValue: string, env: En
 /** Write a pre-emptive CFD nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
+  sessionId: string,
   nudge: { nudge_content: string; threat_type: string; cfd_score: number; pre_emptive: true },
   env: Env
 ): Promise<void> {
@@ -3781,6 +3788,8 @@ async function writePreemptiveNudge(
       },
       body: JSON.stringify({
         agent_id: agentId,
+        session_id: sessionId,
+        // checkpoint_id intentionally omitted — NULL means CFD-originated (see migration 107)
         status: 'pending',
         concerns_summary: nudge.nudge_content,
         metadata: {
@@ -3872,9 +3881,10 @@ async function runObserveCFD(
 
     let finalThreats = l1.threats;
     let finalScore = l1.score;
-    let detectionLayer: CFDDecision['detection_layer'] = 'l1';
+    const detectorScores: Record<string, number | null> = { PatternMatcher: l1.score, SemanticAnalyzer: null };
+    const detectionSources: string[] = l1.score > 0 ? ['PatternMatcher'] : [];
 
-    if (l1.score > 0.2) {
+    if (l1.score >= 0.4) {
       const l2Raw = await callCFDAnalysisLLM(content, 'user_message', env);
       if (l2Raw) {
         const l2Result = parseL2Response(l2Raw);
@@ -3882,7 +3892,8 @@ async function runObserveCFD(
           const merged = mergeL1AndL2(l1.threats, l1.score, l2Result);
           finalThreats = merged.threats;
           finalScore = merged.score;
-          detectionLayer = 'l2';
+          detectorScores.SemanticAnalyzer = l2Result.overall_risk;
+          if (l2Result.overall_risk > 0) detectionSources.push('SemanticAnalyzer');
         }
       }
     }
@@ -3898,9 +3909,9 @@ async function runObserveCFD(
       verdict,
       overall_risk: multiplied_score,
       threats: finalThreats,
-      l1_score: l1.score,
+      detector_scores: detectorScores,
+      detection_sources: detectionSources,
       session_multiplier,
-      detection_layer: detectionLayer,
       duration_ms: Date.now() - t0,
     };
 
@@ -3915,14 +3926,14 @@ async function runObserveCFD(
 
     // Write pre-emptive nudge — will be picked up on the NEXT request for this agent
     const nudge = buildPreemptiveNudgeContent(decision);
-    if (nudge) await writePreemptiveNudge(agentId, nudge, env);
+    if (nudge) await writePreemptiveNudge(agentId, sessionId, nudge, env);
 
     console.log(JSON.stringify({
       event: 'cfd_observe',
       verdict,
-      l1_score: l1.score,
+      pattern_score: l1.score,
       multiplied_score,
-      detection_layer: detectionLayer,
+      detection_sources: detectionSources,
       threat_count: finalThreats.length,
       duration_ms: decision.duration_ms,
     }));
@@ -4127,6 +4138,7 @@ export async function handleProviderProxy(
       // ====================================================================
       // Wave 3: Conscience nudge injection (pre-forward, provider-specific)
       // ====================================================================
+      const cfdFeatureEnabled = quotaContext.feature_flags?.cfd_enabled === true;
       const agentEnforcementMode = agent.aip_enforcement_mode || 'observe';
       if (requestBody) {
         injectedNudgeIds = await injectPendingNudges(
@@ -4134,15 +4146,21 @@ export async function handleProviderProxy(
           agent.id,
           agentEnforcementMode,
           env,
-          provider
+          provider,
+          { includePreemptive: cfdFeatureEnabled }
         );
       }
 
       // ====================================================================
       // Phase 0.5: Context Front Door (CFD) — inbound threat screening
       // ====================================================================
-      const cfdFeatureEnabled = quotaContext.feature_flags?.cfd_enabled === true;
-      if (cfdFeatureEnabled && (cfdConfig.mode === 'enforce' || cfdConfig.mode === 'observe' || cfdConfig.mode === 'simulate') && requestBody !== null) {
+      if (cfdFeatureEnabled && (
+        cfdConfig.mode === 'enforce' ||
+        cfdConfig.mode === 'enforce_sync' ||
+        cfdConfig.mode === 'sovereign' ||
+        cfdConfig.mode === 'observe' ||
+        cfdConfig.mode === 'simulate'
+      ) && requestBody !== null) {
         const inboundMessage = extractLastUserMessage(requestBody as Record<string, unknown>, provider);
         if (inboundMessage) {
           if (cfdConfig.mode === 'simulate') {
@@ -4157,7 +4175,9 @@ export async function handleProviderProxy(
             const simL1 = runL1Detection(inboundMessage, simPatterns);
             let simThreats = simL1.threats;
             let simScore = simL1.score;
-            if (simL1.score > 0.2) {
+            const simDetectorScores: Record<string, number | null> = { PatternMatcher: simL1.score, SemanticAnalyzer: null };
+            const simDetectionSources: string[] = simL1.score > 0 ? ['PatternMatcher'] : [];
+            if (simL1.score >= 0.4) {
               const simL2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
               if (simL2Raw) {
                 const simL2 = parseL2Response(simL2Raw);
@@ -4165,6 +4185,8 @@ export async function handleProviderProxy(
                   const merged = mergeL1AndL2(simL1.threats, simL1.score, simL2);
                   simThreats = merged.threats;
                   simScore = merged.score;
+                  simDetectorScores.SemanticAnalyzer = simL2.overall_risk;
+                  if (simL2.overall_risk > 0) simDetectionSources.push('SemanticAnalyzer');
                 }
               }
             }
@@ -4179,7 +4201,8 @@ export async function handleProviderProxy(
             if (simVerdict !== 'pass') {
               const simDecision: CFDDecision = {
                 verdict: simVerdict, overall_risk: simMultiplied, threats: simThreats,
-                l1_score: simL1.score, session_multiplier: 1.0, detection_layer: 'l2', duration_ms: Date.now() - t0,
+                detector_scores: simDetectorScores, detection_sources: simDetectionSources,
+                session_multiplier: 1.0, duration_ms: Date.now() - t0,
               };
               ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, 'simulate', simDecision, 'user_message', env));
             }
@@ -4199,12 +4222,13 @@ export async function handleProviderProxy(
           ]);
           const l1 = runL1Detection(inboundMessage, patterns);
 
-          // L2: call Haiku for deeper analysis when L1 score > 0.2 (fast path below threshold)
+          // SemanticAnalyzer: call Haiku for deeper analysis when PatternMatcher score >= 0.4
           let finalThreats = l1.threats;
           let finalScore = l1.score;
-          let detectionLayer: CFDDecision['detection_layer'] = 'l1';
+          const detectorScores: Record<string, number | null> = { PatternMatcher: l1.score, SemanticAnalyzer: null };
+          const detectionSources: string[] = l1.score > 0 ? ['PatternMatcher'] : [];
 
-          if (l1.score > 0.2) {
+          if (l1.score >= 0.4) {
             const l2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
             if (l2Raw) {
               const l2Result = parseL2Response(l2Raw);
@@ -4212,7 +4236,8 @@ export async function handleProviderProxy(
                 const merged = mergeL1AndL2(l1.threats, l1.score, l2Result);
                 finalThreats = merged.threats;
                 finalScore = merged.score;
-                detectionLayer = 'l2';
+                detectorScores.SemanticAnalyzer = l2Result.overall_risk;
+                if (l2Result.overall_risk > 0) detectionSources.push('SemanticAnalyzer');
               }
             }
           }
@@ -4242,10 +4267,10 @@ export async function handleProviderProxy(
               verdict,
               overall_risk: trustAdjustedScore,
               threats: finalThreats,
-              l1_score: l1.score,
+              detector_scores: detectorScores,
+              detection_sources: detectionSources,
               session_multiplier,
               quarantine_id: quarantineId,
-              detection_layer: detectionLayer,
               duration_ms,
             };
 
@@ -4276,7 +4301,7 @@ export async function handleProviderProxy(
             // Gateway's existing injectPendingNudges() picks this up automatically
             const nudge = buildPreemptiveNudgeContent(decision);
             if (nudge) {
-              ctx.waitUntil(writePreemptiveNudge(agent.id, nudge, env));
+              ctx.waitUntil(writePreemptiveNudge(agent.id, sessionId, nudge, env));
             }
           }
 
@@ -4287,10 +4312,11 @@ export async function handleProviderProxy(
           console.log(JSON.stringify({
             event: 'cfd',
             verdict,
-            l1_score: l1.score,
+            pattern_score: l1.score,
             multiplied_score: trustAdjustedScore,
             session_multiplier,
-            threat_count: finalThreats.length, detection_layer: detectionLayer,
+            threat_count: finalThreats.length,
+            detection_sources: detectionSources,
             duration_ms,
           }));
 
@@ -4304,9 +4330,9 @@ export async function handleProviderProxy(
                   verdict: tl1.score >= cfdConfig.thresholds.quarantine ? 'quarantine' : 'warn',
                   overall_risk: tl1.score,
                   threats: tl1.threats,
-                  l1_score: tl1.score,
+                  detector_scores: { PatternMatcher: tl1.score, SemanticAnalyzer: null },
+                  detection_sources: ['PatternMatcher'],
                   session_multiplier: 1.0,
-                  detection_layer: 'l1',
                   duration_ms: 0,
                 });
                 // Replace the tool result content in requestBody in-place
@@ -4315,9 +4341,9 @@ export async function handleProviderProxy(
                   verdict: decorated.verdict,
                   overall_risk: tl1.score,
                   threats: tl1.threats,
-                  l1_score: tl1.score,
+                  detector_scores: { PatternMatcher: tl1.score, SemanticAnalyzer: null },
+                  detection_sources: ['PatternMatcher'],
                   session_multiplier: 1.0,
-                  detection_layer: 'l1',
                   duration_ms: 0,
                 }, 'tool_result', env));
                 console.log(JSON.stringify({ event: 'cfd_tool_result', verdict: decorated.verdict, score: tl1.score }));
@@ -4643,9 +4669,9 @@ export async function handleProviderProxy(
             verdict: 'block',
             overall_risk: 1.0,
             threats: [{ type: 'indirect_injection', confidence: 1.0, reasoning: 'Canary credential detected in agent response — confirmed compromise' }],
-            l1_score: 1.0,
+            detector_scores: { CanaryMatcher: 1.0, PatternMatcher: null, SemanticAnalyzer: null },
+            detection_sources: ['CanaryMatcher'],
             session_multiplier: 1.0,
-            detection_layer: 'l1',
             duration_ms: 0,
           }, 'canary', env));
         }
@@ -4751,9 +4777,9 @@ export async function handleProviderProxy(
                   confidence: 0.95,
                   reasoning: `Outbound DLP: ${m.type} detected in agent response`,
                 })),
-                l1_score: 0.9,
+                detector_scores: { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
+                detection_sources: ['DLPScanner'],
                 session_multiplier: 1.0,
-                detection_layer: 'l1' as const,
                 duration_ms: 0,
               }, 'outbound', env));
               console.log(JSON.stringify({
