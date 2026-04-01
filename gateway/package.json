@@ -14,7 +14,8 @@
     "@mnemom/cfd": "file:../shared/cfd",
     "@mnemom/policy-engine": "file:../shared/policy-engine",
     "@noble/ed25519": "^3.0.0",
-    "@noble/hashes": "^2.0.1"
+    "@noble/hashes": "^2.0.1",
+    "jose": "^5.0.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240117.0",
