@@ -4,7 +4,7 @@ import { requireAgent } from "../lib/config.js";
 import { fmt } from "../lib/format.js";
 import { askYesNo, isInteractive } from "../lib/prompt.js";
 import { getPolicy, publishPolicy, type PolicyResponse } from "../lib/api.js";
-import { requireAccessToken } from "../lib/auth.js";
+import { requireAuth } from "../lib/auth.js";
 import {
   validatePolicySchema,
   evaluatePolicy,
@@ -301,7 +301,7 @@ export async function policyPublishCommand(
   console.log();
 
   // Require authentication
-  await requireAccessToken();
+  await requireAuth();
 
   // Confirm
   if (isInteractive()) {
@@ -402,7 +402,7 @@ export async function policyTestCommand(
   }
 
   // Require authentication
-  await requireAccessToken();
+  await requireAuth();
 
   console.log(`\nTesting policy against historical traces for agent ${agent.agentId}...\n`);
 

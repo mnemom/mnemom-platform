@@ -1,5 +1,5 @@
 import { getApiUrl } from "./config.js";
-import { getAccessToken } from "./auth.js";
+import { resolveAuth } from "./auth.js";
 
 export const API_BASE = getApiUrl();
 
@@ -68,12 +68,14 @@ async function fetchApi<T>(endpoint: string): Promise<T> {
 
 export async function postApi<T>(endpoint: string, body: unknown): Promise<T> {
   const url = validateUrl(`${API_BASE}${endpoint}`);
-  const token = await getAccessToken();
+  const cred = await resolveAuth();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
+  if (cred.type === "jwt") {
+    headers["Authorization"] = `Bearer ${cred.token}`;
+  } else if (cred.type === "api-key") {
+    headers["X-Mnemom-Api-Key"] = cred.key;
   }
 
   const response = await fetch(url, { // lgtm[js/file-data-url]
@@ -106,13 +108,19 @@ export async function verifyBinding(
 }
 
 /**
- * Build auth headers if a token is available.
+ * Build auth headers from the best available credential.
  * Returns empty object when unauthenticated (read-only calls).
  */
 async function authHeaders(): Promise<Record<string, string>> {
-  const token = await getAccessToken();
-  if (!token) return {};
-  return { Authorization: `Bearer ${sanitizeForHttp(token)}` };
+  const cred = await resolveAuth();
+  switch (cred.type) {
+    case "jwt":
+      return { Authorization: `Bearer ${sanitizeForHttp(cred.token)}` };
+    case "api-key":
+      return { "X-Mnemom-Api-Key": sanitizeForHttp(cred.key) };
+    case "none":
+      return {};
+  }
 }
 
 export async function getAgent(id: string): Promise<Agent> {
@@ -134,7 +142,7 @@ export async function listAgents(): Promise<AgentListItem[]> {
   const response = await fetch(url, { headers: await authHeaders() });
   if (!response.ok) {
     if (response.status === 401) {
-      throw new Error("Not logged in. Run `smoltbot login` first.");
+      throw new Error("Not authenticated. Run `smoltbot login` or set MNEMOM_API_KEY.");
     }
     const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
     throw new Error(err.message || `Failed to list agents: ${response.status}`);
