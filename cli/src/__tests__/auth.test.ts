@@ -42,6 +42,7 @@ describe("auth", () => {
 
     it("should return config mnemomApiKey when no env var", () => {
       vi.mocked(loadConfig).mockReturnValue({
+        version: 2,
         gateway: "https://gateway.mnemom.ai",
         agents: {},
         defaultAgent: "default",
@@ -53,6 +54,7 @@ describe("auth", () => {
     it("should prefer env var over config", () => {
       process.env.MNEMOM_API_KEY = "mnm_env_key";
       vi.mocked(loadConfig).mockReturnValue({
+        version: 2,
         gateway: "https://gateway.mnemom.ai",
         agents: {},
         defaultAgent: "default",
@@ -93,6 +95,7 @@ describe("auth", () => {
 
     it("should fall back to config API key", async () => {
       vi.mocked(loadConfig).mockReturnValue({
+        version: 2,
         gateway: "https://gateway.mnemom.ai",
         agents: {},
         defaultAgent: "default",
