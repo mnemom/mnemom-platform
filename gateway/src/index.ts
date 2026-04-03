@@ -1298,8 +1298,8 @@ function shouldProve(
       console.log(`[gateway/proof] shouldProve=deferred: ${policyCardGaps.length} card_gaps detected, deferring to DDR`);
       return 'deferred';
     }
-    // No card-gap info: apply boundary cap (default 100% = always prove)
-    const cap = (agentSettings.proof_boundary_cap ?? 100) / 100;
+    // No card-gap info: apply boundary cap (default 5% stochastic sampling)
+    const cap = (agentSettings.proof_boundary_cap ?? 5) / 100;
     if (cap >= 1) return 'prove';
     const bytes = new Uint8Array(4);
     crypto.getRandomValues(bytes);
@@ -2271,8 +2271,13 @@ async function analyzeStreamInBackground(
       await otelExporter.flush();
     }
 
-    // 13b. Request ZK proof if enabled (streaming path has no policy eval, so no card_gaps)
-    const proofDecision = shouldProve(checkpoint, agentSettings, null);
+    // 13b. Request ZK proof if enabled
+    // Streaming path has no policy eval, so card_gaps are unknown.
+    // Defer all streaming boundary violations to DDR reconciliation,
+    // which will classify as card_gap/noise (skip) or aip_miss (prove).
+    const proofDecision = checkpoint.verdict === 'boundary_violation'
+      ? 'deferred' as const
+      : shouldProve(checkpoint, agentSettings, null);
     if (proofDecision === 'prove') {
       await requestProof(
         checkpoint.checkpoint_id,
