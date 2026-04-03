@@ -1,7 +1,16 @@
 import * as http from "node:http";
 import * as crypto from "node:crypto";
 import { exec } from "node:child_process";
-import { getApiUrl, getWebsiteUrl, getAuthInfo, saveAuthTokens, type AuthTokens } from "./config.js";
+import { getApiUrl, getWebsiteUrl, getAuthInfo, saveAuthTokens, loadConfig, type AuthTokens } from "./config.js";
+
+// ============================================================================
+// Auth Credential Types
+// ============================================================================
+
+export type AuthCredential =
+  | { type: "jwt"; token: string }
+  | { type: "api-key"; key: string }
+  | { type: "none" };
 
 /** Sanitize file-sourced data before use in outbound HTTP requests. */
 function sanitizeForHttp(data: string): string {
@@ -47,6 +56,51 @@ export async function requireAccessToken(): Promise<string> {
     process.exit(1);
   }
   return token;
+}
+
+/**
+ * Get the Mnemom API key from env var or config.
+ *
+ * Resolution order:
+ *  1. MNEMOM_API_KEY environment variable
+ *  2. Stored mnemomApiKey from config
+ */
+export function getMnemomApiKey(): string | null {
+  const envKey = process.env.MNEMOM_API_KEY;
+  if (envKey) return envKey;
+
+  const config = loadConfig();
+  return config?.mnemomApiKey ?? null;
+}
+
+/**
+ * Resolve the best available auth credential.
+ *
+ * Resolution order:
+ *  1. JWT (SMOLTBOT_TOKEN env or stored token with auto-refresh)
+ *  2. API key (MNEMOM_API_KEY env or config mnemomApiKey)
+ *  3. None
+ */
+export async function resolveAuth(): Promise<AuthCredential> {
+  const jwt = await getAccessToken();
+  if (jwt) return { type: "jwt", token: jwt };
+
+  const apiKey = getMnemomApiKey();
+  if (apiKey) return { type: "api-key", key: apiKey };
+
+  return { type: "none" };
+}
+
+/**
+ * Require authentication (JWT or API key) or exit with a helpful message.
+ */
+export async function requireAuth(): Promise<AuthCredential & { type: "jwt" | "api-key" }> {
+  const cred = await resolveAuth();
+  if (cred.type === "none") {
+    console.error("Authentication required. Run `smoltbot login` or set MNEMOM_API_KEY.");
+    process.exit(1);
+  }
+  return cred as AuthCredential & { type: "jwt" | "api-key" };
 }
 
 /**

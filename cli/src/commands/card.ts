@@ -9,7 +9,7 @@ import {
   type AlignmentCard,
   type CardResponse,
 } from "../lib/api.js";
-import { requireAccessToken } from "../lib/auth.js";
+import { requireAuth } from "../lib/auth.js";
 import { fmt } from "../lib/format.js";
 import { askYesNo, isInteractive } from "../lib/prompt.js";
 
@@ -447,7 +447,7 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
   }
 
   // Require authentication
-  await requireAccessToken();
+  await requireAuth();
 
   // Confirm with user
   if (isInteractive()) {
