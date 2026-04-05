@@ -25,6 +25,18 @@ runs:
         cache-dependency-path: ${{ inputs.workspace }}/package-lock.json
         registry-url: ${{ inputs.registry-url }}
 
+    - name: Build shared packages
+      shell: bash
+      run: |
+        # Build shared packages that workspaces depend on via file: references.
+        # Must run before workspace npm ci so type declarations are available.
+        for pkg in shared/policy-engine shared/cfd; do
+          if [ -d "$pkg" ]; then
+            echo "Building $pkg..."
+            (cd "$pkg" && npm ci --silent && npm run build)
+          fi
+        done
+
     - name: Install dependencies
       shell: bash
       working-directory: ${{ inputs.workspace }}
