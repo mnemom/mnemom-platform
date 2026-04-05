@@ -1,6 +1,6 @@
 /**
  * Multilingual signal word lists for CFD L1 BEC/social engineering detection.
- * Covers the industry-standard 8 languages (EN/FR/DE/IT/ES/PT/JA/ZH).
+ * Covers 10 languages (EN/FR/DE/IT/ES/PT/JA/ZH/AR/KO).
  * Research basis: confirmed BEC attack patterns in 13+ languages per FBI IC3/SC Media.
  */
 
@@ -36,6 +36,10 @@ export const MULTILINGUAL_SIGNALS: MultilingualSignals = {
          '直ちに','期限','緊迫','今日中','急ぎ','速やかに','早急に'],
     zh: ['立刻','紧急','马上','立即','赶快','尽快','迫切',
          '刻不容缓','截止','紧迫','今天内','赶紧','即刻','火速'],
+    ar: ['فوري','عاجل','الآن','فوراً','حالاً','بسرعة','دون تأخير',
+         'على الفور','في أسرع وقت','اليوم','موعد نهائي','ينتهي','انتهى','لا وقت'],
+    ko: ['즉시','긴급','빨리','지금','바로','지체없이','서둘러',
+         '신속히','오늘','마감일','기한','급하게','즉각','빠른'],
   },
   authority: {
     en: ['CEO','CFO','president','executive','director','VP','boss','manager',
@@ -60,6 +64,10 @@ export const MULTILINGUAL_SIGNALS: MultilingualSignals = {
          '法務','当局','役員','本社','経営陣','幹部','理事'],
     zh: ['总裁','CEO','董事长','总经理','主管','老板','合规',
          '法律','当局','负责人','总部','管理层','高管','理事'],
+    ar: ['المدير','الرئيس','المدير التنفيذي','المدير المالي','القانوني',
+         'الامتثال','المراجع','رئيس مجلس','سلطة','مسؤول','تنفيذي','هيئة'],
+    ko: ['대표','사장','이사','부장','임원','법무','재무',
+         '준법감시','감사','회장','대표이사','CEO','CFO'],
   },
   financial: {
     en: ['wire transfer','bank transfer','ACH transfer','send money','send funds',
@@ -85,6 +93,10 @@ export const MULTILINGUAL_SIGNALS: MultilingualSignals = {
          '請求書','資金移動','入金','振り込み','資金送金','為替'],
     zh: ['转账','银行转账','汇款','账号','IBAN','付款',
          '发票','资金转移','打款','划款','汇出','资金'],
+    ar: ['تحويل','حوالة','دفع','فاتورة','حساب','تحويل بنكي',
+         'مبلغ','أموال','بيتكوين','عملة رقمية','بطاقة هدية','رقم حساب'],
+    ko: ['계좌이체','송금','결제','청구서','계좌번호','비트코인',
+         '가상화폐','상품권','결제정보','이체','지불','대금'],
   },
   secrecy: {
     en: ['don\'t tell','keep secret','confidential','between us','no one else',
@@ -107,6 +119,10 @@ export const MULTILINGUAL_SIGNALS: MultilingualSignals = {
          '黙って','口外しないで','内緒','秘密にして','誰にも知らせないで'],
     zh: ['保密','秘密','机密','不要告诉别人','不经批准',
          '悄悄地','不要透露','私下','不要让别人知道','只有你知道'],
+    ar: ['سري','بيننا','لا تخبر','حافظ على السرية','لا تذكر',
+         'فيما بيننا','خاص','بدون إذن','سراً','دون علم'],
+    ko: ['비밀','우리끼리','말하지마','기밀','승인없이',
+         '내부적으로만','공유하지','알리지','비공개','비밀리에'],
   },
   financial_target: {
     en: ['account number','routing number','IBAN','sort code','vendor banking',
@@ -126,5 +142,9 @@ export const MULTILINGUAL_SIGNALS: MultilingualSignals = {
          '新しい口座','受取人','振込先','口座情報'],
     zh: ['账号','IBAN','银行代码','银行账户',
          '新账户','受益人','收款账户','银行信息'],
+    ar: ['رقم الحساب','ايبان','سويفت','بيانات بنكية',
+         'تفاصيل الدفع','حساب جديد','بيانات المستفيد'],
+    ko: ['계좌번호','은행계좌','새 계좌','수취인',
+         '이체정보','결제상세','계좌정보'],
   },
 };

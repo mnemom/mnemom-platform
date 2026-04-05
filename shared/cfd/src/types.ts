@@ -30,6 +30,12 @@ export interface ThreatDetection {
   matched_pattern?: string;  // for L1 pattern matches
 }
 
+// Options for runL1Detection
+export interface L1Options {
+  /** Surface type of the content — affects indirect injection pattern confidence */
+  surface?: SourceType;
+}
+
 // Full CFD evaluation result
 export interface CFDDecision {
   verdict: CFDVerdict;

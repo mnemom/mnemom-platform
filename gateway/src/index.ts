@@ -72,7 +72,18 @@ import {
   type SessionRiskState,
   type CFDThreatPattern,
   type SourceType,
+  type L1Result,
 } from '@mnemom/cfd';
+
+// ── SemanticAnalyzer trigger helper ────────────────────────────────────────
+// Languages where PatternMatcher has weaker coverage (non-Latin script).
+// For these, SemanticAnalyzer is always triggered regardless of L1 score.
+const NON_LATIN_LANGS = new Set(['ja', 'zh', 'ar', 'ko']);
+
+function shouldForceSemanticAnalysis(l1: L1Result): boolean {
+  return l1.encoding_detected === true ||
+    NON_LATIN_LANGS.has(l1.detected_lang ?? '');
+}
 import { jwtVerify, createRemoteJWKSet, type JWTPayload } from 'jose';
 
 // ============================================================================
@@ -3874,7 +3885,9 @@ async function runObserveCFD(
   sessionId: string,
   content: string,
   config: CFDConfig,
-  env: Env
+  env: Env,
+  /** Tool results to screen async alongside the user message (max 3, pre-sliced). */
+  toolResultsToScreen?: string[],
 ): Promise<void> {
   try {
     const t0 = Date.now();
@@ -3883,14 +3896,14 @@ async function runObserveCFD(
       getCFDSessionState(sessionId, env),
     ]);
 
-    const l1 = runL1Detection(content, patterns);
+    const l1 = runL1Detection(content, patterns, { surface: 'user_message' });
 
     let finalThreats = l1.threats;
     let finalScore = l1.score;
     const detectorScores: Record<string, number | null> = { PatternMatcher: l1.score, SemanticAnalyzer: null };
     const detectionSources: string[] = l1.score > 0 ? ['PatternMatcher'] : [];
 
-    if (l1.score >= 0.4) {
+    if (l1.score >= 0.4 || shouldForceSemanticAnalysis(l1)) {
       const l2Raw = await callCFDAnalysisLLM(content, 'user_message', env);
       if (l2Raw) {
         const l2Result = parseL2Response(l2Raw);
@@ -3944,6 +3957,40 @@ async function runObserveCFD(
       duration_ms: decision.duration_ms,
     }));
     incrementCFDUsage(agentId, env).catch(() => {});
+
+    // Screen tool results async (primary indirect injection surface).
+    // Always triggers SemanticAnalyzer for tool results regardless of L1 score.
+    if (toolResultsToScreen && toolResultsToScreen.length > 0) {
+      await Promise.all(toolResultsToScreen.map(async (tr) => {
+        const tl1 = runL1Detection(tr, patterns, { surface: 'tool_result' });
+        const tDetectorScores: Record<string, number | null> = { PatternMatcher: tl1.score, SemanticAnalyzer: null };
+        const tDetectionSources: string[] = tl1.score > 0 ? ['PatternMatcher'] : [];
+        // Always semantic for tool results — direct injection via tool output is the primary attack vector
+        const tl2Raw = await callCFDAnalysisLLM(tr, 'tool_result', env);
+        if (tl2Raw) {
+          const tl2 = parseL2Response(tl2Raw);
+          if (tl2) {
+            const merged = mergeL1AndL2(tl1.threats, tl1.score, tl2);
+            tDetectorScores.SemanticAnalyzer = tl2.overall_risk;
+            if (tl2.overall_risk > 0) tDetectionSources.push('SemanticAnalyzer');
+            const tMultiplied = Math.min(merged.score, 1.0);
+            const tThresholds = config.thresholds;
+            const tVerdict: CFDVerdict =
+              tMultiplied >= tThresholds.quarantine ? 'quarantine'
+              : tMultiplied >= tThresholds.warn ? 'warn' : 'pass';
+            if (tVerdict !== 'pass') {
+              const tDecision: CFDDecision = {
+                verdict: tVerdict, overall_risk: tMultiplied, threats: merged.threats,
+                detector_scores: tDetectorScores, detection_sources: tDetectionSources,
+                session_multiplier: 1.0, duration_ms: 0,
+              };
+              await logCFDEvaluation(agentId, sessionId, 'observe', tDecision, 'tool_result', env);
+              await deliverCFDWebhooks(tDecision, agentId, sessionId, env);
+            }
+          }
+        }
+      }));
+    }
   } catch (err) {
     console.warn('[cfd/observe] Error in observe-mode analysis (fail-open):', err);
   }
@@ -4186,12 +4233,12 @@ export async function handleProviderProxy(
               fetchCFDThreatPatterns(env),
               getCFDSessionState(sessionId, env),
             ]);
-            const simL1 = runL1Detection(inboundMessage, simPatterns);
+            const simL1 = runL1Detection(inboundMessage, simPatterns, { surface: 'user_message' });
             let simThreats = simL1.threats;
             let simScore = simL1.score;
             const simDetectorScores: Record<string, number | null> = { PatternMatcher: simL1.score, SemanticAnalyzer: null };
             const simDetectionSources: string[] = simL1.score > 0 ? ['PatternMatcher'] : [];
-            if (simL1.score >= 0.4) {
+            if (simL1.score >= 0.4 || shouldForceSemanticAnalysis(simL1)) {
               const simL2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
               if (simL2Raw) {
                 const simL2 = parseL2Response(simL2Raw);
@@ -4223,8 +4270,12 @@ export async function handleProviderProxy(
             // Set simulated verdict — will be emitted as X-CFD-Simulated-Verdict below
             cfdVerdict = simVerdict;
           } else if (cfdConfig.mode === 'observe') {
-            // Observe mode: pass immediately, run full analysis in background
-            ctx.waitUntil(runObserveCFD(agent.id, sessionId, inboundMessage, cfdConfig, env));
+            // Observe mode: pass immediately, run full analysis in background.
+            // Also screen tool results async if tool_result is in screen_surfaces.
+            const toolResultsForObserve = cfdConfig.screen_surfaces.includes('tool_result' as SourceType)
+              ? extractToolResults(requestBody as Record<string, unknown>, provider).slice(0, 3)
+              : [];
+            ctx.waitUntil(runObserveCFD(agent.id, sessionId, inboundMessage, cfdConfig, env, toolResultsForObserve));
             // Sync session risk read for observe mode header (KV, ~1ms)
             const observeSession = await getCFDSessionState(sessionId, env).catch(() => null);
             cfdSessionRisk = observeSession?.session_threat_level ?? 'low';
@@ -4234,15 +4285,16 @@ export async function handleProviderProxy(
             fetchCFDThreatPatterns(env),
             getCFDSessionState(sessionId, env),
           ]);
-          const l1 = runL1Detection(inboundMessage, patterns);
+          const l1 = runL1Detection(inboundMessage, patterns, { surface: 'user_message' });
 
-          // SemanticAnalyzer: call Haiku for deeper analysis when PatternMatcher score >= 0.4
+          // SemanticAnalyzer: call Haiku when PatternMatcher score >= 0.4 OR
+          // non-Latin language detected (weaker regex coverage) OR encoding trick found.
           let finalThreats = l1.threats;
           let finalScore = l1.score;
           const detectorScores: Record<string, number | null> = { PatternMatcher: l1.score, SemanticAnalyzer: null };
           const detectionSources: string[] = l1.score > 0 ? ['PatternMatcher'] : [];
 
-          if (l1.score >= 0.4) {
+          if (l1.score >= 0.4 || shouldForceSemanticAnalysis(l1)) {
             const l2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
             if (l2Raw) {
               const l2Result = parseL2Response(l2Raw);
@@ -4334,35 +4386,45 @@ export async function handleProviderProxy(
             duration_ms,
           }));
 
-          // Screen tool results (injection risk surface)
+          // Screen tool results in parallel — primary indirect injection surface.
+          // Always triggers SemanticAnalyzer (tool results should be data, not instructions).
+          // Uses real `patterns` array (not empty []) for MinHash matching.
           if (cfdConfig.screen_surfaces.includes('tool_result' as SourceType)) {
-            const toolResults = extractToolResults(requestBody as Record<string, unknown>, provider);
-            for (const toolResult of toolResults.slice(0, 3)) { // max 3 results per request
-              const tl1 = runL1Detection(toolResult, []); // patterns already fetched above; use empty for speed
-              if (tl1.score >= cfdConfig.thresholds.warn) {
-                const decorated = decorateMessage(toolResult, {
-                  verdict: tl1.score >= cfdConfig.thresholds.quarantine ? 'quarantine' : 'warn',
-                  overall_risk: tl1.score,
-                  threats: tl1.threats,
-                  detector_scores: { PatternMatcher: tl1.score, SemanticAnalyzer: null },
-                  detection_sources: ['PatternMatcher'],
-                  session_multiplier: 1.0,
-                  duration_ms: 0,
-                });
-                // Replace the tool result content in requestBody in-place
-                replaceToolResultContent(requestBody as Record<string, unknown>, toolResult, decorated.content, provider);
-                ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, {
-                  verdict: decorated.verdict,
-                  overall_risk: tl1.score,
-                  threats: tl1.threats,
-                  detector_scores: { PatternMatcher: tl1.score, SemanticAnalyzer: null },
-                  detection_sources: ['PatternMatcher'],
-                  session_multiplier: 1.0,
-                  duration_ms: 0,
-                }, 'tool_result', env));
-                console.log(JSON.stringify({ event: 'cfd_tool_result', verdict: decorated.verdict, score: tl1.score }));
+            const toolResultsList = extractToolResults(requestBody as Record<string, unknown>, provider).slice(0, 3);
+            await Promise.all(toolResultsList.map(async (toolResult) => {
+              const tl1 = runL1Detection(toolResult, patterns, { surface: 'tool_result' });
+              const tDetectorScores: Record<string, number | null> = { PatternMatcher: tl1.score, SemanticAnalyzer: null };
+              const tDetectionSources: string[] = tl1.score > 0 ? ['PatternMatcher'] : [];
+              let tFinalThreats = tl1.threats;
+              let tFinalScore = tl1.score;
+              // Always semantic for tool results
+              const tl2Raw = await callCFDAnalysisLLM(toolResult, 'tool_result', env);
+              if (tl2Raw) {
+                const tl2Result = parseL2Response(tl2Raw);
+                if (tl2Result) {
+                  const tMerged = mergeL1AndL2(tl1.threats, tl1.score, tl2Result);
+                  tFinalThreats = tMerged.threats;
+                  tFinalScore = tMerged.score;
+                  tDetectorScores.SemanticAnalyzer = tl2Result.overall_risk;
+                  if (tl2Result.overall_risk > 0) tDetectionSources.push('SemanticAnalyzer');
+                }
               }
-            }
+              const tThresholds = cfdConfig.thresholds;
+              let tVerdict: CFDVerdict = 'pass';
+              if (tFinalScore >= tThresholds.quarantine) tVerdict = 'quarantine';
+              else if (tFinalScore >= tThresholds.warn) tVerdict = 'warn';
+              if (tVerdict !== 'pass') {
+                const tDecision: CFDDecision = {
+                  verdict: tVerdict, overall_risk: tFinalScore, threats: tFinalThreats,
+                  detector_scores: tDetectorScores, detection_sources: tDetectionSources,
+                  session_multiplier: 1.0, duration_ms: 0,
+                };
+                const tAnnotated = decorateMessage(toolResult, tDecision);
+                replaceToolResultContent(requestBody as Record<string, unknown>, toolResult, tAnnotated.content, provider);
+                ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, tDecision, 'tool_result', env));
+                console.log(JSON.stringify({ event: 'cfd_tool_result', verdict: tVerdict, score: tFinalScore }));
+              }
+            }));
           }
           } // end enforce else
         }
