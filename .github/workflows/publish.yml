@@ -26,17 +26,18 @@ jobs:
 
       - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6
         with:
-          node-version: "22"
+          node-version: "20"
+          # Node 20 ships with npm 10.x which supports --provenance natively.
+          # Removed Node 22 + `npm install -g npm@latest`: GitHub Actions runners
+          # have a recurring promise-retry MODULE_NOT_FOUND corruption on Node 22
+          # that breaks npm entirely. Node 20 is unaffected.
 
-      - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@latest
-
-      - name: Install shared dependencies
+      - name: Install and build shared dependencies
         run: |
-          for dir in shared/*/; do
-            if [ -f "$dir/package.json" ]; then
-              echo "Installing deps in $dir"
-              (cd "$dir" && npm ci || npm install)
+          for pkg in shared/policy-engine shared/cfd; do
+            if [ -d "$pkg" ]; then
+              echo "Building $pkg..."
+              (cd "$pkg" && npm ci --silent && npm run build)
             fi
           done
 
