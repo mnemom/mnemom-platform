@@ -36,9 +36,50 @@ import {
   type EvaluationResult,
   type ToolReference,
 } from '@mnemom/policy-engine';
+import { createCircuitBreaker, checkAndReset, recordSuccess, recordFailure } from './circuit-breaker';
 
 const AAP_VERSION = '1.0';
 const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
+
+// ============================================================================
+// Supabase Fetch — 5s Timeout + Circuit Breaker
+// ============================================================================
+
+const observerSupabaseCircuitBreaker = createCircuitBreaker(3, 30000);
+
+/** Reset observer circuit breaker state — for use in tests only. */
+export function _resetObserverCircuitBreakerForTests(): void {
+  observerSupabaseCircuitBreaker.failures = 0;
+  observerSupabaseCircuitBreaker.lastFailure = 0;
+  observerSupabaseCircuitBreaker.isOpen = false;
+}
+
+/**
+ * Drop-in replacement for fetch() on all observer Supabase REST/RPC calls.
+ * Adds 5s AbortController timeout and circuit breaker protection.
+ * Callers retain their existing error handling and safe defaults.
+ */
+async function observerSupabaseFetch(url: string, options: RequestInit): Promise<Response> {
+  checkAndReset(observerSupabaseCircuitBreaker, 'observer-supabase');
+  if (observerSupabaseCircuitBreaker.isOpen) {
+    throw new Error('[observer-supabase] Circuit open — DB temporarily unavailable');
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    recordSuccess(observerSupabaseCircuitBreaker, 'observer-supabase');
+    return response;
+  } catch (err) {
+    recordFailure(observerSupabaseCircuitBreaker, 'observer-supabase');
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/** Exported for integration testing only. */
+export { observerSupabaseFetch as _observerSupabaseFetchForTests };
 
 // ============================================================================
 // Types
@@ -1348,11 +1389,11 @@ async function fetchCard(
 
     // Fetch card, agent exemption status, and org card template in parallel
     const [cardResponse, agentResponse, orgCardTemplateResult] = await Promise.all([
-      fetch(
+      observerSupabaseFetch(
         `${env.SUPABASE_URL}/rest/v1/alignment_cards?agent_id=eq.${agentId}&is_active=eq.true&limit=1`,
         { headers: supabaseHeaders }
       ),
-      fetch(
+      observerSupabaseFetch(
         `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=org_card_exempt&limit=1`,
         { headers: supabaseHeaders }
       ),
@@ -1398,7 +1439,7 @@ async function fetchOrgCardTemplateForObserver(
   env: Env
 ): Promise<{ card_template_enabled: boolean; card_template?: Record<string, any> } | null> {
   try {
-    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_org_card_template_for_agent`, {
+    const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_org_card_template_for_agent`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -1457,7 +1498,7 @@ async function submitTrace(
   };
 
   // Use upsert with on_conflict to ensure idempotency
-  const response = await fetch(`${env.SUPABASE_URL}/rest/v1/traces?on_conflict=trace_id`, {
+  const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/traces?on_conflict=trace_id`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_KEY,
@@ -1488,7 +1529,7 @@ async function fetchPolicyForAgent(
   agentName?: string
 ): Promise<{ orgPolicy: Policy | null; agentPolicy: Policy | null; exempt: boolean; dbPolicyId: string | null; dbPolicyVersion: number | null } | null> {
   try {
-    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
+    const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -1521,7 +1562,7 @@ async function fetchPolicyForAgent(
       const linkedId = await resolveLinkedAgentId(agentId, agentName, env);
       if (linkedId) {
         console.log(`[observer/policy] Name fallback: ${agentName} → ${linkedId}`);
-        const fallbackResponse = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
+        const fallbackResponse = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
           method: 'POST',
           headers: {
             apikey: env.SUPABASE_KEY,
@@ -1569,7 +1610,7 @@ async function resolveLinkedAgentId(
 ): Promise<string | null> {
   try {
     // First check if this agent has a linked_agent_id
-    const linkedResponse = await fetch(
+    const linkedResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=linked_agent_id&limit=1`,
       {
         headers: {
@@ -1584,7 +1625,7 @@ async function resolveLinkedAgentId(
     }
 
     // Fallback: find same-name agent with an active policy
-    const nameResponse = await fetch(
+    const nameResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/agents?name=eq.${encodeURIComponent(agentName)}&id=neq.${agentId}&select=id&limit=1`,
       {
         headers: {
@@ -1629,7 +1670,7 @@ async function submitPolicyEvaluation(
 ): Promise<void> {
   try {
     const evalId = `pe-${crypto.randomUUID().slice(0, 8)}`;
-    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/policy_evaluations`, {
+    const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/policy_evaluations`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -1688,7 +1729,7 @@ async function submitUsageEvent(
   };
 
   try {
-    const response = await fetch(
+    const response = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/usage_events`,
       {
         method: 'POST',
@@ -1747,7 +1788,7 @@ async function recoverMetadataFromCheckpoint(
         `&select=agent_id,session_id` +
         `&order=created_at.desc&limit=1`;
 
-      const response = await fetch(url, {
+      const response = await observerSupabaseFetch(url, {
         headers: {
           apikey: env.SUPABASE_KEY,
           Authorization: `Bearer ${env.SUPABASE_KEY}`,
@@ -1801,7 +1842,7 @@ async function linkCheckpointToTrace(
     // Two-step GET-then-PATCH: PostgREST ignores `limit` on PATCH, so a single
     // PATCH with limit=1 would link ALL unlinked checkpoints for this agent+session.
     // Step 1: GET the most recent unlinked checkpoint (include output analysis fields)
-    const getResponse = await fetch(
+    const getResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&linked_trace_id=is.null&order=timestamp.desc&limit=1&select=checkpoint_id,output_block_hash,analysis_scope`,
       {
         headers: {
@@ -1822,7 +1863,7 @@ async function linkCheckpointToTrace(
 
     // Step 2: PATCH that specific checkpoint by ID
     const cpId = cp.checkpoint_id;
-    const patchResponse = await fetch(
+    const patchResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?checkpoint_id=eq.${cpId}`,
       {
         method: 'PATCH',
@@ -1897,7 +1938,7 @@ async function emitCFDCalibrationSignal(
     if (checkpointVerdict !== 'boundary_violation') return;
 
     // Look up the most recent CFD evaluation for this agent+session
-    const cfdResp = await fetch(
+    const cfdResp = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/cfd_evaluations?agent_id=eq.${agentId}&session_id=eq.${sessionId}&order=created_at.desc&limit=1`,
       {
         headers: {
@@ -1925,7 +1966,7 @@ async function emitCFDCalibrationSignal(
     // Compute retroactive score: bump it up since AIP found a real violation
     const retroactiveScore = Math.min(cfdEval.overall_risk + 0.35, 0.95);
 
-    await fetch(`${env.SUPABASE_URL}/rest/v1/cfd_calibration_signals`, {
+    await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/cfd_calibration_signals`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -1966,7 +2007,7 @@ async function detectDisagreement(
     if (!verification) return;
 
     // Query the most recent checkpoint for this agent+session (now linked to this trace)
-    const cpResponse = await fetch(
+    const cpResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&linked_trace_id=eq.${traceId}&order=timestamp.desc&limit=1`,
       {
         headers: {
@@ -1999,7 +2040,7 @@ async function detectDisagreement(
     console.log(`[observer/ddr] Disagreement detected: AIP=${checkpoint.verdict}, observer verified=${verification.verified} for agent ${agentId}`);
 
     // Fetch quota context to check feature flags and DDR mode
-    const quotaResponse = await fetch(
+    const quotaResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/rpc/get_quota_context_for_agent`,
       {
         method: 'POST',
@@ -2026,7 +2067,7 @@ async function detectDisagreement(
 
     // INSERT disagreement review (idempotent via unique constraint)
     const reviewId = `ddr-${Date.now().toString(36)}-${randomHex(6)}`;
-    const insertResponse = await fetch(
+    const insertResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/disagreement_reviews`,
       {
         method: 'POST',
@@ -2089,7 +2130,7 @@ async function runReconciliation(
 
   try {
     // Mark as analyzing
-    await fetch(
+    await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/disagreement_reviews?id=eq.${reviewId}`,
       {
         method: 'PATCH',
@@ -2104,7 +2145,7 @@ async function runReconciliation(
     );
 
     // Fetch the trace for action/decision details
-    const traceResponse = await fetch(
+    const traceResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/traces?trace_id=eq.${traceId}&limit=1`,
       {
         headers: {
@@ -2124,7 +2165,7 @@ async function runReconciliation(
     }
 
     // Fetch the alignment card
-    const cardResponse = await fetch(
+    const cardResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/alignment_cards?agent_id=eq.${agentId}&is_active=eq.true&limit=1`,
       {
         headers: {
@@ -2224,7 +2265,7 @@ ${JSON.stringify(cardJson, null, 2)}
       }
 
       // Update the review with reconciliation results
-      await fetch(
+      await observerSupabaseFetch(
         `${env.SUPABASE_URL}/rest/v1/disagreement_reviews?id=eq.${reviewId}`,
         {
           method: 'PATCH',
@@ -2272,7 +2313,7 @@ ${JSON.stringify(cardJson, null, 2)}
   } catch (error) {
     // Fail-open: update review back to pending on failure
     console.warn('[observer/ddr] Reconciliation failed:', error);
-    await fetch(
+    await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/disagreement_reviews?id=eq.${reviewId}`,
       {
         method: 'PATCH',
@@ -2306,7 +2347,7 @@ async function resolveDeferredProof(
     lookupUrl.searchParams.set('select', 'proof_id,analysis_json,thinking_hash,card_hash,values_hash,model');
     lookupUrl.searchParams.set('limit', '1');
 
-    const lookupRes = await fetch(lookupUrl.toString(), {
+    const lookupRes = await observerSupabaseFetch(lookupUrl.toString(), {
       headers: {
         apikey: env.SUPABASE_KEY,
         Authorization: `Bearer ${env.SUPABASE_KEY}`,
@@ -2332,7 +2373,7 @@ async function resolveDeferredProof(
 
       const patchUrl = new URL(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`);
       patchUrl.searchParams.set('proof_id', `eq.${proof.proof_id}`);
-      await fetch(patchUrl.toString(), {
+      await observerSupabaseFetch(patchUrl.toString(), {
         method: 'PATCH',
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -2370,7 +2411,7 @@ async function resolveDeferredProof(
 
       const patchUrl = new URL(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`);
       patchUrl.searchParams.set('proof_id', `eq.${proof.proof_id}`);
-      await fetch(patchUrl.toString(), {
+      await observerSupabaseFetch(patchUrl.toString(), {
         method: 'PATCH',
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -2406,7 +2447,7 @@ async function applyCardAmendment(
     const supabaseUrl = env.SUPABASE_URL;
     const supabaseKey = env.SUPABASE_KEY;
 
-    const cardResponse = await fetch(
+    const cardResponse = await observerSupabaseFetch(
       `${supabaseUrl}/rest/v1/alignment_cards?agent_id=eq.${agentId}&is_active=eq.true&limit=1`,
       {
         headers: {
@@ -2437,7 +2478,7 @@ async function applyCardAmendment(
       }
       cardJson.autonomy_envelope.bounded_actions = currentBounded;
 
-      await fetch(
+      await observerSupabaseFetch(
         `${supabaseUrl}/rest/v1/alignment_cards?id=eq.${cardId}`,
         {
           method: 'PATCH',
@@ -2456,7 +2497,7 @@ async function applyCardAmendment(
       try {
         // 1. Insert card_amendments row
         const amendmentId = 'ca-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-        const amendRes = await fetch(`${supabaseUrl}/rest/v1/card_amendments`, {
+        const amendRes = await observerSupabaseFetch(`${supabaseUrl}/rest/v1/card_amendments`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -2481,7 +2522,7 @@ async function applyCardAmendment(
         }
 
         // 2. Call reclassify_checkpoint RPC
-        const reclRes = await fetch(`${supabaseUrl}/rest/v1/rpc/reclassify_checkpoint`, {
+        const reclRes = await observerSupabaseFetch(`${supabaseUrl}/rest/v1/rpc/reclassify_checkpoint`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -2509,7 +2550,7 @@ async function applyCardAmendment(
           peUrl.searchParams.set('agent_id', `eq.${agentId}`);
           peUrl.searchParams.set('trace_id', `eq.${traceId}`);
           peUrl.searchParams.set('card_gaps', 'neq.[]');
-          await fetch(peUrl.toString(), {
+          await observerSupabaseFetch(peUrl.toString(), {
             method: 'PATCH',
             headers: {
               'Content-Type': 'application/json',
@@ -2522,7 +2563,7 @@ async function applyCardAmendment(
         }
 
         // 4. Trigger compute_reputation_score RPC for immediate recompute
-        const scoreRes = await fetch(`${supabaseUrl}/rest/v1/rpc/compute_reputation_score`, {
+        const scoreRes = await observerSupabaseFetch(`${supabaseUrl}/rest/v1/rpc/compute_reputation_score`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -2540,7 +2581,7 @@ async function applyCardAmendment(
           if (reclData?.reclassification_id && scoreAfter !== null) {
             const reclUrl = new URL(`${supabaseUrl}/rest/v1/reclassifications`);
             reclUrl.searchParams.set('id', `eq.${reclData.reclassification_id}`);
-            await fetch(reclUrl.toString(), {
+            await observerSupabaseFetch(reclUrl.toString(), {
               method: 'PATCH',
               headers: {
                 'Content-Type': 'application/json',
@@ -2555,7 +2596,7 @@ async function applyCardAmendment(
             if (reclData.event_id) {
               const evUrl = new URL(`${supabaseUrl}/rest/v1/reputation_events`);
               evUrl.searchParams.set('id', `eq.${reclData.event_id}`);
-              await fetch(evUrl.toString(), {
+              await observerSupabaseFetch(evUrl.toString(), {
                 method: 'PATCH',
                 headers: {
                   'Content-Type': 'application/json',
@@ -2593,7 +2634,7 @@ async function applyCardAmendment(
             proofUrl.searchParams.set('select', 'id,analysis_json,thinking_hash,card_hash,values_hash,model');
             proofUrl.searchParams.set('limit', '1');
             proofUrl.searchParams.set('order', 'created_at.desc');
-            const proofRes = await fetch(proofUrl.toString(), {
+            const proofRes = await observerSupabaseFetch(proofUrl.toString(), {
               headers: {
                 apikey: supabaseKey,
                 Authorization: `Bearer ${supabaseKey}`,
@@ -2650,7 +2691,7 @@ async function applyCardAmendment(
  */
 async function runCFDRetentionCleanup(env: Env): Promise<void> {
   try {
-    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/cleanup_expired_cfd_data`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/cleanup_expired_cfd_data`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2677,7 +2718,7 @@ async function runCFDRetentionCleanup(env: Env): Promise<void> {
  */
 async function runCFDAutoPromotion(env: Env): Promise<void> {
   try {
-    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/auto_promote_cfd_patterns`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/auto_promote_cfd_patterns`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2705,7 +2746,7 @@ async function runCFDAutoPromotion(env: Env): Promise<void> {
  */
 async function runCFDAdaptiveThresholds(env: Env): Promise<void> {
   try {
-    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_cfd_threshold_suggestions`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_cfd_threshold_suggestions`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2741,7 +2782,7 @@ async function runCFDAdaptiveThresholds(env: Env): Promise<void> {
  */
 async function runCFDPatternExpiry(env: Env): Promise<void> {
   try {
-    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/expire_stale_cfd_patterns`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/expire_stale_cfd_patterns`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2768,7 +2809,7 @@ async function triggerMeteringRollup(env: Env): Promise<void> {
     const today = new Date().toISOString().split('T')[0];
 
     // Get all billing accounts that have metering events today
-    const response = await fetch(
+    const response = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/metering_events?select=account_id&timestamp=gte.${today}T00:00:00Z&order=account_id`,
       {
         headers: {
@@ -2787,7 +2828,7 @@ async function triggerMeteringRollup(env: Env): Promise<void> {
     const accountIds = [...new Set(events.map(e => e.account_id))];
 
     for (const accountId of accountIds) {
-      const rollupResponse = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/rollup_metering`, {
+      const rollupResponse = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/rollup_metering`, {
         method: 'POST',
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -2832,7 +2873,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
 
     // Fetch accounts with active metered subscriptions (checks and/or proofs)
     // Include stripe_customer_id for meter events API (proofs)
-    const accountsResponse = await fetch(
+    const accountsResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/billing_accounts?subscription_status=in.(active,trialing)&stripe_subscription_item_id=not.is.null&select=account_id,stripe_customer_id,stripe_subscription_item_id,check_count_this_period,stripe_proof_subscription_item_id,proof_count_this_period,stripe_cfd_subscription_item_id,cfd_check_count_this_period`,
       {
         headers: {
@@ -2864,7 +2905,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
     // Fetch today's proof counts from usage_daily_rollup for meter event reporting.
     // Meter events are incremental (each event adds to total), so we send daily counts
     // rather than cumulative period totals.
-    const proofRollupResponse = await fetch(
+    const proofRollupResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/usage_daily_rollup?date=eq.${today}&proof_count=gt.0&select=account_id,proof_count`,
       {
         headers: {
@@ -2899,7 +2940,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
 
         // Record check usage in stripe_usage_reports
         const checkReportId = `sur-${crypto.randomUUID().slice(0, 8)}`;
-        await fetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
+        await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
           method: 'POST',
           headers: {
             apikey: env.SUPABASE_KEY,
@@ -2937,7 +2978,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
 
           // Record proof usage in stripe_usage_reports
           const proofReportId = `sur-${crypto.randomUUID().slice(0, 8)}`;
-          await fetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
+          await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
             method: 'POST',
             headers: {
               apikey: env.SUPABASE_KEY,
@@ -2973,7 +3014,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
 
           // Record CFD usage in stripe_usage_reports
           const cfdReportId = `sur-${crypto.randomUUID().slice(0, 8)}`;
-          await fetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
+          await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
             method: 'POST',
             headers: {
               apikey: env.SUPABASE_KEY,
@@ -2993,7 +3034,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
 
         // Log billing event (combined check + proof report)
         const eventId = `be-${crypto.randomUUID().slice(0, 8)}`;
-        await fetch(`${env.SUPABASE_URL}/rest/v1/billing_events`, {
+        await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/billing_events`, {
           method: 'POST',
           headers: {
             apikey: env.SUPABASE_KEY,
@@ -3049,7 +3090,7 @@ async function checkForDrift(
 
   try {
     // Fetch recent traces for drift analysis
-    const response = await fetch(
+    const response = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/traces?agent_id=eq.${agentId}&order=timestamp.desc&limit=50`,
       {
         headers: {
@@ -3120,7 +3161,7 @@ async function writeCFDDriftTrainingTraces(
       label: 'high_risk',
     }));
 
-    await fetch(`${env.SUPABASE_URL}/rest/v1/cfd_training_traces`, {
+    await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/cfd_training_traces`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -3161,7 +3202,7 @@ async function storeDriftAlert(
   };
 
   try {
-    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/drift_alerts`, {
+    const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/drift_alerts`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -3312,7 +3353,7 @@ function buildTrace(
 async function expireStaleNudges(env: Env): Promise<void> {
   try {
     const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
-    const response = await fetch(
+    const response = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/enforcement_nudges?status=eq.pending&created_at=lt.${fourHoursAgo}`,
       {
         method: 'PATCH',
@@ -3400,7 +3441,7 @@ async function deliverAAPWebhooks(
     const eventTypes = determineAAPEventTypes(trace, verification, policyResult);
 
     // 2. Fetch webhook registrations for this agent
-    const regResponse = await fetch(
+    const regResponse = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?agent_id=eq.${trace.agent_id}&select=*`,
       {
         headers: {
@@ -3509,7 +3550,7 @@ async function deliverAAPWebhooks(
 
       // 6. Record delivery
       try {
-        await fetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
+        await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
           method: 'POST',
           headers: {
             apikey: env.SUPABASE_KEY,
@@ -3538,7 +3579,7 @@ async function deliverAAPWebhooks(
       if (!delivered) {
         console.warn(`[observer/webhook] All retries exhausted for ${reg.registration_id} -> ${reg.callback_url}`);
         try {
-          await fetch(
+          await observerSupabaseFetch(
             `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?registration_id=eq.${reg.registration_id}`,
             {
               method: 'PATCH',
