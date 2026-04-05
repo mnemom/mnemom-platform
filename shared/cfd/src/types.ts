@@ -11,7 +11,7 @@ export type ThreatType =
   | 'pii_in_inbound';
 
 // CFD operating modes
-export type CFDMode = 'disabled' | 'simulate' | 'observe' | 'enforce';
+export type CFDMode = 'disabled' | 'off' | 'simulate' | 'observe' | 'enforce' | 'enforce_sync' | 'sovereign';
 
 // Verdict after evaluation
 export type CFDVerdict = 'pass' | 'warn' | 'quarantine' | 'block';
@@ -33,13 +33,12 @@ export interface ThreatDetection {
 // Full CFD evaluation result
 export interface CFDDecision {
   verdict: CFDVerdict;
-  overall_risk: number;      // 0.0 - 1.0
+  overall_risk: number;            // 0.0 - 1.0
   threats: ThreatDetection[];
-  l1_score: number;
-  l2_score?: number;         // undefined until Phase 1 (Haiku)
+  detector_scores: Record<string, number | null>; // keyed by detector name; null = did not run
+  detection_sources: string[];     // detectors with positive signal contribution
   session_multiplier: number;
-  quarantine_id?: string;    // set when verdict is quarantine or block
-  detection_layer: 'l1' | 'l2' | 'l3';
+  quarantine_id?: string;          // set when verdict is quarantine or block
   duration_ms: number;
 }
 
