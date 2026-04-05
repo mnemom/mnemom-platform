@@ -119,7 +119,8 @@ export interface CFDThreatPattern {
 
 // DLP match result
 export interface DLPMatch {
-  type: 'credit_card' | 'ssn' | 'api_key' | 'pem_key' | 'password_field' | 'oauth_token';
+  type: 'credit_card' | 'ssn' | 'api_key' | 'pem_key' | 'password_field' | 'oauth_token'
+      | 'email' | 'phone' | 'ipv4' | 'db_connection';
   value_masked: string;    // e.g. "****-****-****-1234"
   offset: number;
 }

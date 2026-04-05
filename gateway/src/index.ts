@@ -65,6 +65,8 @@ import {
   buildThreatContextForAIP,
   buildPreemptiveNudgeContent,
   redactDLPMatches,
+  buildCBDAnalysisPrompt,
+  buildCBDUserPrompt,
   DEFAULT_CFD_CONFIG,
   type CFDConfig,
   type CFDDecision,
@@ -73,6 +75,8 @@ import {
   type CFDThreatPattern,
   type SourceType,
   type L1Result,
+  type ThreatType,
+  type ThreatDetection,
 } from '@mnemom/cfd';
 
 // ── SemanticAnalyzer trigger helper ────────────────────────────────────────
@@ -2030,7 +2034,9 @@ async function analyzeStreamInBackground(
   quotaContext: QuotaContext,
   requestBody: Record<string, any> | null,
   otelExporter: ReturnType<typeof createWorkersExporter> | null,
-  env: Env
+  env: Env,
+  /** Canaries already checked inline by the CBD stream transform — skip redundant re-check */
+  alreadyCheckedCanaries?: string[],
 ): Promise<void> {
   try {
     // 1. Read the tee'd stream to completion
@@ -2078,59 +2084,56 @@ async function analyzeStreamInBackground(
     const outputText = analyzeOutput && parsed.text ? parsed.text : undefined;
     const outputHash = outputText ? await sha256(outputText) : undefined;
 
-    // CFD Canary detection — streaming path
-    // Scan assembled output text for planted canary credentials.
-    // Note: streaming headers cannot be modified retroactively; compromise is
-    // logged to cfd_evaluations and retrievable via /v1/cfd/evaluations.
-    if (env.BILLING_CACHE && outputText) {
+    // CBD Canary detection — streaming path (post-assembly check as a belt-and-suspenders backstop).
+    // Primary detection: createCBDStreamTransform (inline, aborts stream on hit).
+    // This secondary check catches any edge cases the inline transform missed.
+    // Skip if the inline transform already checked with the same canary list.
+    if (env.BILLING_CACHE && outputText && !alreadyCheckedCanaries) {
       try {
         const streamCanaries = await fetchAgentCanaries(agent.id, env);
         if (streamCanaries.length > 0) {
           const streamTriggered = scanForCanaryUse(outputText, streamCanaries);
           if (streamTriggered) {
             console.log(JSON.stringify({
-              event: 'cfd_canary_triggered',
+              event: 'cbd_canary_triggered',
               agent_id: agent.id,
               session_id: sessionId,
-              path: 'streaming',
+              path: 'streaming_background',
               canary_prefix: streamTriggered.slice(0, 6) + '****',
             }));
             void markCanaryTriggered(agent.id, streamTriggered, env);
-            void logCFDEvaluation(agent.id, sessionId, 'enforce', {
-              verdict: 'block',
-              overall_risk: 1.0,
-              threats: [{ type: 'indirect_injection' as const, confidence: 1.0,
-                reasoning: 'Canary credential detected in streaming agent response — confirmed compromise' }],
-              detector_scores: { CanaryMatcher: 1.0, PatternMatcher: null, SemanticAnalyzer: null },
-              detection_sources: ['CanaryMatcher'],
-              session_multiplier: 1.0,
-              duration_ms: 0,
-            }, 'canary', env);
+            void logCBDEvaluation(agent.id, sessionId, 'block',
+              { CanaryMatcher: 1.0, PatternMatcher: null, SemanticAnalyzer: null },
+              ['CanaryMatcher'], 'outbound_stream',
+              [{ type: 'data_exfiltration' as ThreatType, confidence: 1.0,
+                 reasoning: 'Canary credential detected in streaming response (background check)' }],
+              1.0, env);
           }
         }
-      } catch { /* fail-open: canary scan errors never block analysis */ }
+      } catch { /* fail-open */ }
     }
 
-    // Outbound DLP — streaming path (log only, can't modify already-sent stream)
+    // CBD Outbound DLP — streaming path (write to cbd_evaluations)
     if (env.CFD_ENABLED === 'true' && env.BILLING_CACHE && outputText) {
       try {
         const { matches: dlpMatches } = redactDLPMatches(outputText);
         if (dlpMatches.length > 0) {
-          void logCFDEvaluation(agent.id, sessionId, 'enforce', {
-            verdict: 'warn',
-            overall_risk: 0.9,
-            threats: dlpMatches.map(m => ({
-              type: 'pii_in_inbound' as const,
+          void logCBDEvaluation(agent.id, sessionId, 'warn',
+            { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
+            ['DLPScanner'], 'outbound',
+            dlpMatches.map(m => ({
+              type: 'pii_in_inbound' as ThreatType,
               confidence: 0.95,
-              reasoning: `Outbound DLP (streaming): ${m.type} detected`,
+              reasoning: `Outbound DLP: ${m.type} detected`,
             })),
-            detector_scores: { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
-            detection_sources: ['DLPScanner'],
-            session_multiplier: 1.0,
-            duration_ms: 0,
-          }, 'outbound', env);
+            0.9, env);
         }
       } catch { /* fail-open */ }
+    }
+
+    // CBD Semantic analysis — async, never blocks (checks for laundered outputs, PHI, etc.)
+    if (env.CFD_ENABLED === 'true' && outputText) {
+      void runCBDSemanticAnalysis(outputText, agent.id, sessionId, env);
     }
 
     // 7. Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
@@ -3774,6 +3777,145 @@ async function incrementCFDUsage(agentId: string, env: Env): Promise<void> {
   }
 }
 
+// ── CBD (Context Back Door) helpers ──────────────────────────────────────────
+
+/**
+ * Log a CBD outbound screening event to cbd_evaluations (fire-and-forget).
+ * Called from both streaming and non-streaming paths.
+ */
+async function logCBDEvaluation(
+  agentId: string,
+  sessionId: string,
+  verdict: string,
+  detectorScores: Record<string, number | null>,
+  detectionSources: string[],
+  surface: string,
+  threats: ThreatDetection[],
+  overallRisk: number,
+  env: Env
+): Promise<void> {
+  try {
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/cbd_evaluations`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        agent_id: agentId,
+        session_id: sessionId,
+        verdict,
+        detector_scores: detectorScores,
+        detection_sources: detectionSources,
+        surface,
+        threats,
+        overall_risk: overallRisk,
+        session_multiplier: 1.0,
+        duration_ms: 0,
+      }),
+    });
+  } catch { /* Non-blocking */ }
+}
+
+/**
+ * Create a TransformStream that scans each streaming chunk for canary values.
+ * If a canary is detected, the stream is aborted (client receives an error).
+ * Uses a rolling tail buffer to catch canary values that span chunk boundaries.
+ * Cost: ~0ms on miss (string search, zero API calls).
+ */
+function createCBDStreamTransform(
+  agentId: string,
+  sessionId: string,
+  canaries: string[],
+  env: Env,
+  ctx: ExecutionContext,
+): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  let tailBuffer = '';    // last N chars of previous chunk for overlap detection
+  const TAIL_SIZE = 80;   // comfortably exceeds any canary value length
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const text = decoder.decode(chunk, { stream: true });
+      const toScan = tailBuffer + text;
+
+      if (canaries.length > 0) {
+        const hit = scanForCanaryUse(toScan, canaries);
+        if (hit) {
+          ctx.waitUntil(Promise.all([
+            markCanaryTriggered(agentId, hit, env),
+            logCBDEvaluation(agentId, sessionId, 'block',
+              { CanaryMatcher: 1.0, PatternMatcher: null, SemanticAnalyzer: null },
+              ['CanaryMatcher'], 'outbound_stream',
+              [{ type: 'data_exfiltration' as ThreatType, confidence: 1.0,
+                 reasoning: 'Canary credential in streaming response — confirmed compromise' }],
+              1.0, env),
+          ]));
+          // Abort the stream — client receives an incomplete/errored response
+          controller.error(new Error('CBD_CANARY_TRIGGERED'));
+          return;
+        }
+      }
+
+      tailBuffer = toScan.length >= TAIL_SIZE ? toScan.slice(-TAIL_SIZE) : toScan;
+      controller.enqueue(chunk);
+    },
+  });
+}
+
+/**
+ * Run async CBD semantic analysis on assembled output text (never blocks user).
+ * Calls Haiku with an outbound-focused threat detection prompt.
+ * Results written to cbd_evaluations; only logs on non-pass verdict.
+ */
+async function runCBDSemanticAnalysis(
+  outputText: string,
+  agentId: string,
+  sessionId: string,
+  env: Env,
+): Promise<void> {
+  if (!outputText || !env.ANTHROPIC_API_KEY) return;
+  try {
+    const systemPrompt = buildCBDAnalysisPrompt();
+    const userPrompt   = buildCBDUserPrompt(outputText);
+    const controller   = new AbortController();
+    const timeoutId    = setTimeout(() => controller.abort(), 8000);
+    try {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 512,
+          system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
+        signal: controller.signal,
+      });
+      if (!resp.ok) return;
+      const body = (await resp.json()) as Record<string, unknown>;
+      const blocks = body.content as Array<Record<string, unknown>> | undefined;
+      const rawText = typeof blocks?.find(b => b.type === 'text')?.text === 'string'
+        ? (blocks!.find(b => b.type === 'text')!.text as string)
+        : null;
+      if (!rawText) return;
+      const result = parseL2Response(rawText);
+      if (!result || result.recommendation === 'pass') return;
+      await logCBDEvaluation(agentId, sessionId, result.recommendation,
+        { SemanticAnalyzer: result.overall_risk, PatternMatcher: null, CanaryMatcher: null },
+        ['SemanticAnalyzer'], 'outbound', result.threats, result.overall_risk, env);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch { /* fail-open */ }
+}
+
 /** Fetch canary values for an agent (KV cached 10 min). Returns empty array on error. */
 async function fetchAgentCanaries(agentId: string, env: Env): Promise<string[]> {
   if (!env.BILLING_CACHE) return [];
@@ -4722,13 +4864,26 @@ export async function handleProviderProxy(
         });
       }
 
-      // Tee the stream: one fork to client (immediate), one fork to background analysis
-      const [clientStream, analysisStream] = response.body.tee();
+      // CBD streaming fast path: inline canary scanner before client sees bytes.
+      // If a canary is detected, the stream is aborted mid-flight.
+      // Cost: ~1ms KV read (cached) + ~0ms per chunk (string search).
+      const cbdCanaries = (env.CFD_ENABLED === 'true' && env.BILLING_CACHE)
+        ? await fetchAgentCanaries(agent.id, env).catch(() => [] as string[])
+        : [] as string[];
+      const cbdFilteredBody = response.body
+        ? response.body.pipeThrough(
+            createCBDStreamTransform(agent.id, sessionId, cbdCanaries, env, ctx)
+          )
+        : null;
+
+      // Tee the CBD-filtered stream: one fork to client, one to background analysis
+      const [clientStream, analysisStream] = (cbdFilteredBody ?? response.body!).tee();
 
       ctx.waitUntil(
         analyzeStreamInBackground(
           analysisStream, provider, agent, sessionId,
-          agentSettings, quotaContext, requestBody, otelExporter, env
+          agentSettings, quotaContext, requestBody, otelExporter, env,
+          cbdCanaries  // pass pre-fetched canaries to avoid redundant KV read
         )
       );
 
@@ -4780,22 +4935,18 @@ export async function handleProviderProxy(
         if (triggered) {
           canaryTriggered = true;
           console.log(JSON.stringify({
-            event: 'cfd_canary_triggered',
+            event: 'cbd_canary_triggered',
             agent_id: agent.id,
             session_id: sessionId,
             canary_prefix: triggered.slice(0, 6) + '****',
           }));
-          // Mark triggered in DB and emit calibration signal (background)
           ctx.waitUntil(markCanaryTriggered(agent.id, triggered, env));
-          ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, 'enforce', {
-            verdict: 'block',
-            overall_risk: 1.0,
-            threats: [{ type: 'indirect_injection', confidence: 1.0, reasoning: 'Canary credential detected in agent response — confirmed compromise' }],
-            detector_scores: { CanaryMatcher: 1.0, PatternMatcher: null, SemanticAnalyzer: null },
-            detection_sources: ['CanaryMatcher'],
-            session_multiplier: 1.0,
-            duration_ms: 0,
-          }, 'canary', env));
+          ctx.waitUntil(logCBDEvaluation(agent.id, sessionId, 'block',
+            { CanaryMatcher: 1.0, PatternMatcher: null, SemanticAnalyzer: null },
+            ['CanaryMatcher'], 'outbound',
+            [{ type: 'data_exfiltration' as ThreatType, confidence: 1.0,
+               reasoning: 'Canary credential detected in agent response — confirmed compromise' }],
+            1.0, env));
         }
       }
     } catch {
@@ -4803,7 +4954,20 @@ export async function handleProviderProxy(
     }
 
     if (canaryTriggered) {
-      responseHeaders.set('X-CFD-Canary-Triggered', 'true');
+      // CBD P0: block the response entirely — do not return the compromised content
+      responseHeaders.set('X-CBD-Canary-Triggered', 'true');
+      return new Response(JSON.stringify({
+        error: 'Agent response blocked — canary credential detected (confirmed compromise)',
+        type: 'cbd_canary_triggered',
+        agent_id: agent.id,
+        session_id: sessionId,
+      }), {
+        status: 500,
+        headers: {
+          'Content-Type': 'application/json',
+          ...Object.fromEntries(responseHeaders.entries()),
+        },
+      });
     }
 
     // Fail-open wrapper: entire AIP pipeline wrapped in try/catch
@@ -4867,14 +5031,12 @@ export async function handleProviderProxy(
       const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
 
       // ====================================================================
-      // Outbound DLP — screen agent response for data leaks
-      // Runs when CFD feature is enabled; scans extracted text content only
+      // CBD Outbound DLP — screen agent response for data leaks
+      // Scans extracted text content; logs to cbd_evaluations.
       // ====================================================================
-      let outboundDLPRedacted = false;
-      let outboundDLPModifiedBody = responseBodyText;
+      let outboundDLPDetected = false;
       if (env.CFD_ENABLED === 'true' && env.BILLING_CACHE) {
         try {
-          // Extract text content from response for DLP scanning
           const textToScan = outputText ?? (() => {
             try {
               const parsed = JSON.parse(responseBodyText);
@@ -4889,34 +5051,33 @@ export async function handleProviderProxy(
           if (textToScan && textToScan.length > 0) {
             const { matches } = redactDLPMatches(textToScan);
             if (matches.length > 0) {
-              outboundDLPRedacted = true;
-              // Log to cfd_evaluations as an outbound surface detection
-              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, 'enforce', {
-                verdict: 'warn',
-                overall_risk: 0.9,
-                threats: matches.map(m => ({
-                  type: 'pii_in_inbound' as const,
+              outboundDLPDetected = true;
+              ctx.waitUntil(logCBDEvaluation(agent.id, sessionId, 'warn',
+                { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
+                ['DLPScanner'], 'outbound',
+                matches.map(m => ({
+                  type: 'pii_in_inbound' as ThreatType,
                   confidence: 0.95,
                   reasoning: `Outbound DLP: ${m.type} detected in agent response`,
                 })),
-                detector_scores: { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
-                detection_sources: ['DLPScanner'],
-                session_multiplier: 1.0,
-                duration_ms: 0,
-              }, 'outbound', env));
+                0.9, env));
               console.log(JSON.stringify({
-                event: 'cfd_outbound_dlp',
+                event: 'cbd_outbound_dlp',
                 agent_id: agent.id,
                 match_types: [...new Set(matches.map(m => m.type))],
               }));
             }
           }
-        } catch { /* fail-open: outbound DLP errors never block response */ }
+        } catch { /* fail-open */ }
       }
-      void outboundDLPModifiedBody;
 
-      if (outboundDLPRedacted) {
-        responseHeaders.set('X-CFD-Outbound-DLP', 'detected');
+      if (outboundDLPDetected) {
+        responseHeaders.set('X-CBD-DLP', 'detected');
+      }
+
+      // CBD Semantic analysis — async, never blocks the response
+      if (env.CFD_ENABLED === 'true' && outputText) {
+        ctx.waitUntil(runCBDSemanticAnalysis(outputText, agent.id, sessionId, env));
       }
 
       // Phase 7: Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
@@ -5460,7 +5621,7 @@ export default {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Canary-Triggered, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict, X-CFD-Outbound-DLP',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict, X-CBD-Canary-Triggered, X-CBD-DLP',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },

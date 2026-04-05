@@ -93,3 +93,98 @@ describe('scanDLP', () => {
     expect(hasDLPMatches('No sensitive data here.')).toBe(false);
   });
 });
+
+// Phase 2.5: HIPAA extended patterns
+describe('scanDLP — email (HIPAA #6)', () => {
+  it('detects a plain email address', () => {
+    const matches = scanDLP('Contact us at patient@hospital.org for appointments.');
+    expect(matches.some(m => m.type === 'email')).toBe(true);
+    const m = matches.find(m => m.type === 'email')!;
+    expect(m.value_masked).toContain('@hospital.org');
+  });
+
+  it('does NOT flag example.com emails', () => {
+    const matches = scanDLP('See user@example.com for details.');
+    expect(matches.some(m => m.type === 'email')).toBe(false);
+  });
+
+  it('detects multiple emails', () => {
+    const matches = scanDLP('From: alice@acme.com To: bob@corp.io');
+    expect(matches.filter(m => m.type === 'email').length).toBe(2);
+  });
+
+  it('does not flag text without @ symbol', () => {
+    expect(hasDLPMatches('no email here, just text')).toBe(false);
+  });
+});
+
+describe('scanDLP — phone (HIPAA #4)', () => {
+  it('detects US phone in (NPA) NXX-XXXX format', () => {
+    const matches = scanDLP('Call us at (617) 555-0100 for support.');
+    expect(matches.some(m => m.type === 'phone')).toBe(true);
+  });
+
+  it('detects phone with dots', () => {
+    const matches = scanDLP('Reach the doctor at 617.555.0199');
+    expect(matches.some(m => m.type === 'phone')).toBe(true);
+  });
+
+  it('detects E.164 format', () => {
+    const matches = scanDLP('International: +1-617-555-0143');
+    expect(matches.some(m => m.type === 'phone')).toBe(true);
+  });
+
+  it('does NOT flag 10-digit numbers that are all the same digit', () => {
+    const matches = scanDLP('Test: 555-555-5555');
+    // All same digit — filtered out
+    const phones = matches.filter(m => m.type === 'phone');
+    expect(phones.length).toBe(0);
+  });
+
+  it('does NOT flag numbers starting with 0 or 1 in area code', () => {
+    const matches = scanDLP('Invalid: 011-555-0100 or 100-555-0100');
+    expect(matches.filter(m => m.type === 'phone').length).toBe(0);
+  });
+});
+
+describe('scanDLP — IPv4 (HIPAA #15)', () => {
+  it('detects a public IPv4 address', () => {
+    const matches = scanDLP('Server IP: 203.0.113.42');
+    expect(matches.some(m => m.type === 'ipv4')).toBe(true);
+    expect(matches.find(m => m.type === 'ipv4')!.value_masked).toContain('203.0');
+  });
+
+  it('does NOT flag loopback 127.0.0.1', () => {
+    const matches = scanDLP('localhost: 127.0.0.1');
+    expect(matches.some(m => m.type === 'ipv4')).toBe(false);
+  });
+
+  it('does NOT flag link-local 169.254.x.x', () => {
+    const matches = scanDLP('link-local: 169.254.0.1');
+    expect(matches.some(m => m.type === 'ipv4')).toBe(false);
+  });
+});
+
+describe('scanDLP — database connection strings', () => {
+  it('detects PostgreSQL connection string', () => {
+    const matches = scanDLP('DB: postgresql://admin:secret@db.prod.example.com/patients');
+    expect(matches.some(m => m.type === 'db_connection')).toBe(true);
+    const m = matches.find(m => m.type === 'db_connection')!;
+    expect(m.value_masked).not.toContain('secret');
+  });
+
+  it('detects MongoDB connection string', () => {
+    const matches = scanDLP('Connect with mongodb+srv://user:pass@cluster.mongodb.net/prod');
+    expect(matches.some(m => m.type === 'db_connection')).toBe(true);
+  });
+
+  it('detects Redis URL', () => {
+    const matches = scanDLP('Cache: redis://user:token@redis.example.com:6379/0');
+    expect(matches.some(m => m.type === 'db_connection')).toBe(true);
+  });
+
+  it('does NOT flag short db-like strings', () => {
+    const matches = scanDLP('Use redis://local');
+    expect(matches.some(m => m.type === 'db_connection')).toBe(false);
+  });
+});
