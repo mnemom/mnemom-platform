@@ -73,7 +73,7 @@ import {
   type CFDThreatPattern,
   type SourceType,
 } from '@mnemom/cfd';
-import { jwtVerify, createRemoteJWKSet } from 'jose';
+import { jwtVerify, createRemoteJWKSet, type JWTPayload } from 'jose';
 
 // ============================================================================
 // Bootstrapping Defaults
@@ -517,9 +517,10 @@ export function _resetJwksCacheForTests(): void {
  * Uses createRemoteJWKSet — supports key rotation automatically.
  * Throws if the token is invalid, expired, or fails signature verification.
  */
-async function verifySupabaseJwt(token: string, supabaseUrl: string): Promise<void> {
+async function verifySupabaseJwt(token: string, supabaseUrl: string): Promise<JWTPayload> {
   const jwks = getSupabaseJwks(supabaseUrl);
-  await jwtVerify(token, jwks, { algorithms: ['ES256'] });
+  const { payload } = await jwtVerify(token, jwks, { algorithms: ['ES256'] });
+  return payload;
 }
 
 /**
@@ -3991,9 +3992,13 @@ export async function handleProviderProxy(
   // Only applies to JWT-shaped Bearer tokens (3 dot-separated parts).
   // Raw LLM provider API keys (sk-ant-..., sk-proj-...) pass through unchanged.
   // Uses JWKS (ES256) — no extra secret needed, key rotation handled automatically.
-  if (looksLikeJwt(apiKey)) {
+  // On success, sub claim is captured for use as a meaningful key_prefix.
+  const isJwtToken = looksLikeJwt(apiKey);
+  let jwtSub: string | undefined;
+  if (isJwtToken) {
     try {
-      await verifySupabaseJwt(apiKey, env.SUPABASE_URL);
+      const jwtPayload = await verifySupabaseJwt(apiKey, env.SUPABASE_URL);
+      jwtSub = typeof jwtPayload.sub === 'string' ? jwtPayload.sub : undefined;
     } catch {
       return new Response(
         JSON.stringify({ error: 'Invalid or expired token', type: 'authentication_error' }),
@@ -4005,9 +4010,13 @@ export async function handleProviderProxy(
   const otelExporter = createOTelExporter(env);
 
   try {
-    // key_prefix is always raw provider key prefix — for named agents SHA256 uses key|name
-    // but the prefix stored is always apiKey.slice(0, 16) (not the combined string prefix)
-    const keyPrefix = apiKey ? apiKey.slice(0, 16) : undefined;
+    // key_prefix: for JWT tokens, derived from sub claim (Supabase user UUID prefix).
+    // For JWT tokens with no sub: undefined — don't store the meaningless JWT header bytes.
+    // For raw API keys: first 16 chars of the key. For named agents, hash uses key|name
+    // but the prefix stored is always from apiKey alone (not the combined string).
+    const keyPrefix = isJwtToken
+      ? (jwtSub ? jwtSub.slice(0, 16) : undefined)
+      : apiKey.slice(0, 16);
 
     // Hash the API key for agent identification
     const agentHash = agentName

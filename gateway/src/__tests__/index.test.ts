@@ -2357,7 +2357,7 @@ describe('handleProviderProxy — JWT signature verification (ES256/JWKS)', () =
     const existingAgent = {
       id: 'agent-uuid-jwt',
       agent_hash: 'abcdef0123456789',
-      key_prefix: 'eyJhbGciOiJFUzI1',
+      key_prefix: 'test-user-id',
       name: null,
       created_at: '2024-01-01T00:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -2402,6 +2402,61 @@ describe('handleProviderProxy — JWT signature verification (ES256/JWKS)', () =
 
     expect(response.status).not.toBe(401);
     expect(mockFetch).toHaveBeenCalled(); // agent lookup happened — JWT cleared verification
+  });
+
+  it('stores sub.slice(0,16) as key_prefix when creating a new JWT-authenticated agent', async () => {
+    const SUB = '550e8400-e29b-41d4-a716-446655440000';
+    const jwt = await new SignJWT({ sub: SUB })
+      .setProtectedHeader({ alg: 'ES256' })
+      .setIssuedAt()
+      .setExpirationTime('1h')
+      .sign(privateKey);
+
+    stubJwksWithKey(publicKey);
+    const env = createTestEnv();
+
+    const newAgent = {
+      id: 'smolt-testjwt1',
+      agent_hash: 'a1b2c3d4e5f60001',
+      name: null,
+      created_at: new Date().toISOString(),
+      last_seen: null,
+      key_prefix: SUB.slice(0, 16),
+    };
+
+    // [0] Agent lookup → empty (new agent)
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve([]) });
+    // [1] Agent INSERT — this is the body we assert against
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve([newAgent]) });
+    // [2] ensureAlignmentCard — background upsert, silently ignored on failure
+    mockFetch.mockResolvedValueOnce({ ok: true });
+    // [3] Quota context RPC
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        plan_id: 'plan-free', billing_model: 'none', subscription_status: 'none',
+        included_checks: 0, check_count_this_period: 0, overage_threshold: null,
+        per_check_price: 0, feature_flags: {}, limits: {}, account_id: null,
+        current_period_end: null, past_due_since: null, is_suspended: false,
+        agent_settings: null, per_proof_price: 0,
+      }),
+    });
+    // [4] Policy fetch RPC
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(null) });
+    // [5] Forward to CF AI Gateway
+    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+    const request = new Request('https://gateway.mnemom.ai/openai/v1/models', {
+      method: 'GET',
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+
+    await handleProviderProxy(request, env, createMockContext(), 'openai');
+
+    // INSERT body (call index 1) must have sub-derived prefix, NOT the JWT header bytes
+    const insertBody = JSON.parse(mockFetch.mock.calls[1][1].body);
+    expect(insertBody.key_prefix).toBe(SUB.slice(0, 16));        // '550e8400-e29b-41'
+    expect(insertBody.key_prefix).not.toBe('eyJhbGciOiJFUzI1'); // not the JWT header
   });
 
   it('passes a raw (non-JWT-shaped) API key through without calling createRemoteJWKSet', async () => {
