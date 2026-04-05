@@ -18,6 +18,7 @@ import {
   handleAnthropicProxy,
   handleProviderProxy,
   _resetJwksCacheForTests,
+  _resetSupabaseCircuitBreakerForTests,
   evaluateQuota,
   hashMnemomApiKey,
   resolveQuotaContext,
@@ -55,6 +56,7 @@ function createMockContext(): ExecutionContext {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  _resetSupabaseCircuitBreakerForTests();
 });
 
 describe('hashApiKey', () => {
@@ -2511,5 +2513,35 @@ describe('handleProviderProxy — JWT signature verification (ES256/JWKS)', () =
     expect(body.error).not.toBe('Invalid or expired token');
     // JWKS was never invoked — raw key skips JWT verification entirely
     expect(vi.mocked(createRemoteJWKSet)).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// Supabase Circuit Breaker Integration (scale/step-04)
+// ============================================================================
+
+describe('supabaseFetch — circuit breaker (via resolveQuotaContext)', () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    _resetSupabaseCircuitBreakerForTests();
+  });
+
+  it('opens the circuit after 3 Supabase failures and blocks the 4th call', async () => {
+    const env = createTestEnv();
+    // Simulate network failure for all fetch calls (timeout/connection error)
+    mockFetch.mockRejectedValue(new Error('Network error'));
+
+    // Calls 1-3: each reaches fetch, fails, circuit breaker increments
+    await resolveQuotaContext('agent-1', env);
+    await resolveQuotaContext('agent-2', env);
+    await resolveQuotaContext('agent-3', env);
+    expect(mockFetch).toHaveBeenCalledTimes(3); // each failure hit fetch
+
+    // Call 4: circuit is now open — fetch must NOT be called
+    mockFetch.mockClear();
+    const result = await resolveQuotaContext('agent-4', env);
+
+    expect(mockFetch).not.toHaveBeenCalled(); // circuit blocked the fetch
+    expect(result).toEqual(FREE_TIER_CONTEXT); // fail-open: safe default returned
   });
 });
