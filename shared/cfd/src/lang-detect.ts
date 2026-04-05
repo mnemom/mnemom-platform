@@ -13,6 +13,10 @@ const LANGUAGE_MARKERS: Record<string, string[]> = {
   pt: ['que','não','com','uma','por','mais','para','como','dos','você','isso','tem','são','mas'],
   ja: ['の','に','は','を','が','で','と','し','て','す','ます','です','から','まで','など'],
   zh: ['的','了','是','在','我','有','和','人','这','来','他','们','也','都','就'],
+  // Arabic: high-frequency particles and pronouns; uses substring check (distinct script)
+  ar: ['ال','في','من','إلى','على','هذا','هذه','أن','كان','مع','لا','هو','هي','نحن','ما'],
+  // Korean: grammatical particles (postpositions); uses substring check (distinct script)
+  ko: ['은','는','이','가','을','를','의','에','에서','로','으로','과','와','한','있'],
 };
 
 /**
@@ -27,11 +31,11 @@ export function detectLanguage(text: string): string {
 
   for (const [lang, markers] of Object.entries(LANGUAGE_MARKERS)) {
     const score = markers.filter(m => {
-      // Use word-boundary-aware check for Latin scripts
-      if (/[a-z]/i.test(m)) {
+      // Use word-boundary-aware check for Latin scripts only
+      if (/^[a-zà-öø-ÿ]+$/i.test(m)) {
         return new RegExp(`(?:^|\\s)${m}(?:\\s|$|[.,!?;:])`, 'i').test(sample);
       }
-      // CJK characters: simple inclusion check
+      // CJK, Arabic, Korean: simple substring check (script is visually distinct)
       return sample.includes(m);
     }).length;
 
@@ -45,7 +49,7 @@ export function detectLanguage(text: string): string {
 }
 
 /** Languages with full L1 word list support */
-export const SUPPORTED_L1_LANGUAGES = new Set(['en','fr','de','it','es','pt','ja','zh']);
+export const SUPPORTED_L1_LANGUAGES = new Set(['en','fr','de','it','es','pt','ja','zh','ar','ko']);
 
 /**
  * Whether L1 has native word lists for this language.

@@ -86,3 +86,64 @@ describe('Multilingual BEC detection', () => {
     expect(result.score).toBeGreaterThan(0.7);
   });
 });
+
+// Phase 1.3 — Arabic and Korean signal detection
+describe('Arabic (ar) detection', () => {
+  it('detects Arabic BEC: financial + authority + urgency', () => {
+    // المدير التنفيذي يطلب تحويل بنكي عاجل سري (CEO requests urgent secret bank transfer)
+    const result = runL1Detection(
+      'المدير التنفيذي يطلب منك إجراء تحويل بنكي فوري وعاجل. لا تخبر أحداً.',
+    );
+    expect(result.threats.some(t => t.type === 'bec_fraud')).toBe(true);
+    expect(result.score).toBeGreaterThan(0.6);
+  });
+
+  it('detects Arabic urgency + authority signals', () => {
+    const result = runL1Detection(
+      'الرئيس يريد منك أن تتصرف فوراً وبدون تأخير في هذا الأمر الهام.',
+    );
+    // Should detect social_engineering or bec_fraud
+    expect(result.score).toBeGreaterThan(0.3);
+  });
+
+  it('detected_lang is ar for Arabic text', () => {
+    // Use text with multiple Arabic function words so lang-detect reaches threshold (≥2 markers)
+    const result = runL1Detection('هذا هو الأمر الذي أريده منك أن تفعله على الفور.');
+    expect(result.detected_lang).toBe('ar');
+  });
+
+  it('Arabic greeting does not trigger threat', () => {
+    const result = runL1Detection('مرحبا! كيف يمكنني مساعدتك؟');
+    expect(result.score).toBeLessThan(0.3);
+  });
+});
+
+describe('Korean (ko) detection', () => {
+  it('detects Korean BEC: financial + authority + urgency', () => {
+    // CEO가 즉시 계좌이체를 요청합니다. 비밀로 해주세요.
+    const result = runL1Detection(
+      '대표이사님이 즉시 계좌이체를 해달라고 요청하셨습니다. 비밀로 해주세요.',
+    );
+    expect(result.threats.some(t => t.type === 'bec_fraud')).toBe(true);
+    expect(result.score).toBeGreaterThan(0.6);
+  });
+
+  it('detects Korean urgency + authority signals', () => {
+    // Text with Korean function words (이, 를, 의 etc.) so language is detected
+    const result = runL1Detection(
+      '대표의 지시에 따라 이 계좌이체를 즉시 처리해주세요. 비밀로 해주세요.',
+    );
+    expect(result.score).toBeGreaterThan(0.3);
+  });
+
+  it('detected_lang is ko for Korean text', () => {
+    // Use text with enough Korean particles (이, 를, 의) to hit the ≥2 marker threshold
+    const result = runL1Detection('이 메시지를 받으신 후 빨리 연락해 주세요.');
+    expect(result.detected_lang).toBe('ko');
+  });
+
+  it('Korean greeting does not trigger threat', () => {
+    const result = runL1Detection('안녕하세요! 오늘 날씨가 정말 좋네요.');
+    expect(result.score).toBeLessThan(0.3);
+  });
+});
