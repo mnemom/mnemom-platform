@@ -31,6 +31,21 @@ const PASSWORD_FIELD_PATTERN = /(?:password|passwd|pwd|secret|token|api_key)\s*[
 // OAuth/Bearer tokens
 const OAUTH_PATTERN = /Bearer\s+([a-zA-Z0-9\-._~+/]+=*){20,}/g;
 
+// Email addresses (HIPAA identifier #6)
+const EMAIL_PATTERN = /\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b/g;
+
+// US phone numbers and E.164 (HIPAA identifier #4)
+// Area code must start 2-9 to exclude test/invalid numbers (NPA 000, 555 excluded via context)
+const PHONE_PATTERN = /\b(?:\+1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g;
+
+// IPv4 addresses (HIPAA identifier #15)
+// Loopback (127.x) and link-local (169.254.x) excluded — not PII
+const IPV4_PATTERN = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
+const IPV4_EXCLUDED = /^(?:127\.|169\.254\.|0\.0\.0\.0$|255\.255\.255\.255$)/;
+
+// Database connection strings (credential leak)
+const DB_CONNECTION_PATTERN = /(?:postgresql|postgres|mysql|mongodb(?:\+srv)?|redis|jdbc:[a-z]+):\/\/[^\s"'\n]{10,}/gi;
+
 export function scanDLP(text: string): DLPMatch[] {
   const matches: DLPMatch[] = [];
 
@@ -71,6 +86,42 @@ export function scanDLP(text: string): DLPMatch[] {
     matches.push({ type: 'oauth_token', value_masked: 'Bearer ****', offset: match.index ?? 0 });
   }
 
+  // Email addresses
+  for (const match of text.matchAll(EMAIL_PATTERN)) {
+    const addr = match[0];
+    // Skip obvious placeholder emails
+    if (addr.includes('example.com') || addr.includes('test@') || addr.endsWith('@localhost')) continue;
+    const parts = addr.split('@');
+    const masked = parts[0].slice(0, 2) + '****@' + parts[1];
+    matches.push({ type: 'email', value_masked: masked, offset: match.index ?? 0 });
+  }
+
+  // Phone numbers
+  for (const match of text.matchAll(PHONE_PATTERN)) {
+    const digits = match[0].replace(/\D/g, '');
+    // Need at least 10 digits, reject 555-01xx test numbers and all-same-digit patterns
+    if (digits.length < 10) continue;
+    const last10 = digits.slice(-10);
+    if (/^(\d)\1{9}$/.test(last10)) continue; // all same digit
+    matches.push({ type: 'phone', value_masked: '***-***-' + last10.slice(-4), offset: match.index ?? 0 });
+  }
+
+  // IPv4 addresses
+  for (const match of text.matchAll(IPV4_PATTERN)) {
+    if (IPV4_EXCLUDED.test(match[0])) continue;
+    const parts = match[0].split('.');
+    const masked = parts[0] + '.' + parts[1] + '.***.' + parts[3];
+    matches.push({ type: 'ipv4', value_masked: masked, offset: match.index ?? 0 });
+  }
+
+  // Database connection strings
+  for (const match of text.matchAll(DB_CONNECTION_PATTERN)) {
+    const url = match[0];
+    // Mask credentials: proto://user:pass@host → proto://****@host
+    const masked = url.replace(/(:\/{2})[^@]*@/, '$1****@').slice(0, 60) + (url.length > 60 ? '...' : '');
+    matches.push({ type: 'db_connection', value_masked: masked, offset: match.index ?? 0 });
+  }
+
   return matches;
 }
 
@@ -101,6 +152,9 @@ export function redactDLPMatches(text: string): { redacted: string; matches: DLP
     { pattern: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, label: '[PRIVATE_KEY REDACTED]' },
     { pattern: /(?:password|passwd|pwd|secret|token|api_key)\s*[=:]\s*["']?([^\s"',;]{8,})["']?/gi, label: '[CREDENTIAL REDACTED]' },
     { pattern: /Bearer\s+([a-zA-Z0-9\-._~+/]+=*){20,}/g, label: 'Bearer [TOKEN REDACTED]' },
+    { pattern: /\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b/g, label: '[EMAIL REDACTED]' },
+    { pattern: /\b(?:\+1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, label: '[PHONE REDACTED]' },
+    { pattern: /(?:postgresql|postgres|mysql|mongodb(?:\+srv)?|redis|jdbc:[a-z]+):\/\/[^\s"'\n]{10,}/gi, label: '[DB_CONNECTION REDACTED]' },
   ];
 
   for (const { pattern, label } of REDACT_PATTERNS) {
