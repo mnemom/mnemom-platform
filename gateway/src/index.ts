@@ -4574,7 +4574,7 @@ export async function handleProviderProxy(
       ...(request.method !== 'GET' && request.method !== 'HEAD' ? { body: modifiedBody } : {}),
     });
 
-    const response = await supabaseFetch(forwardRequest);
+    const response = await fetch(forwardRequest);
 
     // ====================================================================
     // Wave 2: Real-time AIP integrity checking
