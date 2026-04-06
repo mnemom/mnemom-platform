@@ -68,6 +68,9 @@ import {
   buildCBDAnalysisPrompt,
   buildCBDUserPrompt,
   DEFAULT_CFD_CONFIG,
+  preprocessForDetection,
+  computeMinHash,
+  computeBandHashes,
   type CFDConfig,
   type CFDDecision,
   type CFDVerdict,
@@ -540,6 +543,11 @@ export function _resetSupabaseCircuitBreakerForTests(): void {
   supabaseCircuitBreaker.lastFailure = 0;
   supabaseCircuitBreaker.isOpen = false;
 }
+
+/** Exported for unit testing — wraps fetchCFDLSHCandidates. */
+export { fetchCFDLSHCandidates as _fetchCFDLSHCandidatesForTests };
+/** Exported for unit testing — wraps fetchCFDContextFamilies. */
+export { fetchCFDContextFamilies as _fetchCFDContextFamiliesForTests };
 
 /**
  * Drop-in replacement for fetch() on all Supabase REST/RPC calls.
@@ -3464,7 +3472,7 @@ async function fetchCFDThreatPatterns(env: Env): Promise<CFDThreatPattern[]> {
       if (cached) return JSON.parse(cached) as CFDThreatPattern[];
     }
     const resp = await supabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns?label=eq.malicious&is_active=eq.true&select=id,threat_type,label,content,minhash&order=created_at.desc&limit=500`,
+      `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns?label=eq.malicious&is_active=eq.true&select=id,threat_type,label,content,minhash,pattern_family&order=created_at.desc&limit=500`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -3481,6 +3489,108 @@ async function fetchCFDThreatPatterns(env: Env): Promise<CFDThreatPattern[]> {
   } catch {
     return [];
   }
+}
+
+/**
+ * Query the LSH inverted index in KV to find candidate patterns for a given normalized text.
+ * Returns the subset of allPatterns whose IDs appear in any of the 16 band bucket lists.
+ * Falls back to the full allPatterns list when the KV index is unavailable or not yet built.
+ *
+ * @param normalizedContent - Content AFTER preprocessForDetection (same normalization as detector)
+ */
+async function fetchCFDLSHCandidates(
+  normalizedContent: string,
+  allPatterns: CFDThreatPattern[],
+  env: Env,
+): Promise<CFDThreatPattern[]> {
+  if (!env.BILLING_CACHE || allPatterns.length === 0) return allPatterns;
+  try {
+    const sig = computeMinHash(normalizedContent);
+    const bandHashes = computeBandHashes(sig);
+    const keys = bandHashes.map((h, i) => `cfd_lsh:band:${i}:${h}`);
+    const results = await Promise.all(keys.map(k => env.BILLING_CACHE!.get(k)));
+    const candidateIds = new Set<string>();
+    for (const r of results) {
+      if (r) {
+        try { (JSON.parse(r) as string[]).forEach(id => candidateIds.add(id)); } catch { /* skip malformed */ }
+      }
+    }
+    if (candidateIds.size === 0) return allPatterns; // index not yet built — fail open
+    return allPatterns.filter(p => candidateIds.has(p.id));
+  } catch {
+    return allPatterns; // fail open on any KV error
+  }
+}
+
+/**
+ * Fetch the relevant card family names for a given surface type and agent industry.
+ * Calls the get_cards_for_context Supabase RPC, cached in KV for 15 minutes.
+ * Returns an empty set on failure (fail-open: no family filtering applied).
+ */
+async function fetchCFDContextFamilies(
+  surface: string,
+  industry: string | undefined,
+  env: Env,
+): Promise<Set<string>> {
+  const cacheKey = `cfd:ctx:${surface}:${industry ?? ''}`;
+  try {
+    if (env.BILLING_CACHE) {
+      const cached = await env.BILLING_CACHE.get(cacheKey);
+      if (cached) return new Set(JSON.parse(cached) as string[]);
+    }
+    const resp = await supabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/rpc/get_cards_for_context`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ p_surface: surface, p_industry: industry ?? null }),
+      }
+    );
+    if (!resp.ok) return new Set();
+    const families = await resp.json() as string[];
+    if (env.BILLING_CACHE) {
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(families), { expirationTtl: 900 }).catch(() => {});
+    }
+    return new Set(families);
+  } catch {
+    return new Set(); // fail open
+  }
+}
+
+/**
+ * Three-phase threat pattern pre-filter for a given content string.
+ *
+ * Phase 1 — Context family filter: restrict to families relevant for this surface/industry.
+ * Phase 2 — LSH candidate filter: use KV band index to narrow to ~20-50 near-duplicate candidates.
+ *
+ * The returned subset is passed to runL1Detection, replacing the full allPatterns list.
+ * Fails open at every step: always returns a valid (possibly full) pattern list.
+ *
+ * IMPORTANT: normalizes content internally via preprocessForDetection, matching the
+ * normalization runL1Detection applies — LSH lookup and detector see the same text.
+ */
+async function getCFDCandidatePatterns(
+  rawContent: string,
+  surface: 'user_message' | 'tool_result',
+  allPatterns: CFDThreatPattern[],
+  agentIndustry: string | undefined,
+  env: Env,
+): Promise<CFDThreatPattern[]> {
+  // Normalize — same transform the detector applies before MinHash
+  const { normalized } = preprocessForDetection(rawContent);
+
+  // Phase 1: context family filter (surface + industry)
+  const families = await fetchCFDContextFamilies(surface, agentIndustry, env);
+  const familyFiltered = families.size > 0
+    ? allPatterns.filter(p => !p.pattern_family || families.has(p.pattern_family))
+    : allPatterns;
+
+  // Phase 2: LSH candidate filter
+  return fetchCFDLSHCandidates(normalized, familyFiltered, env);
 }
 
 /** Read session risk state from KV. */
@@ -4084,7 +4194,8 @@ async function runObserveCFD(
       getCFDSessionState(sessionId, env),
     ]);
 
-    const l1 = runL1Detection(content, patterns, { surface: 'user_message' });
+    const userMsgCandidates = await getCFDCandidatePatterns(content, 'user_message', patterns, undefined, env);
+    const l1 = runL1Detection(content, userMsgCandidates, { surface: 'user_message' });
 
     let finalThreats = l1.threats;
     let finalScore = l1.score;
@@ -4150,7 +4261,8 @@ async function runObserveCFD(
     // Always triggers SemanticAnalyzer for tool results regardless of L1 score.
     if (toolResultsToScreen && toolResultsToScreen.length > 0) {
       await Promise.all(toolResultsToScreen.map(async (tr) => {
-        const tl1 = runL1Detection(tr, patterns, { surface: 'tool_result' });
+        const trCandidates = await getCFDCandidatePatterns(tr, 'tool_result', patterns, undefined, env);
+        const tl1 = runL1Detection(tr, trCandidates, { surface: 'tool_result' });
         const tDetectorScores: Record<string, number | null> = { PatternMatcher: tl1.score, SemanticAnalyzer: null };
         const tDetectionSources: string[] = tl1.score > 0 ? ['PatternMatcher'] : [];
         // Always semantic for tool results — direct injection via tool output is the primary attack vector
@@ -4421,7 +4533,8 @@ export async function handleProviderProxy(
               fetchCFDThreatPatterns(env),
               getCFDSessionState(sessionId, env),
             ]);
-            const simL1 = runL1Detection(inboundMessage, simPatterns, { surface: 'user_message' });
+            const simCandidates = await getCFDCandidatePatterns(inboundMessage, 'user_message', simPatterns, undefined, env);
+            const simL1 = runL1Detection(inboundMessage, simCandidates, { surface: 'user_message' });
             let simThreats = simL1.threats;
             let simScore = simL1.score;
             const simDetectorScores: Record<string, number | null> = { PatternMatcher: simL1.score, SemanticAnalyzer: null };
@@ -4473,7 +4586,8 @@ export async function handleProviderProxy(
             fetchCFDThreatPatterns(env),
             getCFDSessionState(sessionId, env),
           ]);
-          const l1 = runL1Detection(inboundMessage, patterns, { surface: 'user_message' });
+          const enforceCandidates = await getCFDCandidatePatterns(inboundMessage, 'user_message', patterns, undefined, env);
+          const l1 = runL1Detection(inboundMessage, enforceCandidates, { surface: 'user_message' });
 
           // SemanticAnalyzer: call Haiku when PatternMatcher score >= 0.4 OR
           // non-Latin language detected (weaker regex coverage) OR encoding trick found.
@@ -4580,7 +4694,8 @@ export async function handleProviderProxy(
           if (cfdConfig.screen_surfaces.includes('tool_result' as SourceType)) {
             const toolResultsList = extractToolResults(requestBody as Record<string, unknown>, provider).slice(0, 3);
             await Promise.all(toolResultsList.map(async (toolResult) => {
-              const tl1 = runL1Detection(toolResult, patterns, { surface: 'tool_result' });
+              const trEnforceCandidates = await getCFDCandidatePatterns(toolResult, 'tool_result', patterns, undefined, env);
+              const tl1 = runL1Detection(toolResult, trEnforceCandidates, { surface: 'tool_result' });
               const tDetectorScores: Record<string, number | null> = { PatternMatcher: tl1.score, SemanticAnalyzer: null };
               const tDetectionSources: string[] = tl1.score > 0 ? ['PatternMatcher'] : [];
               let tFinalThreats = tl1.threats;

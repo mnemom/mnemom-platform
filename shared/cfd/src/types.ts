@@ -115,6 +115,7 @@ export interface CFDThreatPattern {
   label: 'malicious' | 'benign';
   content: string;
   minhash?: string;
+  pattern_family?: string;
 }
 
 // DLP match result
