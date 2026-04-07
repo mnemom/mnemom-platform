@@ -4881,7 +4881,8 @@ export async function handleProviderProxy(
 
     // Clone headers and add metadata + AI Gateway auth
     const forwardHeaders = new Headers(request.headers);
-    forwardHeaders.delete('x-smoltbot-agent'); // Internal routing header — don't forward to CF AI Gateway
+    forwardHeaders.delete('x-smoltbot-agent'); // Internal routing headers — don't forward to CF AI Gateway
+    forwardHeaders.delete('x-mnemom-agent');   // New canonical name (dual-header transition)
     forwardHeaders.set('cf-aig-metadata', metadataHeader);
     forwardHeaders.set('cf-aig-authorization', `Bearer ${env.CF_AIG_TOKEN}`);
 
@@ -4905,8 +4906,10 @@ export async function handleProviderProxy(
 
     // Clone response headers as base for our response
     const responseHeaders = new Headers(response.headers);
-    responseHeaders.set('x-smoltbot-agent', agent.id);
-    responseHeaders.set('x-smoltbot-session', sessionId);
+    responseHeaders.set('x-smoltbot-agent', agent.id);    // deprecated: remove after 6-month transition (2026-10)
+    responseHeaders.set('x-mnemom-agent', agent.id);      // canonical new name
+    responseHeaders.set('x-smoltbot-session', sessionId); // deprecated: remove after 6-month transition (2026-10)
+    responseHeaders.set('x-mnemom-session', sessionId);   // canonical new name
 
     // Add CFD headers if screening ran
     if (cfdVerdict) {
@@ -5274,8 +5277,10 @@ export async function handleProviderProxy(
                     'X-AIP-Checkpoint-Id': hybridCheckpoint.checkpoint_id,
                     'X-AIP-Action': hybridAction,
                     'X-AIP-Proceed': String(hybridProceed),
-                    'x-smoltbot-agent': agent.id,
-                    'x-smoltbot-session': sessionId,
+                    'x-smoltbot-agent': agent.id,    // deprecated (2026-10)
+                    'x-mnemom-agent': agent.id,
+                    'x-smoltbot-session': sessionId, // deprecated (2026-10)
+                    'x-mnemom-session': sessionId,
                   },
                 }
               );
@@ -5531,8 +5536,10 @@ export async function handleProviderProxy(
               'X-AIP-Checkpoint-Id': checkpoint.checkpoint_id,
               'X-AIP-Action': signal.recommended_action,
               'X-AIP-Proceed': String(signal.proceed),
-              'x-smoltbot-agent': agent.id,
-              'x-smoltbot-session': sessionId,
+              'x-smoltbot-agent': agent.id,    // deprecated (2026-10)
+              'x-mnemom-agent': agent.id,
+              'x-smoltbot-session': sessionId, // deprecated (2026-10)
+              'x-mnemom-session': sessionId,
             },
           }
         );
@@ -5735,8 +5742,8 @@ export default {
         headers: {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict, X-CBD-Canary-Triggered, X-CBD-DLP',
+          'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent, x-mnemom-agent',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, x-mnemom-agent, x-mnemom-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict, X-CBD-Canary-Triggered, X-CBD-DLP',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },
@@ -5764,12 +5771,13 @@ export default {
       return handleModelsEndpoint(env);
     }
 
-    // Named agent identification via x-smoltbot-agent header.
+    // Named agent identification via x-mnemom-agent header (canonical) or
+    // x-smoltbot-agent (deprecated, accepted during 6-month transition until 2026-10).
     // URL paths stay the same (/anthropic/*, /openai/*, /gemini/*).
     // NOTE: URL-prefix approaches (/a/{name}/ and /agent/{name}/) don't work
     // because Cloudflare AI Gateway intercepts paths matching /{provider}/v1/...
     // at any depth on this domain.
-    const agentName = request.headers.get('x-smoltbot-agent') || undefined;
+    const agentName = request.headers.get('x-mnemom-agent') || request.headers.get('x-smoltbot-agent') || undefined;
 
     // Anthropic API proxy
     if (path.startsWith('/anthropic/') || path === '/anthropic') {
@@ -5791,7 +5799,7 @@ export default {
       JSON.stringify({
         error: 'Not found',
         type: 'not_found',
-        message: 'This gateway handles /health, /anthropic/*, /openai/*, /gemini/* endpoints. Use x-smoltbot-agent header for named agents.',
+        message: 'This gateway handles /health, /anthropic/*, /openai/*, /gemini/* endpoints. Use x-mnemom-agent header for named agents.',
       }),
       {
         status: 404,
