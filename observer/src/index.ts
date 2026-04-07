@@ -1,5 +1,5 @@
 /**
- * Smoltbot Observer Worker
+ * Mnemom Observer Worker (mnemom-platform)
  *
  * Processes logs from Cloudflare AI Gateway, extracts thinking blocks,
  * analyzes decisions with Claude Haiku, builds AP-Traces, verifies against
@@ -239,7 +239,7 @@ export default {
     if (url.pathname === '/health') {
       return Response.json({
         status: 'ok',
-        service: 'smoltbot-observer',
+        service: 'mnemom-observer',
         version: '2.1.0',
         build: '2026-03-03-trace-fix',
       });
@@ -325,7 +325,7 @@ function createOTelExporter(env: Env) {
   return createWorkersExporter({
     endpoint: env.OTLP_ENDPOINT,
     authorization: env.OTLP_AUTH,
-    serviceName: 'smoltbot-observer',
+    serviceName: 'mnemom-observer',
   });
 }
 
@@ -441,9 +441,9 @@ async function processLog(
     metadata = await recoverMetadataFromCheckpoint(log, env) ?? undefined;
   }
 
-  // Validate this is a smoltbot request by checking for agent_id
+  // Validate this is a mnemom request by checking for agent_id
   if (!metadata?.agent_id) {
-    console.log(`[observer] Skipping ${log.id}: no smoltbot metadata and no checkpoint fallback`);
+    console.log(`[observer] Skipping ${log.id}: no mnemom metadata and no checkpoint fallback`);
     await deleteLog(log.id, env);
     return false;
   }

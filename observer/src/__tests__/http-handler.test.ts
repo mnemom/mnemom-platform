@@ -33,7 +33,7 @@ function handleRequest(request: Request, env: Env): Response {
   if (url.pathname === '/health') {
     return Response.json({
       status: 'ok',
-      service: 'smoltbot-observer',
+      service: 'mnemom-observer',
       version: '2.0.0',
     });
   }
@@ -90,7 +90,7 @@ describe('/health endpoint', () => {
     expect(res.status).toBe(200);
     const body = await res.json() as Record<string, unknown>;
     expect(body.status).toBe('ok');
-    expect(body.service).toBe('smoltbot-observer');
+    expect(body.service).toBe('mnemom-observer');
     expect(body.version).toBe('2.0.0');
   });
 

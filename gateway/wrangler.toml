@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 # ─── Production ───────────────────────────────────────────────────────────────
 [env.production]
-name = "smoltbot-gateway"
+name = "mnemom-gateway"
 # CF Workers Paid Standard ($5/month) plan required: Ed25519 signing + CFD L1 pattern matching
 # + AIP analysis can exceed 10ms bundled CPU. Standard plan provides 30s CPU per invocation.
 usage_model = "standard"
@@ -35,7 +35,7 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
-name = "smoltbot-gateway-staging"
+name = "mnemom-gateway-staging"
 
 routes = [
   { pattern = "gateway-staging.mnemom.ai", custom_domain = true }
