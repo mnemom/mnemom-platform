@@ -37,6 +37,7 @@ import {
   type ToolReference,
 } from '@mnemom/policy-engine';
 import { createCircuitBreaker, checkAndReset, recordSuccess, recordFailure } from './circuit-breaker';
+import { computeBandHashes, deserializeMinHash } from '@mnemom/cfd';
 
 const AAP_VERSION = '1.0';
 const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
@@ -101,6 +102,7 @@ interface Env {
   PROVER_URL?: string;
   PROVER_API_KEY?: string;
   OBSERVER_MAX_LOGS?: string; // Max logs per cron tick; default "5000"; parsed as int
+  BILLING_CACHE?: KVNamespace; // Shared KV namespace with gateway — used for LSH index
 }
 
 interface GatewayLog {
@@ -202,6 +204,13 @@ export default {
         ctx.waitUntil(runCFDPatternExpiry(env)); // NEW
       }
 
+      // Nightly LSH index rebuild + family consolidation + orphan expiry (2:00 AM UTC)
+      if (now.getUTCHours() === 2 && now.getUTCMinutes() === 0) {
+        ctx.waitUntil(runCFDLSHIndexRebuild(env));
+        ctx.waitUntil(runCFDConsolidation(env));
+        ctx.waitUntil(runCFDExpireOrphans(env));
+      }
+
       // Flush OTel spans for all processed logs in one batch
       if (otelExporter) {
         ctx.waitUntil(otelExporter.flush());
@@ -237,6 +246,12 @@ export default {
       const triggerSecret = request.headers.get('X-Trigger-Secret');
       if (!triggerSecret || triggerSecret !== env.TRIGGER_SECRET) {
         return new Response('Unauthorized', { status: 401 });
+      }
+
+      // LSH index rebuild job (for testing without waiting for nightly cron)
+      if (url.searchParams.get('job') === 'lsh_rebuild') {
+        ctx.waitUntil(runCFDLSHIndexRebuild(env));
+        return Response.json({ status: 'triggered', job: 'lsh_rebuild' });
       }
 
       console.log('[observer] Manual trigger initiated');
@@ -2797,6 +2812,140 @@ async function runCFDPatternExpiry(env: Env): Promise<void> {
     }
   } catch (err) {
     console.warn('[observer/cfd-evolution] Pattern expiry failed:', err);
+  }
+}
+
+/**
+ * Rebuild the MinHash LSH inverted index in KV for fast gateway-side candidate lookup.
+ * Called nightly at 2:00 AM UTC. Fetches all active malicious patterns with minhash from
+ * Supabase, computes 16 band hashes per pattern, and writes the inverted index to KV.
+ *
+ * KV key format: `cfd_lsh:band:{bandIndex}:{bandHash}` → JSON array of pattern IDs
+ * KV TTL: 16 hours (57600s) — rebuilt before expiry each night
+ */
+async function runCFDLSHIndexRebuild(env: Env): Promise<void> {
+  if (!env.BILLING_CACHE) return;
+  try {
+    // Paginate: fetch all active malicious patterns that have a minhash
+    const allPatterns: Array<{ id: string; minhash: string }> = [];
+    let lastId = '';
+    for (;;) {
+      const url = `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns`
+        + `?label=eq.malicious&is_active=eq.true&minhash=not.is.null`
+        + `&select=id,minhash&order=id&limit=2000`
+        + (lastId ? `&id=gt.${lastId}` : '');
+      const resp = await observerSupabaseFetch(url, {
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        },
+      });
+      if (!resp.ok) break;
+      const page = await resp.json() as Array<{ id: string; minhash: string }>;
+      if (page.length === 0) break;
+      allPatterns.push(...page);
+      lastId = page[page.length - 1].id;
+      if (page.length < 2000) break;
+    }
+
+    if (allPatterns.length === 0) {
+      console.log('[observer/cfd-lsh] No patterns with minhash — skipping LSH rebuild');
+      return;
+    }
+
+    // Build inverted index: bandKey → pattern ID[]
+    const bandMap = new Map<string, string[]>();
+    for (const { id, minhash } of allPatterns) {
+      const sig = deserializeMinHash(minhash);
+      if (!sig) continue;
+      const bands = computeBandHashes(sig);
+      for (let b = 0; b < bands.length; b++) {
+        const key = `cfd_lsh:band:${b}:${bands[b]}`;
+        const existing = bandMap.get(key);
+        if (existing) existing.push(id);
+        else bandMap.set(key, [id]);
+      }
+    }
+
+    // Batch-write to KV in chunks of 100 (respects ~1000 writes/s rate limit)
+    const TTL = 57600; // 16 hours
+    const entries = [...bandMap.entries()];
+    for (let i = 0; i < entries.length; i += 100) {
+      await Promise.all(
+        entries.slice(i, i + 100).map(([key, ids]) =>
+          env.BILLING_CACHE!.put(key, JSON.stringify(ids), { expirationTtl: TTL }).catch(() => {})
+        )
+      );
+    }
+
+    // Metadata key for health checks / verification
+    await env.BILLING_CACHE.put(
+      'cfd_lsh:meta',
+      JSON.stringify({ count: allPatterns.length, band_keys: bandMap.size, rebuilt_at: new Date().toISOString() }),
+      { expirationTtl: TTL }
+    ).catch(() => {});
+
+    console.log(`[observer/cfd-lsh] Rebuilt: ${allPatterns.length} patterns, ${bandMap.size} band keys`);
+  } catch (err) {
+    console.warn('[observer/cfd-lsh] LSH index rebuild failed:', err);
+  }
+}
+
+/**
+ * Refresh representative_minhash and card_count for families with ≥5 active patterns.
+ * Called nightly at 2:00 AM UTC alongside the LSH rebuild.
+ */
+async function runCFDConsolidation(env: Env): Promise<void> {
+  try {
+    const resp = await observerSupabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/rpc/consolidate_pattern_families`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      }
+    );
+    if (resp.ok) {
+      const result = await resp.json() as { consolidated: number; families_updated: string[] };
+      if (result.consolidated > 0) {
+        console.log(`[observer/cfd-families] Consolidated ${result.consolidated} families: ${result.families_updated.join(', ')}`);
+      }
+    }
+  } catch (err) {
+    console.warn('[observer/cfd-families] Consolidation failed:', err);
+  }
+}
+
+/**
+ * Expire auto-created candidate patterns older than 14 days that are still pending review.
+ * Called nightly at 2:00 AM UTC.
+ */
+async function runCFDExpireOrphans(env: Env): Promise<void> {
+  try {
+    const resp = await observerSupabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/rpc/expire_orphaned_candidates`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      }
+    );
+    if (resp.ok) {
+      const result = await resp.json() as { expired: number };
+      if (result.expired > 0) {
+        console.log(`[observer/cfd-orphans] Expired ${result.expired} orphaned candidate patterns`);
+      }
+    }
+  } catch (err) {
+    console.warn('[observer/cfd-orphans] Orphan expiry failed:', err);
   }
 }
 

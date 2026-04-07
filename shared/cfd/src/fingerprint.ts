@@ -134,6 +134,38 @@ export function deserializeMinHash(raw: string): number[] | null {
 
 void SERIALIZED_LENGTH; // suppress unused warning (used as documentation)
 
+// ── LSH band hashing ──────────────────────────────────────────────────────────
+
+const BAND_COUNT = 16;
+const BAND_WIDTH = NUM_HASHES / BAND_COUNT; // 4 values per band
+
+/**
+ * Divide a 64-element MinHash signature into 16 bands of 4 values each,
+ * hash each band using FNV-1a, and return 16 lowercase 8-char hex strings.
+ *
+ * Two texts with Jaccard similarity ≥ 0.65 share at least one band with
+ * high probability, making this an efficient pre-filter before full similarity.
+ *
+ * KV key pattern: `cfd_lsh:band:{bandIndex}:{result[bandIndex]}`
+ * Patterns sharing ≥1 band key with a query are near-duplicate candidates.
+ */
+export function computeBandHashes(sig: number[]): string[] {
+  const bands: string[] = [];
+  for (let b = 0; b < BAND_COUNT; b++) {
+    let h = 2166136261; // FNV-1a 32-bit offset basis
+    for (let i = 0; i < BAND_WIDTH; i++) {
+      const val = sig[b * BAND_WIDTH + i] >>> 0;
+      // Mix each byte of the 32-bit value into the running hash
+      for (let byte = 0; byte < 4; byte++) {
+        h ^= (val >>> (byte * 8)) & 0xff;
+        h = (h * 16777619) >>> 0; // FNV prime, unsigned 32-bit
+      }
+    }
+    bands.push(h.toString(16).padStart(8, '0'));
+  }
+  return bands;
+}
+
 /**
  * Check if a text is a near-duplicate of a known pattern.
  * Returns the similarity score (0-1) or 0 if the stored hash is invalid.

@@ -17,4 +17,4 @@ export type {
 } from './types.js';
 export type { L2Result, PreemptiveNudge } from './types.js';
 export { DEFAULT_CFD_CONFIG } from './types.js';
-export { computeMinHash, estimateSimilarity, serializeMinHash, deserializeMinHash, isSimilarToPattern } from './fingerprint.js';
+export { computeMinHash, estimateSimilarity, serializeMinHash, deserializeMinHash, isSimilarToPattern, computeBandHashes } from './fingerprint.js';
