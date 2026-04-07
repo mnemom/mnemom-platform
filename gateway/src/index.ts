@@ -1,5 +1,5 @@
 /**
- * Smoltbot Gateway Worker
+ * Mnemom Gateway Worker (mnemom-platform)
  *
  * The heart of the Smoltbot system - a Cloudflare Worker that:
  * 1. Intercepts API requests to Anthropic, OpenAI, and Gemini
@@ -2877,7 +2877,7 @@ function createOTelExporter(env: Env) {
   return createWorkersExporter({
     endpoint: env.OTLP_ENDPOINT,
     authorization: env.OTLP_AUTH,
-    serviceName: 'smoltbot-gateway',
+    serviceName: 'mnemom-gateway',
   });
 }
 

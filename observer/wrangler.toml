@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 # ─── Production ───────────────────────────────────────────────────────────────
 [env.production]
-name = "smoltbot-observer"
+name = "mnemom-observer"
 # CF Workers Paid Standard ($5/month) plan required: CFD analysis + OTel export per cron tick
 # can exceed 10ms bundled CPU on bulk log processing. Standard plan provides 30s CPU.
 usage_model = "standard"
@@ -26,7 +26,7 @@ OBSERVER_MAX_LOGS = "5000"
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
-name = "smoltbot-observer-staging"
+name = "mnemom-observer-staging"
 
 [env.staging.triggers]
 crons = ["*/5 * * * *"]
