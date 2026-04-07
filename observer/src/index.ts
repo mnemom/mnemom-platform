@@ -186,9 +186,14 @@ export default {
         ctx.waitUntil(runCFDAutoPromotion(env));
       }
 
-      // CFD adaptive threshold analysis (hourly)
+      // CFD adaptive threshold analysis (hourly, at :30)
       if (now.getUTCMinutes() === 30) {
         ctx.waitUntil(runCFDAdaptiveThresholds(env));
+      }
+
+      // Arena V2: process pending bypass events into recipes (hourly, at :45)
+      if (now.getUTCMinutes() === 45) {
+        ctx.waitUntil(runArenaSidebandAnalysis(env));
       }
 
       // Report daily usage to Stripe (midnight UTC only)
@@ -2946,6 +2951,127 @@ async function runCFDExpireOrphans(env: Env): Promise<void> {
     }
   } catch (err) {
     console.warn('[observer/cfd-orphans] Orphan expiry failed:', err);
+  }
+}
+
+/**
+ * Arena V2 sideband analyzer.
+ *
+ * Runs hourly (at :45). Polls arena_bypass_events WHERE recipe_status='pending'.
+ * For each:
+ *  1. Calls generate_arena_recipe() RPC to create a cfd_recipes row
+ *  2. Checks minhash similarity to existing active patterns
+ *  3. If similarity < 0.65 (genuinely novel): auto-promotes via promote_arena_recipe()
+ *  4. Otherwise: leaves in review queue for human action
+ *
+ * The auto-promotion threshold (0.65) is deliberately conservative.
+ * The CFD auto_promote_cfd_patterns() cron still handles the final activation.
+ */
+async function runArenaSidebandAnalysis(env: Env): Promise<void> {
+  try {
+    // Fetch up to 20 pending bypass events from the last 24 hours
+    const url = `${env.SUPABASE_URL}/rest/v1/arena_bypass_events`
+      + `?recipe_status=eq.pending`
+      + `&created_at=gte.${new Date(Date.now() - 86_400_000).toISOString()}`
+      + `&select=id,payload,minhash,door,mutation_type,detector_scores`
+      + `&order=created_at.desc&limit=20`;
+
+    const resp = await observerSupabaseFetch(url, {
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      },
+    });
+    if (!resp.ok) {
+      console.warn('[observer/arena-sideband] Failed to fetch bypass events:', resp.status);
+      return;
+    }
+
+    const events = await resp.json() as Array<{
+      id: string;
+      payload: string;
+      minhash?: string;
+      door: string;
+      mutation_type?: string;
+      detector_scores?: Record<string, unknown>;
+    }>;
+
+    if (events.length === 0) return;
+
+    let generated = 0;
+    let promoted = 0;
+
+    for (const event of events) {
+      // Step 1: generate the recipe
+      const genResp = await observerSupabaseFetch(
+        `${env.SUPABASE_URL}/rest/v1/rpc/generate_arena_recipe`,
+        {
+          method: 'POST',
+          headers: {
+            apikey: env.SUPABASE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ p_bypass_id: event.id }),
+        }
+      );
+      if (!genResp.ok) continue;
+      const genResult = await genResp.json() as { recipe_id?: string; error?: string };
+      if (!genResult.recipe_id) continue;
+      generated++;
+
+      // Step 2: check if this is a genuinely novel bypass (no similar active pattern)
+      // If the bypass event has a precomputed minhash, use it.
+      // If not, skip auto-promotion and leave for human review.
+      if (!event.minhash) continue;
+
+      // Step 3: check similarity against active patterns
+      // Use the minhash_similarity RPC on the top existing pattern
+      const simResp = await observerSupabaseFetch(
+        `${env.SUPABASE_URL}/rest/v1/rpc/check_bypass_novelty`,
+        {
+          method: 'POST',
+          headers: {
+            apikey: env.SUPABASE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ p_minhash: event.minhash }),
+        }
+      );
+
+      let isNovel = true;
+      if (simResp.ok) {
+        const simResult = await simResp.json() as { max_similarity: number };
+        // If max similarity to ANY existing active pattern is >= 0.65, not novel
+        if (simResult.max_similarity >= 0.65) {
+          isNovel = false;
+        }
+      }
+
+      // Step 4: auto-promote novel bypasses
+      if (isNovel) {
+        const promoteResp = await observerSupabaseFetch(
+          `${env.SUPABASE_URL}/rest/v1/rpc/promote_arena_recipe`,
+          {
+            method: 'POST',
+            headers: {
+              apikey: env.SUPABASE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ p_recipe_id: genResult.recipe_id }),
+          }
+        );
+        if (promoteResp.ok) promoted++;
+      }
+    }
+
+    if (generated > 0) {
+      console.log(`[observer/arena-sideband] Processed ${events.length} bypass events: ${generated} recipes generated, ${promoted} auto-promoted`);
+    }
+  } catch (err) {
+    console.warn('[observer/arena-sideband] Sideband analysis failed:', err);
   }
 }
 
