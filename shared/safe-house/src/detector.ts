@@ -1,7 +1,7 @@
 import { scanDLP } from './dlp.js';
 import { computeMinHash, isSimilarToPattern } from './fingerprint.js';
 import type {
-  ThreatDetection, ThreatType, CFDThreatPattern, SessionRiskState,
+  ThreatDetection, ThreatType, SafeHouseThreatPattern, SessionRiskState,
   SourceType, L1Options,
 } from './types.js';
 import { detectLanguage, hasNativeL1Support } from './lang-detect.js';
@@ -187,7 +187,7 @@ const MAX_L1_CONTENT_LENGTH = 8_000;
 
 export function runL1Detection(
   content: string,
-  patterns: CFDThreatPattern[] = [],
+  patterns: SafeHouseThreatPattern[] = [],
   options: L1Options = {},
 ): L1Result {
   const surface = options.surface;

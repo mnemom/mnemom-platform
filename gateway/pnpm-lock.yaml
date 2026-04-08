@@ -14,9 +14,9 @@ importers:
       '@mnemom/aip-otel-exporter':
         specifier: ^0.5.0
         version: 0.5.0
-      '@mnemom/cfd':
-        specifier: file:../shared/cfd
-        version: file:../shared/cfd
+      '@mnemom/safe-house':
+        specifier: file:../shared/safe-house
+        version: file:../shared/safe-house
       '@mnemom/policy-engine':
         specifier: file:../shared/policy-engine
         version: file:../shared/policy-engine
@@ -614,8 +614,8 @@ packages:
       '@opentelemetry/api':
         optional: true
 
-  '@mnemom/cfd@file:../shared/cfd':
-    resolution: {directory: ../shared/cfd, type: directory}
+  '@mnemom/safe-house@file:../shared/safe-house':
+    resolution: {directory: ../shared/safe-house, type: directory}
 
   '@mnemom/policy-engine@file:../shared/policy-engine':
     resolution: {directory: ../shared/policy-engine, type: directory}
@@ -1610,7 +1610,7 @@ snapshots:
 
   '@mnemom/aip-otel-exporter@0.5.0': {}
 
-  '@mnemom/cfd@file:../shared/cfd': {}
+  '@mnemom/safe-house@file:../shared/safe-house': {}
 
   '@mnemom/policy-engine@file:../shared/policy-engine':
     dependencies:

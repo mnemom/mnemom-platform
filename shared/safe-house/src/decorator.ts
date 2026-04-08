@@ -1,4 +1,4 @@
-import type { CFDDecision, AnnotatedMessage, QuarantineNotification, ThreatType } from './types.js';
+import type { SafeHouseDecision, AnnotatedMessage, QuarantineNotification, ThreatType } from './types.js';
 
 function escapeXml(str: string): string {
   return str
@@ -24,7 +24,7 @@ function threatLabel(type: ThreatType): string {
   return labels[type] ?? type;
 }
 
-function instructionForThreats(threats: CFDDecision['threats']): string {
+function instructionForThreats(threats: SafeHouseDecision['threats']): string {
   const types = new Set(threats.map(t => t.type));
   const parts: string[] = [];
 
@@ -70,7 +70,7 @@ function instructionForThreats(threats: CFDDecision['threats']): string {
  */
 export function decorateMessage(
   message: string,
-  decision: CFDDecision,
+  decision: SafeHouseDecision,
   options: { source_type?: string; sender_verified?: boolean } = {},
 ): AnnotatedMessage {
   const { source_type = 'unknown', sender_verified = false } = options;
@@ -86,7 +86,7 @@ export function decorateMessage(
     : '';
 
   const assessment = [
-    `<context_security_assessment cfd_version="1">`,
+    `<context_security_assessment sh_version="1">`,
     `  <verdict>WARN</verdict>`,
     `  <threats>`,
     threatXml,
@@ -103,7 +103,7 @@ export function decorateMessage(
   const wrappedContent = [
     assessment,
     '',
-    `<untrusted_content source="${escapeXml(source_type)}"${senderAttr} cfd_scanned="true">`,
+    `<untrusted_content source="${escapeXml(source_type)}"${senderAttr} sh_scanned="true">`,
     message,
     `</untrusted_content>`,
   ].join('\n');
@@ -122,7 +122,7 @@ export function decorateMessage(
  */
 export function buildQuarantineNotification(
   quarantineId: string,
-  decision: CFDDecision,
+  decision: SafeHouseDecision,
   options: {
     apparent_sender?: string;
     review_base_url?: string;
@@ -136,11 +136,11 @@ export function buildQuarantineNotification(
     ? `\n  <apparent_sender>${escapeXml(options.apparent_sender)}</apparent_sender>`
     : '';
   const reviewUrl = options.review_base_url
-    ? `${options.review_base_url}/cfd/quarantine/${quarantineId}`
-    : `https://app.mnemom.com/cfd/quarantine/${quarantineId}`;
+    ? `${options.review_base_url}/safe-house/quarantine/${quarantineId}`
+    : `https://app.mnemom.com/safe-house/quarantine/${quarantineId}`;
 
   const xml = [
-    `<quarantine_notification cfd_version="1">`,
+    `<quarantine_notification sh_version="1">`,
     `  <status>BLOCKED</status>`,
     `  <reason>${topThreat.type}</reason>`,
     `  <confidence>${pct / 100}</confidence>`,

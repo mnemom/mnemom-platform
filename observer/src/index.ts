@@ -37,7 +37,7 @@ import {
   type ToolReference,
 } from '@mnemom/policy-engine';
 import { createCircuitBreaker, checkAndReset, recordSuccess, recordFailure } from './circuit-breaker';
-import { computeBandHashes, deserializeMinHash } from '@mnemom/cfd';
+import { computeBandHashes, deserializeMinHash } from '@mnemom/safe-house';
 
 const AAP_VERSION = '1.0';
 const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
@@ -179,16 +179,16 @@ export default {
       // Roll up metering events for billing (idempotent, safe every tick)
       ctx.waitUntil(triggerMeteringRollup(env));
 
-      // CFD pattern auto-promotion (every 5 minutes when enabled)
+      // Safe House pattern auto-promotion (every 5 minutes when enabled)
       const now = new Date();
       const now5 = now;
       if (now5.getUTCMinutes() % 5 === 0) {
-        ctx.waitUntil(runCFDAutoPromotion(env));
+        ctx.waitUntil(runSHAutoPromotion(env));
       }
 
-      // CFD adaptive threshold analysis (hourly, at :30)
+      // Safe House adaptive threshold analysis (hourly, at :30)
       if (now.getUTCMinutes() === 30) {
-        ctx.waitUntil(runCFDAdaptiveThresholds(env));
+        ctx.waitUntil(runSHAdaptiveThresholds(env));
       }
 
       // Arena V2: process pending bypass events into recipes (hourly, at :45)
@@ -205,15 +205,15 @@ export default {
       const now2 = new Date();
       // Pattern TTL expiry — stale patterns deactivated weekly
       if (now2.getUTCDay() === 0 && now2.getUTCHours() === 0 && now2.getUTCMinutes() === 0) {
-        ctx.waitUntil(runCFDRetentionCleanup(env));
-        ctx.waitUntil(runCFDPatternExpiry(env)); // NEW
+        ctx.waitUntil(runSHRetentionCleanup(env));
+        ctx.waitUntil(runSHPatternExpiry(env)); // NEW
       }
 
       // Nightly LSH index rebuild + family consolidation + orphan expiry (2:00 AM UTC)
       if (now.getUTCHours() === 2 && now.getUTCMinutes() === 0) {
-        ctx.waitUntil(runCFDLSHIndexRebuild(env));
-        ctx.waitUntil(runCFDConsolidation(env));
-        ctx.waitUntil(runCFDExpireOrphans(env));
+        ctx.waitUntil(runSHLSHIndexRebuild(env));
+        ctx.waitUntil(runSHConsolidation(env));
+        ctx.waitUntil(runSHExpireOrphans(env));
       }
 
       // Flush OTel spans for all processed logs in one batch
@@ -255,7 +255,7 @@ export default {
 
       // LSH index rebuild job (for testing without waiting for nightly cron)
       if (url.searchParams.get('job') === 'lsh_rebuild') {
-        ctx.waitUntil(runCFDLSHIndexRebuild(env));
+        ctx.waitUntil(runSHLSHIndexRebuild(env));
         return Response.json({ status: 'triggered', job: 'lsh_rebuild' });
       }
 
@@ -560,8 +560,8 @@ async function processLog(
       .then(() => detectDisagreement(agent_id, session_id, trace.trace_id, verification, env, otelExporter))
   );
 
-  // Emit CFD calibration signal for false negative detection (fire-and-forget)
-  ctx.waitUntil(emitCFDCalibrationSignal(agent_id, session_id, verification?.verified === false ? 'boundary_violation' : '', null, env));
+  // Emit Safe House calibration signal for false negative detection (fire-and-forget)
+  ctx.waitUntil(emitSHCalibrationSignal(agent_id, session_id, verification?.verified === false ? 'boundary_violation' : '', null, env));
 
   // Check for behavioral drift (runs in background)
   ctx.waitUntil(checkForDrift(agent_id, card, env, otelExporter));
@@ -1939,15 +1939,15 @@ Rules:
 - Be precise in your reasoning — cite specific evidence from both assessments`;
 
 /**
- * Emit a CFD calibration signal when AIP detects a boundary violation.
- * This enables the CFD closed feedback loop:
- * - If AIP verdict = boundary_violation and a recent CFD evaluation exists for this session,
- *   we emit a 'false_negative' signal so CFD can improve its detection thresholds.
+ * Emit a Safe House calibration signal when AIP detects a boundary violation.
+ * This enables the Safe House closed feedback loop:
+ * - If AIP verdict = boundary_violation and a recent Safe House evaluation exists for this session,
+ *   we emit a 'false_negative' signal so Safe House can improve its detection thresholds.
  * - If the agent's thinking block shows it noticed the threat but proceeded,
  *   we emit a 'thinking_integrity' signal for retroactive scoring.
  * Always fire-and-forget — never throws.
  */
-async function emitCFDCalibrationSignal(
+async function emitSHCalibrationSignal(
   agentId: string,
   sessionId: string,
   checkpointVerdict: string,
@@ -1957,9 +1957,9 @@ async function emitCFDCalibrationSignal(
   try {
     if (checkpointVerdict !== 'boundary_violation') return;
 
-    // Look up the most recent CFD evaluation for this agent+session
+    // Look up the most recent Safe House evaluation for this agent+session
     const cfdResp = await observerSupabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/cfd_evaluations?agent_id=eq.${agentId}&session_id=eq.${sessionId}&order=created_at.desc&limit=1`,
+      `${env.SUPABASE_URL}/rest/v1/sh_evaluations?agent_id=eq.${agentId}&session_id=eq.${sessionId}&order=created_at.desc&limit=1`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -1980,13 +1980,13 @@ async function emitCFDCalibrationSignal(
 
     const cfdEval = cfdEvals[0];
 
-    // Only emit if CFD scored this session LOW (i.e., a false negative)
-    if (cfdEval.overall_risk >= 0.6) return; // CFD already flagged it — not a false negative
+    // Only emit if Safe House scored this session LOW (i.e., a false negative)
+    if (cfdEval.overall_risk >= 0.6) return; // Safe House already flagged it — not a false negative
 
     // Compute retroactive score: bump it up since AIP found a real violation
     const retroactiveScore = Math.min(cfdEval.overall_risk + 0.35, 0.95);
 
-    await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/cfd_calibration_signals`, {
+    await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/sh_calibration_signals`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -1996,15 +1996,15 @@ async function emitCFDCalibrationSignal(
       },
       body: JSON.stringify({
         signal_type: 'false_negative',
-        cfd_evaluation_id: cfdEval.id,
-        cfd_original_score: cfdEval.overall_risk,
+        sh_evaluation_id: cfdEval.id,
+        sh_original_score: cfdEval.overall_risk,
         aip_verdict: checkpointVerdict,
         aip_concerns: concerns,
         retroactive_score: retroactiveScore,
       }),
     });
 
-    console.log(`[observer/cfd] Calibration signal emitted: false_negative for agent ${agentId} session ${sessionId} (original CFD score: ${cfdEval.overall_risk.toFixed(2)} → retroactive: ${retroactiveScore.toFixed(2)})`);
+    console.log(`[observer/safe-house] Calibration signal emitted: false_negative for agent ${agentId} session ${sessionId} (original Safe House score: ${cfdEval.overall_risk.toFixed(2)} → retroactive: ${retroactiveScore.toFixed(2)})`);
   } catch {
     // Fire-and-forget: never throws
   }
@@ -2706,12 +2706,12 @@ async function applyCardAmendment(
 
 
 /**
- * Call cleanup_expired_cfd_data() RPC to enforce retention policies.
+ * Call cleanup_expired_sh_data() RPC to enforce retention policies.
  * Runs weekly (Sundays at midnight UTC).
  */
-async function runCFDRetentionCleanup(env: Env): Promise<void> {
+async function runSHRetentionCleanup(env: Env): Promise<void> {
   try {
-    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/cleanup_expired_cfd_data`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/cleanup_expired_sh_data`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2722,23 +2722,23 @@ async function runCFDRetentionCleanup(env: Env): Promise<void> {
     });
     if (resp.ok) {
       const result = await resp.json() as { quarantine_deleted: number; evaluations_deleted: number };
-      console.log(`[observer/retention] CFD cleanup: ${result.quarantine_deleted} quarantine, ${result.evaluations_deleted} evaluations deleted`);
+      console.log(`[observer/retention] Safe House cleanup: ${result.quarantine_deleted} quarantine, ${result.evaluations_deleted} evaluations deleted`);
     } else {
-      console.warn(`[observer/retention] CFD cleanup RPC failed: ${resp.status}`);
+      console.warn(`[observer/retention] Safe House cleanup RPC failed: ${resp.status}`);
     }
   } catch (err) {
-    console.warn('[observer/retention] CFD cleanup failed:', err);
+    console.warn('[observer/retention] Safe House cleanup failed:', err);
   }
 }
 
 /**
- * Auto-promote high-confidence CFD patterns to active status.
+ * Auto-promote high-confidence Safe House patterns to active status.
  * Called every 5 minutes by the observer cron.
- * Only runs when cfd_auto_promote_enabled = true in security_settings.
+ * Only runs when sh_auto_promote_enabled = true in security_settings.
  */
-async function runCFDAutoPromotion(env: Env): Promise<void> {
+async function runSHAutoPromotion(env: Env): Promise<void> {
   try {
-    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/auto_promote_cfd_patterns`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/auto_promote_sh_patterns`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2750,23 +2750,23 @@ async function runCFDAutoPromotion(env: Env): Promise<void> {
     if (resp.ok) {
       const result = await resp.json() as { promoted: number; reason?: string };
       if (result.promoted > 0) {
-        console.log(`[observer/cfd-evolution] Auto-promoted ${result.promoted} CFD patterns`);
+        console.log(`[observer/safe-house-evolution] Auto-promoted ${result.promoted} Safe House patterns`);
       }
     }
   } catch (err) {
-    console.warn('[observer/cfd-evolution] Auto-promotion failed:', err);
+    console.warn('[observer/safe-house-evolution] Auto-promotion failed:', err);
   }
 }
 
 /**
  * Check false positive rates and emit threshold suggestions when FP rate exceeds threshold.
  * Called hourly by the observer cron.
- * Suggestions are stored in cfd_configs.suggested_warn_threshold (if the column exists)
+ * Suggestions are stored in sh_configs.suggested_warn_threshold (if the column exists)
  * or logged for admin review.
  */
-async function runCFDAdaptiveThresholds(env: Env): Promise<void> {
+async function runSHAdaptiveThresholds(env: Env): Promise<void> {
   try {
-    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_cfd_threshold_suggestions`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_sh_threshold_suggestions`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2785,24 +2785,24 @@ async function runCFDAdaptiveThresholds(env: Env): Promise<void> {
     }>;
 
     if (suggestions.length > 0) {
-      console.log(`[observer/cfd-evolution] Threshold suggestions: ${suggestions.length} bands with high FP rate`);
+      console.log(`[observer/safe-house-evolution] Threshold suggestions: ${suggestions.length} bands with high FP rate`);
       for (const s of suggestions) {
-        console.log(`[observer/cfd-evolution] Band ${s.confidence_band}-${(s.confidence_band + 0.1).toFixed(1)}: FP rate ${s.fp_rate}% → suggest warn threshold ${s.suggested_threshold}`);
+        console.log(`[observer/safe-house-evolution] Band ${s.confidence_band}-${(s.confidence_band + 0.1).toFixed(1)}: FP rate ${s.fp_rate}% → suggest warn threshold ${s.suggested_threshold}`);
       }
     }
   } catch (err) {
-    console.warn('[observer/cfd-evolution] Adaptive threshold check failed:', err);
+    console.warn('[observer/safe-house-evolution] Adaptive threshold check failed:', err);
   }
 }
 
 /**
- * Deactivate CFD threat patterns that haven't been matched recently (TTL expired).
+ * Deactivate Safe House threat patterns that haven't been matched recently (TTL expired).
  * Prevents the pattern library from accumulating stale entries that slow down L1 matching.
  * Called weekly (Sunday midnight UTC).
  */
-async function runCFDPatternExpiry(env: Env): Promise<void> {
+async function runSHPatternExpiry(env: Env): Promise<void> {
   try {
-    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/expire_stale_cfd_patterns`, {
+    const resp = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/expire_stale_sh_patterns`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -2813,10 +2813,10 @@ async function runCFDPatternExpiry(env: Env): Promise<void> {
     });
     if (resp.ok) {
       const result = await resp.json() as { expired: number; ttl_days: number };
-      console.log(`[observer/cfd-evolution] Pattern TTL: ${result.expired} patterns expired (TTL: ${result.ttl_days}d)`);
+      console.log(`[observer/safe-house-evolution] Pattern TTL: ${result.expired} patterns expired (TTL: ${result.ttl_days}d)`);
     }
   } catch (err) {
-    console.warn('[observer/cfd-evolution] Pattern expiry failed:', err);
+    console.warn('[observer/safe-house-evolution] Pattern expiry failed:', err);
   }
 }
 
@@ -2825,17 +2825,17 @@ async function runCFDPatternExpiry(env: Env): Promise<void> {
  * Called nightly at 2:00 AM UTC. Fetches all active malicious patterns with minhash from
  * Supabase, computes 16 band hashes per pattern, and writes the inverted index to KV.
  *
- * KV key format: `cfd_lsh:band:{bandIndex}:{bandHash}` → JSON array of pattern IDs
+ * KV key format: `sh_lsh:band:{bandIndex}:{bandHash}` → JSON array of pattern IDs
  * KV TTL: 16 hours (57600s) — rebuilt before expiry each night
  */
-async function runCFDLSHIndexRebuild(env: Env): Promise<void> {
+async function runSHLSHIndexRebuild(env: Env): Promise<void> {
   if (!env.BILLING_CACHE) return;
   try {
     // Paginate: fetch all active malicious patterns that have a minhash
     const allPatterns: Array<{ id: string; minhash: string }> = [];
     let lastId = '';
     for (;;) {
-      const url = `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns`
+      const url = `${env.SUPABASE_URL}/rest/v1/sh_threat_patterns`
         + `?label=eq.malicious&is_active=eq.true&minhash=not.is.null`
         + `&select=id,minhash&order=id&limit=2000`
         + (lastId ? `&id=gt.${lastId}` : '');
@@ -2854,7 +2854,7 @@ async function runCFDLSHIndexRebuild(env: Env): Promise<void> {
     }
 
     if (allPatterns.length === 0) {
-      console.log('[observer/cfd-lsh] No patterns with minhash — skipping LSH rebuild');
+      console.log('[observer/sh-lsh] No patterns with minhash — skipping LSH rebuild');
       return;
     }
 
@@ -2865,7 +2865,7 @@ async function runCFDLSHIndexRebuild(env: Env): Promise<void> {
       if (!sig) continue;
       const bands = computeBandHashes(sig);
       for (let b = 0; b < bands.length; b++) {
-        const key = `cfd_lsh:band:${b}:${bands[b]}`;
+        const key = `sh_lsh:band:${b}:${bands[b]}`;
         const existing = bandMap.get(key);
         if (existing) existing.push(id);
         else bandMap.set(key, [id]);
@@ -2885,14 +2885,14 @@ async function runCFDLSHIndexRebuild(env: Env): Promise<void> {
 
     // Metadata key for health checks / verification
     await env.BILLING_CACHE.put(
-      'cfd_lsh:meta',
+      'sh_lsh:meta',
       JSON.stringify({ count: allPatterns.length, band_keys: bandMap.size, rebuilt_at: new Date().toISOString() }),
       { expirationTtl: TTL }
     ).catch(() => {});
 
-    console.log(`[observer/cfd-lsh] Rebuilt: ${allPatterns.length} patterns, ${bandMap.size} band keys`);
+    console.log(`[observer/sh-lsh] Rebuilt: ${allPatterns.length} patterns, ${bandMap.size} band keys`);
   } catch (err) {
-    console.warn('[observer/cfd-lsh] LSH index rebuild failed:', err);
+    console.warn('[observer/sh-lsh] LSH index rebuild failed:', err);
   }
 }
 
@@ -2900,7 +2900,7 @@ async function runCFDLSHIndexRebuild(env: Env): Promise<void> {
  * Refresh representative_minhash and card_count for families with ≥5 active patterns.
  * Called nightly at 2:00 AM UTC alongside the LSH rebuild.
  */
-async function runCFDConsolidation(env: Env): Promise<void> {
+async function runSHConsolidation(env: Env): Promise<void> {
   try {
     const resp = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/rpc/consolidate_pattern_families`,
@@ -2917,11 +2917,11 @@ async function runCFDConsolidation(env: Env): Promise<void> {
     if (resp.ok) {
       const result = await resp.json() as { consolidated: number; families_updated: string[] };
       if (result.consolidated > 0) {
-        console.log(`[observer/cfd-families] Consolidated ${result.consolidated} families: ${result.families_updated.join(', ')}`);
+        console.log(`[observer/sh-families] Consolidated ${result.consolidated} families: ${result.families_updated.join(', ')}`);
       }
     }
   } catch (err) {
-    console.warn('[observer/cfd-families] Consolidation failed:', err);
+    console.warn('[observer/sh-families] Consolidation failed:', err);
   }
 }
 
@@ -2929,7 +2929,7 @@ async function runCFDConsolidation(env: Env): Promise<void> {
  * Expire auto-created candidate patterns older than 14 days that are still pending review.
  * Called nightly at 2:00 AM UTC.
  */
-async function runCFDExpireOrphans(env: Env): Promise<void> {
+async function runSHExpireOrphans(env: Env): Promise<void> {
   try {
     const resp = await observerSupabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/rpc/expire_orphaned_candidates`,
@@ -2946,11 +2946,11 @@ async function runCFDExpireOrphans(env: Env): Promise<void> {
     if (resp.ok) {
       const result = await resp.json() as { expired: number };
       if (result.expired > 0) {
-        console.log(`[observer/cfd-orphans] Expired ${result.expired} orphaned candidate patterns`);
+        console.log(`[observer/sh-orphans] Expired ${result.expired} orphaned candidate patterns`);
       }
     }
   } catch (err) {
-    console.warn('[observer/cfd-orphans] Orphan expiry failed:', err);
+    console.warn('[observer/sh-orphans] Orphan expiry failed:', err);
   }
 }
 
@@ -2959,13 +2959,13 @@ async function runCFDExpireOrphans(env: Env): Promise<void> {
  *
  * Runs hourly (at :45). Polls arena_bypass_events WHERE recipe_status='pending'.
  * For each:
- *  1. Calls generate_arena_recipe() RPC to create a cfd_recipes row
+ *  1. Calls generate_arena_recipe() RPC to create a sh_recipes row
  *  2. Checks minhash similarity to existing active patterns
  *  3. If similarity < 0.65 (genuinely novel): auto-promotes via promote_arena_recipe()
  *  4. Otherwise: leaves in review queue for human action
  *
  * The auto-promotion threshold (0.65) is deliberately conservative.
- * The CFD auto_promote_cfd_patterns() cron still handles the final activation.
+ * The Safe House auto_promote_sh_patterns() cron still handles the final activation.
  */
 async function runArenaSidebandAnalysis(env: Env): Promise<void> {
   try {
@@ -3149,7 +3149,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
     // Fetch accounts with active metered subscriptions (checks and/or proofs)
     // Include stripe_customer_id for meter events API (proofs)
     const accountsResponse = await observerSupabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/billing_accounts?subscription_status=in.(active,trialing)&stripe_subscription_item_id=not.is.null&select=account_id,stripe_customer_id,stripe_subscription_item_id,check_count_this_period,stripe_proof_subscription_item_id,proof_count_this_period,stripe_cfd_subscription_item_id,cfd_check_count_this_period`,
+      `${env.SUPABASE_URL}/rest/v1/billing_accounts?subscription_status=in.(active,trialing)&stripe_subscription_item_id=not.is.null&select=account_id,stripe_customer_id,stripe_subscription_item_id,check_count_this_period,stripe_proof_subscription_item_id,proof_count_this_period,stripe_sh_subscription_item_id,sh_check_count_this_period`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -3170,8 +3170,8 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
       check_count_this_period: number;
       stripe_proof_subscription_item_id: string | null;
       proof_count_this_period: number;
-      stripe_cfd_subscription_item_id: string | null;        // NEW
-      cfd_check_count_this_period: number;                   // NEW
+      stripe_sh_subscription_item_id: string | null;        // NEW
+      sh_check_count_this_period: number;                   // NEW
     }>;
 
     const today = new Date().toISOString().split('T')[0];
@@ -3271,24 +3271,24 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
           });
         }
 
-        // Report CFD check usage (follows same pattern as integrity checks)
-        let cfdQuantity = 0;
-        if (account.stripe_cfd_subscription_item_id && (account.cfd_check_count_this_period || 0) > 0) {
-          cfdQuantity = account.cfd_check_count_this_period || 0;
-          const cfdIdempotencyKey = `${account.account_id}-cfd-${today}`;
+        // Report Safe House check usage (follows same pattern as integrity checks)
+        let shQuantity = 0;
+        if (account.stripe_sh_subscription_item_id && (account.sh_check_count_this_period || 0) > 0) {
+          shQuantity = account.sh_check_count_this_period || 0;
+          const shIdempotencyKey = `${account.account_id}-sh-${today}`;
 
           await (stripe as any).subscriptionItems.createUsageRecord(
-            account.stripe_cfd_subscription_item_id,
+            account.stripe_sh_subscription_item_id,
             {
-              quantity: cfdQuantity,
+              quantity: shQuantity,
               timestamp: Math.floor(Date.now() / 1000),
               action: 'set',
             },
-            { idempotencyKey: cfdIdempotencyKey }
+            { idempotencyKey: shIdempotencyKey }
           );
 
-          // Record CFD usage in stripe_usage_reports
-          const cfdReportId = `sur-${crypto.randomUUID().slice(0, 8)}`;
+          // Record Safe House usage in stripe_usage_reports
+          const shReportId = `sur-${crypto.randomUUID().slice(0, 8)}`;
           await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/stripe_usage_reports`, {
             method: 'POST',
             headers: {
@@ -3298,11 +3298,11 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
               Prefer: 'return=minimal',
             },
             body: JSON.stringify({
-              id: cfdReportId,
+              id: shReportId,
               account_id: account.account_id,
-              stripe_subscription_item_id: account.stripe_cfd_subscription_item_id,
-              reported_quantity: cfdQuantity,
-              idempotency_key: cfdIdempotencyKey,
+              stripe_subscription_item_id: account.stripe_sh_subscription_item_id,
+              reported_quantity: shQuantity,
+              idempotency_key: shIdempotencyKey,
             }),
           });
         }
@@ -3324,7 +3324,7 @@ async function reportDailyUsageToStripe(env: Env): Promise<void> {
             details: {
               check_quantity: checkQuantity,
               proof_quantity: proofQuantity,
-              cfd_quantity: cfdQuantity,
+              sh_quantity: shQuantity,
               date: today,
               check_idempotency_key: checkIdempotencyKey,
               proof_identifier: proofQuantity > 0
@@ -3412,12 +3412,12 @@ async function checkForDrift(
 }
 
 /**
- * Write CFD training traces for messages that preceded detected behavioral drift.
+ * Write Safe House training traces for messages that preceded detected behavioral drift.
  * These become labeled "high_risk" examples: the message the agent received
  * before drifting toward unsafe behavior is likely adversarial.
  * Always fire-and-forget — never throws.
  */
-async function writeCFDDriftTrainingTraces(
+async function writeSHDriftTrainingTraces(
   agentId: string,
   driftAlertId: string,
   traceIds: string[],
@@ -3436,7 +3436,7 @@ async function writeCFDDriftTrainingTraces(
       label: 'high_risk',
     }));
 
-    await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/cfd_training_traces`, {
+    await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/sh_training_traces`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -3447,7 +3447,7 @@ async function writeCFDDriftTrainingTraces(
       body: JSON.stringify(inserts),
     });
 
-    console.log(`[observer/cfd] Wrote ${inserts.length} drift training traces for alert ${driftAlertId}`);
+    console.log(`[observer/safe-house] Wrote ${inserts.length} drift training traces for alert ${driftAlertId}`);
   } catch {
     // Fire-and-forget: never throws
   }
@@ -3491,8 +3491,8 @@ async function storeDriftAlert(
     if (!response.ok) {
       console.warn(`[observer] Failed to store drift alert: ${response.status}`);
     } else {
-      // Write CFD training traces for preceding messages (fire-and-forget)
-      writeCFDDriftTrainingTraces(agentId, alert.id, driftAlert.trace_ids, env).catch(() => {});
+      // Write Safe House training traces for preceding messages (fire-and-forget)
+      writeSHDriftTrainingTraces(agentId, alert.id, driftAlert.trace_ids, env).catch(() => {});
     }
   } catch (error) {
     console.error('[observer] Error storing drift alert:', error);
