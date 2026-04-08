@@ -1,11 +1,11 @@
 /**
- * Tests for the CFD MinHash LSH pre-filter and context family filter logic.
+ * Tests for the Safe House MinHash LSH pre-filter and context family filter logic.
  *
  * These tests validate the core LSH candidate selection algorithm directly,
  * without importing from the full gateway index.ts (which requires all
  * file:-linked packages to be built — only available in CI).
  *
- * The gateway functions (fetchCFDLSHCandidates, fetchCFDContextFamilies) are
+ * The gateway functions (fetchSHLSHCandidates, fetchSHContextFamilies) are
  * also covered by integration tests in CI. This file tests the underlying
  * band-hash matching logic independently.
  */
@@ -16,11 +16,11 @@ import {
   computeBandHashes,
   preprocessForDetection,
   deserializeMinHash,
-} from '@mnemom/cfd';
-import type { CFDThreatPattern } from '@mnemom/cfd';
+} from '@mnemom/safe-house';
+import type { SafeHouseThreatPattern } from '@mnemom/safe-house';
 
-// Build a CFDThreatPattern with a valid minhash
-function makePattern(id: string, text: string, family?: string): CFDThreatPattern {
+// Build a SafeHouseThreatPattern with a valid minhash
+function makePattern(id: string, text: string, family?: string): SafeHouseThreatPattern {
   return {
     id,
     threat_type: 'prompt_injection',
@@ -31,17 +31,17 @@ function makePattern(id: string, text: string, family?: string): CFDThreatPatter
   };
 }
 
-// Inline the LSH candidate selection logic (same as gateway fetchCFDLSHCandidates)
+// Inline the LSH candidate selection logic (same as gateway fetchSHLSHCandidates)
 // This lets us test the algorithm without importing the full gateway module.
 async function selectLSHCandidates(
   normalizedContent: string,
-  allPatterns: CFDThreatPattern[],
+  allPatterns: SafeHouseThreatPattern[],
   kv: Map<string, string>,
-): Promise<CFDThreatPattern[]> {
+): Promise<SafeHouseThreatPattern[]> {
   if (allPatterns.length === 0) return allPatterns;
   const sig = computeMinHash(normalizedContent);
   const bandHashes = computeBandHashes(sig);
-  const keys = bandHashes.map((h, i) => `cfd_lsh:band:${i}:${h}`);
+  const keys = bandHashes.map((h, i) => `sh_lsh:band:${i}:${h}`);
   const results = await Promise.all(keys.map(k => Promise.resolve(kv.get(k) ?? null)));
   const candidateIds = new Set<string>();
   for (const r of results) {
@@ -53,8 +53,8 @@ async function selectLSHCandidates(
   return allPatterns.filter(p => candidateIds.has(p.id));
 }
 
-// Build a KV map for a set of patterns (simulates what runCFDLSHIndexRebuild writes)
-function buildKVIndex(patterns: CFDThreatPattern[]): Map<string, string> {
+// Build a KV map for a set of patterns (simulates what runSHLSHIndexRebuild writes)
+function buildKVIndex(patterns: SafeHouseThreatPattern[]): Map<string, string> {
   const kv = new Map<string, string>();
   for (const p of patterns) {
     if (!p.minhash) continue;
@@ -62,7 +62,7 @@ function buildKVIndex(patterns: CFDThreatPattern[]): Map<string, string> {
     if (!sig) continue;
     const bands = computeBandHashes(sig);
     for (let b = 0; b < bands.length; b++) {
-      const key = `cfd_lsh:band:${b}:${bands[b]}`;
+      const key = `sh_lsh:band:${b}:${bands[b]}`;
       const existing = kv.get(key);
       const ids: string[] = existing ? JSON.parse(existing) : [];
       ids.push(p.id);
@@ -132,14 +132,14 @@ describe('LSH candidate selection', () => {
 
   it('context family filter — patterns without matching family are excluded', () => {
     // Test the family filter logic (run synchronously)
-    const patterns: CFDThreatPattern[] = [
+    const patterns: SafeHouseThreatPattern[] = [
       makePattern('p1', 'indirect injection text', 'indirect_injection'),
       makePattern('p2', 'prompt injection text', 'prompt_injection'),
       makePattern('p3', 'no family text', undefined),
     ];
     const relevantFamilies = new Set(['indirect_injection', 'data_exfiltration']);
 
-    // Phase 1 context filter (same logic as getCFDCandidatePatterns Phase 2)
+    // Phase 1 context filter (same logic as getSHCandidatePatterns Phase 2)
     const familyFiltered = patterns.filter(
       p => !p.pattern_family || relevantFamilies.has(p.pattern_family)
     );

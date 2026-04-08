@@ -11,7 +11,7 @@
   "dependencies": {
     "@mnemom/agent-alignment-protocol": "^0.5.0",
     "@mnemom/aip-otel-exporter": "^0.5.0",
-    "@mnemom/cfd": "file:../shared/cfd",
+    "@mnemom/safe-house": "file:../shared/safe-house",
     "@mnemom/policy-engine": "file:../shared/policy-engine",
     "stripe": "^20.3.1"
   },

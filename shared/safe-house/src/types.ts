@@ -10,11 +10,11 @@ export type ThreatType =
   | 'privilege_escalation'
   | 'pii_in_inbound';
 
-// CFD operating modes
-export type CFDMode = 'disabled' | 'off' | 'simulate' | 'observe' | 'enforce' | 'enforce_sync' | 'sovereign';
+// Safe House operating modes
+export type SafeHouseMode = 'disabled' | 'off' | 'simulate' | 'observe' | 'enforce' | 'enforce_sync' | 'sovereign';
 
 // Verdict after evaluation
-export type CFDVerdict = 'pass' | 'warn' | 'quarantine' | 'block';
+export type SafeHouseVerdict = 'pass' | 'warn' | 'quarantine' | 'block';
 
 // Trust tier for message source
 export type TrustTier = 'high' | 'medium' | 'low' | 'unknown';
@@ -36,9 +36,9 @@ export interface L1Options {
   surface?: SourceType;
 }
 
-// Full CFD evaluation result
-export interface CFDDecision {
-  verdict: CFDVerdict;
+// Full Safe House evaluation result
+export interface SafeHouseDecision {
+  verdict: SafeHouseVerdict;
   overall_risk: number;            // 0.0 - 1.0
   threats: ThreatDetection[];
   detector_scores: Record<string, number | null>; // keyed by detector name; null = did not run
@@ -52,7 +52,7 @@ export interface CFDDecision {
 export interface AnnotatedMessage {
   content: string;           // full decorated XML string to replace original
   original: string;          // original unmodified content
-  verdict: CFDVerdict;
+  verdict: SafeHouseVerdict;
   quarantine_ref?: string;
 }
 
@@ -71,9 +71,9 @@ export interface SourceTrustRule {
   risk_multiplier: number;      // 0.0 (fully trusted) to 2.0 (extra suspicious)
 }
 
-// CFD configuration (from cfd_configs table)
-export interface CFDConfig {
-  mode: CFDMode;
+// Safe House configuration (from sh_configs table)
+export interface SafeHouseConfig {
+  mode: SafeHouseMode;
   thresholds: {
     warn: number;           // default 0.6
     quarantine: number;     // default 0.8
@@ -83,7 +83,7 @@ export interface CFDConfig {
   trusted_sources: SourceTrustRule[];
 }
 
-export const DEFAULT_CFD_CONFIG: CFDConfig = {
+export const DEFAULT_SAFE_HOUSE_CONFIG: SafeHouseConfig = {
   mode: 'disabled',
   thresholds: { warn: 0.6, quarantine: 0.8, block: 0.95 },
   screen_surfaces: ['user_message'],
@@ -108,8 +108,8 @@ export interface ContentSurface {
   trust_tier?: TrustTier;
 }
 
-// Threat pattern from cfd_threat_patterns table
-export interface CFDThreatPattern {
+// Threat pattern from sh_threat_patterns table
+export interface SafeHouseThreatPattern {
   id: string;
   threat_type: ThreatType;
   label: 'malicious' | 'benign';
@@ -130,7 +130,7 @@ export interface DLPMatch {
 export interface L2Result {
   threats: ThreatDetection[];
   overall_risk: number;
-  recommendation: CFDVerdict;
+  recommendation: SafeHouseVerdict;
   raw_response: string;
 }
 
@@ -138,6 +138,6 @@ export interface L2Result {
 export interface PreemptiveNudge {
   nudge_content: string;
   threat_type: ThreatType;
-  cfd_score: number;
+  sh_score: number;
   pre_emptive: true;
 }

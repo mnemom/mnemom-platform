@@ -6,15 +6,15 @@ export { detectLanguage, hasNativeL1Support, SUPPORTED_L1_LANGUAGES } from './la
 export { MULTILINGUAL_SIGNALS } from './i18n-signals.js';
 export { decorateMessage, buildQuarantineNotification } from './decorator.js';
 export { scanDLP, hasDLPMatches, redactDLPMatches } from './dlp.js';
-export { buildCFDAnalysisPrompt, THREAT_CATEGORY_DESCRIPTIONS } from './prompts.js';
-export { buildCFDUserPrompt, parseL2Response, mergeL1AndL2, buildThreatContextForAIP, buildPreemptiveNudgeContent } from './prompts.js';
-export { buildCBDAnalysisPrompt, buildCBDUserPrompt, CBD_THREAT_DESCRIPTIONS } from './prompts.js';
+export { buildSHAnalysisPrompt, THREAT_CATEGORY_DESCRIPTIONS } from './prompts.js';
+export { buildSHUserPrompt, parseL2Response, mergeL1AndL2, buildThreatContextForAIP, buildPreemptiveNudgeContent } from './prompts.js';
+export { buildSHExitAnalysisPrompt, buildSHExitUserPrompt, SH_EXIT_THREAT_DESCRIPTIONS } from './prompts.js';
 export type {
-  ThreatType, CFDMode, CFDVerdict, TrustTier, SourceType,
-  ThreatDetection, CFDDecision, AnnotatedMessage, QuarantineNotification,
-  CFDConfig, SessionRiskState, ContentSurface, CFDThreatPattern, DLPMatch,
+  ThreatType, SafeHouseMode, SafeHouseVerdict, TrustTier, SourceType,
+  ThreatDetection, SafeHouseDecision, AnnotatedMessage, QuarantineNotification,
+  SafeHouseConfig, SessionRiskState, ContentSurface, SafeHouseThreatPattern, DLPMatch,
   SourceTrustRule, L1Options,
 } from './types.js';
 export type { L2Result, PreemptiveNudge } from './types.js';
-export { DEFAULT_CFD_CONFIG } from './types.js';
+export { DEFAULT_SAFE_HOUSE_CONFIG } from './types.js';
 export { computeMinHash, estimateSimilarity, serializeMinHash, deserializeMinHash, isSimilarToPattern, computeBandHashes } from './fingerprint.js';

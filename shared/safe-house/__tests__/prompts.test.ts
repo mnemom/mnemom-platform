@@ -4,12 +4,12 @@ import {
   mergeL1AndL2,
   buildThreatContextForAIP,
   buildPreemptiveNudgeContent,
-  buildCFDUserPrompt,
+  buildSHUserPrompt,
 } from '../src/prompts.js';
-import type { ThreatDetection, CFDDecision, L2Result } from '../src/types.js';
+import type { ThreatDetection, SafeHouseDecision, L2Result } from '../src/types.js';
 
 // Helpers
-function makeDecision(overrides: Partial<CFDDecision> = {}): CFDDecision {
+function makeDecision(overrides: Partial<SafeHouseDecision> = {}): SafeHouseDecision {
   return {
     verdict: 'pass',
     overall_risk: 0.5,
@@ -314,43 +314,43 @@ describe('buildPreemptiveNudgeContent', () => {
   });
 });
 
-// ─── buildCFDUserPrompt ───────────────────────────────────────────────────────
+// ─── buildSHUserPrompt ───────────────────────────────────────────────────────
 
-describe('buildCFDUserPrompt', () => {
+describe('buildSHUserPrompt', () => {
   it('23. content > 2000 chars → truncated at 2000 with "[... truncated ...]"', () => {
     const long = 'a'.repeat(3000);
-    const result = buildCFDUserPrompt(long);
+    const result = buildSHUserPrompt(long);
     expect(result).toContain('[... truncated ...]');
     // The truncated content portion is 2000 chars
     expect(result.indexOf('[... truncated ...]')).toBeGreaterThan(1999);
   });
 
   it('24. sourceType provided → appears in output', () => {
-    const result = buildCFDUserPrompt('hello', 'email');
+    const result = buildSHUserPrompt('hello', 'email');
     expect(result).toContain('email');
     expect(result).toContain('Source type:');
   });
 
   it('25. short content → not truncated', () => {
     const short = 'short message';
-    const result = buildCFDUserPrompt(short);
+    const result = buildSHUserPrompt(short);
     expect(result).toContain(short);
     expect(result).not.toContain('[... truncated ...]');
   });
 
   it('25b. sourceType="unknown" → no source note in output', () => {
-    const result = buildCFDUserPrompt('hello', 'unknown');
+    const result = buildSHUserPrompt('hello', 'unknown');
     expect(result).not.toContain('Source type:');
   });
 
   it('25c. no sourceType → no source note in output', () => {
-    const result = buildCFDUserPrompt('hello');
+    const result = buildSHUserPrompt('hello');
     expect(result).not.toContain('Source type:');
   });
 
   it('25d. content exactly 2000 chars → not truncated', () => {
     const exact = 'b'.repeat(2000);
-    const result = buildCFDUserPrompt(exact);
+    const result = buildSHUserPrompt(exact);
     expect(result).not.toContain('[... truncated ...]');
   });
 });
