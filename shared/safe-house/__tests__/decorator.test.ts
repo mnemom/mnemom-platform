@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { decorateMessage, buildQuarantineNotification } from '../src/decorator.js';
-import type { CFDDecision } from '../src/types.js';
+import type { SafeHouseDecision } from '../src/types.js';
 
-function makeBECDecision(overrides: Partial<CFDDecision> = {}): CFDDecision {
+function makeBECDecision(overrides: Partial<SafeHouseDecision> = {}): SafeHouseDecision {
   return {
     verdict: 'warn',
     overall_risk: 0.75,
@@ -21,7 +21,7 @@ function makeBECDecision(overrides: Partial<CFDDecision> = {}): CFDDecision {
   };
 }
 
-function makeBlockDecision(overrides: Partial<CFDDecision> = {}): CFDDecision {
+function makeBlockDecision(overrides: Partial<SafeHouseDecision> = {}): SafeHouseDecision {
   return {
     verdict: 'block',
     overall_risk: 0.96,
@@ -47,9 +47,9 @@ function makeBlockDecision(overrides: Partial<CFDDecision> = {}): CFDDecision {
 }
 
 describe('decorateMessage', () => {
-  it('output contains <context_security_assessment cfd_version="1">', () => {
+  it('output contains <context_security_assessment sh_version="1">', () => {
     const result = decorateMessage('Hello, wire me money.', makeBECDecision());
-    expect(result.content).toContain('<context_security_assessment cfd_version="1">');
+    expect(result.content).toContain('<context_security_assessment sh_version="1">');
   });
 
   it('output contains <verdict>WARN</verdict>', () => {
@@ -118,9 +118,9 @@ describe('decorateMessage', () => {
 });
 
 describe('buildQuarantineNotification', () => {
-  it('output contains <quarantine_notification cfd_version="1">', () => {
+  it('output contains <quarantine_notification sh_version="1">', () => {
     const notif = buildQuarantineNotification('qid-001', makeBlockDecision());
-    expect(notif.xml).toContain('<quarantine_notification cfd_version="1">');
+    expect(notif.xml).toContain('<quarantine_notification sh_version="1">');
   });
 
   it('output contains <status>BLOCKED</status>', () => {
@@ -135,7 +135,7 @@ describe('buildQuarantineNotification', () => {
   });
 
   it('throws if decision has no threats', () => {
-    const emptyDecision: CFDDecision = {
+    const emptyDecision: SafeHouseDecision = {
       verdict: 'block',
       overall_risk: 0.96,
       threats: [],
@@ -164,13 +164,13 @@ describe('buildQuarantineNotification', () => {
 
   it('uses default review URL when no review_base_url provided', () => {
     const notif = buildQuarantineNotification('qid-001', makeBlockDecision());
-    expect(notif.xml).toContain('https://app.mnemom.com/cfd/quarantine/qid-001');
+    expect(notif.xml).toContain('https://app.mnemom.com/safe-house/quarantine/qid-001');
   });
 
   it('uses custom review_base_url when provided', () => {
     const notif = buildQuarantineNotification('qid-001', makeBlockDecision(), {
       review_base_url: 'https://staging.mnemom.com',
     });
-    expect(notif.xml).toContain('https://staging.mnemom.com/cfd/quarantine/qid-001');
+    expect(notif.xml).toContain('https://staging.mnemom.com/safe-house/quarantine/qid-001');
   });
 });

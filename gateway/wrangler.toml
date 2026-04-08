@@ -19,7 +19,7 @@ workers_dev = true
 [env.production.vars]
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "true"
-CFD_ENABLED = "true"   # Enables CFD DB lookups; per-agent mode controlled via cfd_configs table
+SAFE_HOUSE_ENABLED = "true"   # Enables Safe House DB lookups; per-agent mode controlled via cfd_configs table
 
 [[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
@@ -46,8 +46,8 @@ workers_dev = true
 [env.staging.vars]
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "false"
-CFD_ENABLED = "true"
-# Sovereign agent recommended CFD config (set via /v1/agents/:id/cfd/config):
+SAFE_HOUSE_ENABLED = "true"
+# Sovereign agent recommended Safe House config (set via /v1/agents/:id/cfd/config):
 # mode: enforce, screen_surfaces: all, thresholds: 0.5/0.70/0.85
 # Canaries: POST /v1/cfd/canaries for each primary tool credential
 

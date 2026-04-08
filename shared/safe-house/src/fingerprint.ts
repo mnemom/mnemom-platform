@@ -146,7 +146,7 @@ const BAND_WIDTH = NUM_HASHES / BAND_COUNT; // 4 values per band
  * Two texts with Jaccard similarity ≥ 0.65 share at least one band with
  * high probability, making this an efficient pre-filter before full similarity.
  *
- * KV key pattern: `cfd_lsh:band:{bandIndex}:{result[bandIndex]}`
+ * KV key pattern: `sh_lsh:band:{bandIndex}:{result[bandIndex]}`
  * Patterns sharing ≥1 band key with a query are near-duplicate candidates.
  */
 export function computeBandHashes(sig: number[]): string[] {

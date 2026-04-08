@@ -58,29 +58,29 @@ import {
   applySessionMultiplier,
   decorateMessage,
   buildQuarantineNotification,
-  buildCFDAnalysisPrompt,
-  buildCFDUserPrompt,
+  buildSHAnalysisPrompt,
+  buildSHUserPrompt,
   parseL2Response,
   mergeL1AndL2,
   buildThreatContextForAIP,
   buildPreemptiveNudgeContent,
   redactDLPMatches,
-  buildCBDAnalysisPrompt,
-  buildCBDUserPrompt,
-  DEFAULT_CFD_CONFIG,
+  buildSHExitAnalysisPrompt,
+  buildSHExitUserPrompt,
+  DEFAULT_SAFE_HOUSE_CONFIG,
   preprocessForDetection,
   computeMinHash,
   computeBandHashes,
-  type CFDConfig,
-  type CFDDecision,
-  type CFDVerdict,
+  type SafeHouseConfig,
+  type SafeHouseDecision,
+  type SafeHouseVerdict,
   type SessionRiskState,
-  type CFDThreatPattern,
+  type SafeHouseThreatPattern,
   type SourceType,
   type L1Result,
   type ThreatType,
   type ThreatDetection,
-} from '@mnemom/cfd';
+} from '@mnemom/safe-house';
 
 // ── SemanticAnalyzer trigger helper ────────────────────────────────────────
 // Languages where PatternMatcher has weaker coverage (non-Latin script).
@@ -182,8 +182,8 @@ export interface Env {
   PROVER_API_KEY?: string;              // Shared secret for prover auth
   // Phase 4: Transaction guardrails KV cache
   KV?: KVNamespace;
-  // Context Front Door
-  CFD_ENABLED?: string;  // "true" to enable CFD DB fetches; default off to avoid test interference
+  // Safe House
+  SAFE_HOUSE_ENABLED?: string;  // "true" to enable Safe House DB fetches; default off to avoid test interference
 }
 
 interface Agent {
@@ -243,10 +243,10 @@ export interface QuotaContext {
   agent_settings: AgentSettings | null;
   per_proof_price: number;
   containment_status: 'active' | 'paused' | 'killed';
-  // CFD billing fields (populated by get_quota_context_for_agent RPC)
-  cfd_included_checks?: number;
-  per_cfd_check_price?: number;
-  cfd_check_count_this_period?: number;
+  // Safe House billing fields (populated by get_quota_context_for_agent RPC)
+  sh_included_checks?: number;
+  per_sh_check_price?: number;
+  sh_check_count_this_period?: number;
 }
 
 export interface QuotaDecision {
@@ -544,10 +544,10 @@ export function _resetSupabaseCircuitBreakerForTests(): void {
   supabaseCircuitBreaker.isOpen = false;
 }
 
-/** Exported for unit testing — wraps fetchCFDLSHCandidates. */
-export { fetchCFDLSHCandidates as _fetchCFDLSHCandidatesForTests };
-/** Exported for unit testing — wraps fetchCFDContextFamilies. */
-export { fetchCFDContextFamilies as _fetchCFDContextFamiliesForTests };
+/** Exported for unit testing — wraps fetchSHLSHCandidates. */
+export { fetchSHLSHCandidates as _fetchSHLSHCandidatesForTests };
+/** Exported for unit testing — wraps fetchSHContextFamilies. */
+export { fetchSHContextFamilies as _fetchSHContextFamiliesForTests };
 
 /**
  * Drop-in replacement for fetch() on all Supabase REST/RPC calls.
@@ -2103,7 +2103,7 @@ async function analyzeStreamInBackground(
           const streamTriggered = scanForCanaryUse(outputText, streamCanaries);
           if (streamTriggered) {
             console.log(JSON.stringify({
-              event: 'cbd_canary_triggered',
+              event: 'sh_canary_triggered',
               agent_id: agent.id,
               session_id: sessionId,
               path: 'streaming_background',
@@ -2121,8 +2121,8 @@ async function analyzeStreamInBackground(
       } catch { /* fail-open */ }
     }
 
-    // CBD Outbound DLP — streaming path (write to cbd_evaluations)
-    if (env.CFD_ENABLED === 'true' && env.BILLING_CACHE && outputText) {
+    // CBD Outbound DLP — streaming path (write to sh_exit_evaluations)
+    if (env.SAFE_HOUSE_ENABLED === 'true' && env.BILLING_CACHE && outputText) {
       try {
         const { matches: dlpMatches } = redactDLPMatches(outputText);
         if (dlpMatches.length > 0) {
@@ -2140,7 +2140,7 @@ async function analyzeStreamInBackground(
     }
 
     // CBD Semantic analysis — async, never blocks (checks for laundered outputs, PHI, etc.)
-    if (env.CFD_ENABLED === 'true' && outputText) {
+    if (env.SAFE_HOUSE_ENABLED === 'true' && outputText) {
       void runCBDSemanticAnalysis(outputText, agent.id, sessionId, env);
     }
 
@@ -2239,9 +2239,9 @@ async function analyzeStreamInBackground(
     ].filter(Boolean);
     const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
-    // Retrieve cached CFD result for this session (written during pre-check, Phase 0.5)
-    const cachedCFDResult = await env.BILLING_CACHE?.get(`cfd:result:${sessionId}:latest`)
-      .then(raw => raw ? JSON.parse(raw) as CFDDecision : null)
+    // Retrieve cached Safe House result for this session (written during pre-check, Phase 0.5)
+    const cachedCFDResult = await env.BILLING_CACHE?.get(`sh:result:${sessionId}:latest`)
+      .then(raw => raw ? JSON.parse(raw) as SafeHouseDecision : null)
       .catch(() => null) ?? null;
     const cfdThreatContext = cachedCFDResult ? buildThreatContextForAIP(cachedCFDResult) : undefined;
     const enrichedTaskContext = [gatewayTaskContext, cfdThreatContext].filter(Boolean).join('\n\n') || undefined;
@@ -2326,9 +2326,9 @@ async function analyzeStreamInBackground(
         reasoning_summary: cp.reasoning_summary,
       })),
       ...(cachedCFDResult ? [{
-        checkpoint_id: `cfd:${sessionId}:latest`,
+        checkpoint_id: `sh:${sessionId}:latest`,
         verdict: cachedCFDResult.verdict as string,
-        reasoning_summary: `CFD pre-screen: risk=${cachedCFDResult.overall_risk.toFixed(2)} threats=${cachedCFDResult.threats.map((t: { type: string }) => t.type).join(',')}`,
+        reasoning_summary: `Safe House pre-screen: risk=${cachedCFDResult.overall_risk.toFixed(2)} threats=${cachedCFDResult.threats.map((t: { type: string }) => t.type).join(',')}`,
       }] : []),
     ];
     const attestation = await attestCheckpoint(
@@ -2524,25 +2524,25 @@ async function callAnalysisLLM(
 }
 
 /**
- * Call Haiku for CFD L2 threat analysis.
+ * Call Haiku for Safe House L2 threat analysis.
  * Uses the existing Anthropic API key — NOT routed through CF AI Gateway
  * (to avoid the gateway calling itself in an infinite loop).
- * Separate from the AIP circuit breaker — CFD failures never block AIP.
+ * Separate from the AIP circuit breaker — Safe House failures never block AIP.
  * Fail-open: returns null on any error.
  */
-async function callCFDAnalysisLLM(
+async function callSHAnalysisLLM(
   content: string,
   sourceType: string,
   env: Env
 ): Promise<string | null> {
   if (!env.ANTHROPIC_API_KEY) return null;
 
-  const systemPrompt = buildCFDAnalysisPrompt();
-  const userPrompt = buildCFDUserPrompt(content, sourceType);
+  const systemPrompt = buildSHAnalysisPrompt();
+  const userPrompt = buildSHUserPrompt(content, sourceType);
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout for CFD
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout for Safe House
     try {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -2752,13 +2752,13 @@ async function deliverWebhooks(
 }
 
 /**
- * Deliver CFD-specific webhook events to registered endpoints.
+ * Deliver Safe House-specific webhook events to registered endpoints.
  * Reuses the same aip_webhook_registrations table and HMAC signing.
- * CFD events use event types: cfd.evaluation.warn, cfd.evaluation.quarantine,
- * cfd.evaluation.block, cfd.canary.triggered, cfd.session.escalated
+ * Safe House events use event types: safe_house.evaluation.warn, safe_house.evaluation.quarantine,
+ * safe_house.evaluation.block, safe_house.canary.triggered, safe_house.session.escalated
  */
-async function deliverCFDWebhooks(
-  decision: CFDDecision,
+async function deliverSHWebhooks(
+  decision: SafeHouseDecision,
   agentId: string,
   sessionId: string,
   env: Env
@@ -2767,7 +2767,7 @@ async function deliverCFDWebhooks(
   if (decision.verdict === 'pass') return;
 
   try {
-    // Fetch registrations that have CFD events enabled
+    // Fetch registrations that have Safe House events enabled
     const regResponse = await supabaseFetch(
       `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?agent_id=eq.${agentId}&select=*`,
       {
@@ -2791,13 +2791,13 @@ async function deliverCFDWebhooks(
 
     // Map verdict to event type
     const eventType = decision.verdict === 'quarantine' || decision.verdict === 'block'
-      ? `cfd.evaluation.${decision.verdict}`
-      : 'cfd.evaluation.warn';
+      ? `safe_house.evaluation.${decision.verdict}`
+      : 'safe_house.evaluation.warn';
 
     // Filter registrations that subscribe to this event type
     const matching = registrations.filter(reg =>
       reg.event_types.some(et =>
-        et === '*' || et === 'cfd.*' || et === eventType
+        et === '*' || et === 'safe_house.*' || et === eventType
       )
     );
     if (matching.length === 0) return;
@@ -2818,7 +2818,7 @@ async function deliverCFDWebhooks(
           : null,
         detection_sources: decision.detection_sources,
         ...(decision.quarantine_id
-          ? { review_url: `https://app.mnemom.com/cfd/quarantine/${decision.quarantine_id}` }
+          ? { review_url: `https://app.mnemom.com/safe-house/quarantine/${decision.quarantine_id}` }
           : {}),
       },
     };
@@ -2841,7 +2841,7 @@ async function deliverCFDWebhooks(
             headers: {
               'Content-Type': 'application/json',
               'X-AIP-Signature': `sha256=${signature}`,
-              'X-CFD-Event': eventType,
+              'X-Safe-House-Event': eventType,
             },
             body: payloadString,
           });
@@ -2872,7 +2872,7 @@ async function deliverCFDWebhooks(
       }).catch(() => {});
     }
   } catch (err) {
-    console.warn('[cfd/webhooks] Error delivering CFD webhooks:', err);
+    console.warn('[safe-house/webhooks] Error delivering Safe House webhooks:', err);
   }
 }
 
@@ -3427,23 +3427,23 @@ async function applyGracePeriod(
 }
 
 // ============================================================================
-// Context Front Door (CFD) — inbound threat screening helpers
+// Safe House — inbound threat screening helpers
 // ============================================================================
 
 /**
- * Fetch CFD config for an agent (org-level fallback). KV cached 5 min.
- * Requires CFD_ENABLED='true' env var and BILLING_CACHE binding.
+ * Fetch Safe House config for an agent (org-level fallback). KV cached 5 min.
+ * Requires SAFE_HOUSE_ENABLED='true' env var and BILLING_CACHE binding.
  * Returns disabled default without any fetch in other environments (tests,
  * local dev) to avoid inserting extra calls into test mock sequences.
  */
-async function fetchCFDConfig(agentId: string, env: Env): Promise<CFDConfig> {
-  if (env.CFD_ENABLED !== 'true' || !env.BILLING_CACHE) return { ...DEFAULT_CFD_CONFIG };
-  const cacheKey = `cfd:config:${agentId}`;
+async function fetchSHConfig(agentId: string, env: Env): Promise<SafeHouseConfig> {
+  if (env.SAFE_HOUSE_ENABLED !== 'true' || !env.BILLING_CACHE) return { ...DEFAULT_SAFE_HOUSE_CONFIG };
+  const cacheKey = `sh:config:${agentId}`;
   try {
     const cached = await env.BILLING_CACHE.get(cacheKey);
-    if (cached) return JSON.parse(cached) as CFDConfig;
+    if (cached) return JSON.parse(cached) as SafeHouseConfig;
     const resp = await supabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/rpc/get_cfd_config_for_agent`,
+      `${env.SUPABASE_URL}/rest/v1/rpc/get_sh_config_for_agent`,
       {
         method: 'POST',
         headers: {
@@ -3454,25 +3454,25 @@ async function fetchCFDConfig(agentId: string, env: Env): Promise<CFDConfig> {
         body: JSON.stringify({ p_agent_id: agentId }),
       }
     );
-    if (!resp.ok) return { ...DEFAULT_CFD_CONFIG };
-    const config = await resp.json() as CFDConfig;
+    if (!resp.ok) return { ...DEFAULT_SAFE_HOUSE_CONFIG };
+    const config = await resp.json() as SafeHouseConfig;
     await env.BILLING_CACHE.put(cacheKey, JSON.stringify(config), { expirationTtl: 300 }).catch(() => {});
     return config;
   } catch {
-    return { ...DEFAULT_CFD_CONFIG };
+    return { ...DEFAULT_SAFE_HOUSE_CONFIG };
   }
 }
 
-/** Fetch active CFD threat patterns (KV cached 5 min). */
-async function fetchCFDThreatPatterns(env: Env): Promise<CFDThreatPattern[]> {
-  const cacheKey = 'cfd:threat-patterns';
+/** Fetch active Safe House threat patterns (KV cached 5 min). */
+async function fetchSHThreatPatterns(env: Env): Promise<SafeHouseThreatPattern[]> {
+  const cacheKey = 'sh:threat-patterns';
   try {
     if (env.BILLING_CACHE) {
       const cached = await env.BILLING_CACHE.get(cacheKey);
-      if (cached) return JSON.parse(cached) as CFDThreatPattern[];
+      if (cached) return JSON.parse(cached) as SafeHouseThreatPattern[];
     }
     const resp = await supabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/cfd_threat_patterns?label=eq.malicious&is_active=eq.true&select=id,threat_type,label,content,minhash,pattern_family&order=created_at.desc&limit=500`,
+      `${env.SUPABASE_URL}/rest/v1/sh_threat_patterns?label=eq.malicious&is_active=eq.true&select=id,threat_type,label,content,minhash,pattern_family&order=created_at.desc&limit=500`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -3481,7 +3481,7 @@ async function fetchCFDThreatPatterns(env: Env): Promise<CFDThreatPattern[]> {
       }
     );
     if (!resp.ok) return [];
-    const patterns = await resp.json() as CFDThreatPattern[];
+    const patterns = await resp.json() as SafeHouseThreatPattern[];
     if (env.BILLING_CACHE) {
       await env.BILLING_CACHE.put(cacheKey, JSON.stringify(patterns), { expirationTtl: 300 }).catch(() => {});
     }
@@ -3498,16 +3498,16 @@ async function fetchCFDThreatPatterns(env: Env): Promise<CFDThreatPattern[]> {
  *
  * @param normalizedContent - Content AFTER preprocessForDetection (same normalization as detector)
  */
-async function fetchCFDLSHCandidates(
+async function fetchSHLSHCandidates(
   normalizedContent: string,
-  allPatterns: CFDThreatPattern[],
+  allPatterns: SafeHouseThreatPattern[],
   env: Env,
-): Promise<CFDThreatPattern[]> {
+): Promise<SafeHouseThreatPattern[]> {
   if (!env.BILLING_CACHE || allPatterns.length === 0) return allPatterns;
   try {
     const sig = computeMinHash(normalizedContent);
     const bandHashes = computeBandHashes(sig);
-    const keys = bandHashes.map((h, i) => `cfd_lsh:band:${i}:${h}`);
+    const keys = bandHashes.map((h, i) => `sh_lsh:band:${i}:${h}`);
     const results = await Promise.all(keys.map(k => env.BILLING_CACHE!.get(k)));
     const candidateIds = new Set<string>();
     for (const r of results) {
@@ -3527,12 +3527,12 @@ async function fetchCFDLSHCandidates(
  * Calls the get_cards_for_context Supabase RPC, cached in KV for 15 minutes.
  * Returns an empty set on failure (fail-open: no family filtering applied).
  */
-async function fetchCFDContextFamilies(
+async function fetchSHContextFamilies(
   surface: string,
   industry: string | undefined,
   env: Env,
 ): Promise<Set<string>> {
-  const cacheKey = `cfd:ctx:${surface}:${industry ?? ''}`;
+  const cacheKey = `sh:ctx:${surface}:${industry ?? ''}`;
   try {
     if (env.BILLING_CACHE) {
       const cached = await env.BILLING_CACHE.get(cacheKey);
@@ -3573,45 +3573,45 @@ async function fetchCFDContextFamilies(
  * IMPORTANT: normalizes content internally via preprocessForDetection, matching the
  * normalization runL1Detection applies — LSH lookup and detector see the same text.
  */
-async function getCFDCandidatePatterns(
+async function getSHCandidatePatterns(
   rawContent: string,
   surface: 'user_message' | 'tool_result',
-  allPatterns: CFDThreatPattern[],
+  allPatterns: SafeHouseThreatPattern[],
   agentIndustry: string | undefined,
   env: Env,
-): Promise<CFDThreatPattern[]> {
+): Promise<SafeHouseThreatPattern[]> {
   // Normalize — same transform the detector applies before MinHash
   const { normalized } = preprocessForDetection(rawContent);
 
   // Phase 1: context family filter (surface + industry)
-  const families = await fetchCFDContextFamilies(surface, agentIndustry, env);
+  const families = await fetchSHContextFamilies(surface, agentIndustry, env);
   const familyFiltered = families.size > 0
     ? allPatterns.filter(p => !p.pattern_family || families.has(p.pattern_family))
     : allPatterns;
 
   // Phase 2: LSH candidate filter
-  return fetchCFDLSHCandidates(normalized, familyFiltered, env);
+  return fetchSHLSHCandidates(normalized, familyFiltered, env);
 }
 
 /** Read session risk state from KV. */
-async function getCFDSessionState(sessionId: string, env: Env): Promise<SessionRiskState | null> {
+async function getSHSessionState(sessionId: string, env: Env): Promise<SessionRiskState | null> {
   try {
-    const raw = await env.BILLING_CACHE?.get(`cfd:session:${sessionId}`);
+    const raw = await env.BILLING_CACHE?.get(`sh:session:${sessionId}`);
     return raw ? JSON.parse(raw) as SessionRiskState : null;
   } catch {
     return null;
   }
 }
 
-/** Update session risk state in KV after a CFD check. */
-async function updateCFDSessionState(
+/** Update session risk state in KV after a Safe House check. */
+async function updateSHSessionState(
   sessionId: string,
   agentId: string,
   score: number,
   env: Env
 ): Promise<void> {
   try {
-    const existing = await getCFDSessionState(sessionId, env);
+    const existing = await getSHSessionState(sessionId, env);
     const now = Date.now();
     const windowScores = [
       ...(existing?.window_scores ?? []).filter(s => now - s.timestamp < 3600_000),
@@ -3629,7 +3629,7 @@ async function updateCFDSessionState(
       last_updated: now,
     };
     await env.BILLING_CACHE?.put(
-      `cfd:session:${sessionId}`,
+      `sh:session:${sessionId}`,
       JSON.stringify(state),
       { expirationTtl: 3600 }
     );
@@ -3805,7 +3805,7 @@ function applySourceTrust(
   baseScore: number,
   sourceType: string,
   agentId: string,
-  trustedSources: import('@mnemom/cfd').SourceTrustRule[]
+  trustedSources: import('@mnemom/safe-house').SourceTrustRule[]
 ): number {
   if (!trustedSources || trustedSources.length === 0) return baseScore;
 
@@ -3830,17 +3830,17 @@ function applySourceTrust(
   return baseScore;
 }
 
-/** Log a CFD evaluation to the cfd_evaluations table (fire-and-forget). */
-async function logCFDEvaluation(
+/** Log a Safe House evaluation to the sh_evaluations table (fire-and-forget). */
+async function logSHEvaluation(
   agentId: string,
   sessionId: string,
   mode: string,
-  decision: CFDDecision,
+  decision: SafeHouseDecision,
   surface: string,
   env: Env
 ): Promise<void> {
   try {
-    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/cfd_evaluations`, {
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/sh_evaluations`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -3869,11 +3869,11 @@ async function logCFDEvaluation(
   }
 }
 
-/** Increment CFD usage counter for billing (fire-and-forget). */
-async function incrementCFDUsage(agentId: string, env: Env): Promise<void> {
+/** Increment Safe House usage counter for billing (fire-and-forget). */
+async function incrementSHUsage(agentId: string, env: Env): Promise<void> {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/increment_cfd_usage`, {
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/increment_sh_usage`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -3890,7 +3890,7 @@ async function incrementCFDUsage(agentId: string, env: Env): Promise<void> {
 // ── CBD (Context Back Door) helpers ──────────────────────────────────────────
 
 /**
- * Log a CBD outbound screening event to cbd_evaluations (fire-and-forget).
+ * Log a CBD outbound screening event to sh_exit_evaluations (fire-and-forget).
  * Called from both streaming and non-streaming paths.
  */
 async function logCBDEvaluation(
@@ -3905,7 +3905,7 @@ async function logCBDEvaluation(
   env: Env
 ): Promise<void> {
   try {
-    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/cbd_evaluations`, {
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/sh_exit_evaluations`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_KEY,
@@ -3978,7 +3978,7 @@ function createCBDStreamTransform(
 /**
  * Run async CBD semantic analysis on assembled output text (never blocks user).
  * Calls Haiku with an outbound-focused threat detection prompt.
- * Results written to cbd_evaluations; only logs on non-pass verdict.
+ * Results written to sh_exit_evaluations; only logs on non-pass verdict.
  */
 async function runCBDSemanticAnalysis(
   outputText: string,
@@ -3988,8 +3988,8 @@ async function runCBDSemanticAnalysis(
 ): Promise<void> {
   if (!outputText || !env.ANTHROPIC_API_KEY) return;
   try {
-    const systemPrompt = buildCBDAnalysisPrompt();
-    const userPrompt   = buildCBDUserPrompt(outputText);
+    const systemPrompt = buildSHExitAnalysisPrompt();
+    const userPrompt   = buildSHExitUserPrompt(outputText);
     const controller   = new AbortController();
     const timeoutId    = setTimeout(() => controller.abort(), 8000);
     try {
@@ -4029,13 +4029,13 @@ async function runCBDSemanticAnalysis(
 /** Fetch canary values for an agent (KV cached 10 min). Returns empty array on error. */
 async function fetchAgentCanaries(agentId: string, env: Env): Promise<string[]> {
   if (!env.BILLING_CACHE) return [];
-  const cacheKey = `cfd:canaries:${agentId}`;
+  const cacheKey = `sh:canaries:${agentId}`;
   try {
     const cached = await env.BILLING_CACHE.get(cacheKey);
     if (cached) return JSON.parse(cached) as string[];
 
     const resp = await supabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/cfd_canaries?agent_id=eq.${agentId}&triggered=eq.false&select=canary_value`,
+      `${env.SUPABASE_URL}/rest/v1/sh_canaries?agent_id=eq.${agentId}&triggered=eq.false&select=canary_value`,
       {
         headers: {
           apikey: env.SUPABASE_KEY,
@@ -4066,7 +4066,7 @@ function scanForCanaryUse(text: string, canaries: string[]): string | null {
 async function markCanaryTriggered(agentId: string, canaryValue: string, env: Env): Promise<void> {
   try {
     await supabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/cfd_canaries?agent_id=eq.${agentId}&canary_value=eq.${encodeURIComponent(canaryValue)}`,
+      `${env.SUPABASE_URL}/rest/v1/sh_canaries?agent_id=eq.${agentId}&canary_value=eq.${encodeURIComponent(canaryValue)}`,
       {
         method: 'PATCH',
         headers: {
@@ -4079,17 +4079,17 @@ async function markCanaryTriggered(agentId: string, canaryValue: string, env: En
       }
     );
     // Invalidate KV cache
-    await env.BILLING_CACHE?.delete(`cfd:canaries:${agentId}`);
+    await env.BILLING_CACHE?.delete(`sh:canaries:${agentId}`);
   } catch {
     // Fire-and-forget
   }
 }
 
-/** Write a pre-emptive CFD nudge to the enforcement_nudges table. */
+/** Write a pre-emptive Safe House nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
   sessionId: string,
-  nudge: { nudge_content: string; threat_type: string; cfd_score: number; pre_emptive: true },
+  nudge: { nudge_content: string; threat_type: string; sh_score: number; pre_emptive: true },
   env: Env
 ): Promise<void> {
   try {
@@ -4104,13 +4104,13 @@ async function writePreemptiveNudge(
       body: JSON.stringify({
         agent_id: agentId,
         session_id: sessionId,
-        // checkpoint_id intentionally omitted — NULL means CFD-originated (see migration 107)
+        // checkpoint_id intentionally omitted — NULL means Safe House-originated (see migration 107)
         status: 'pending',
         concerns_summary: nudge.nudge_content,
         metadata: {
           pre_emptive: true,
           threat_type: nudge.threat_type,
-          cfd_score: nudge.cfd_score,
+          sh_score: nudge.sh_score,
         },
       }),
     });
@@ -4119,15 +4119,15 @@ async function writePreemptiveNudge(
   }
 }
 
-/** Write CFD result to KV so the AIP analysis (Phase 1+) can enrich its conscience prompt. */
-async function cacheCFDResultForAIP(
+/** Write Safe House result to KV so the AIP analysis (Phase 1+) can enrich its conscience prompt. */
+async function cacheSHResultForAIP(
   sessionId: string,
-  decision: CFDDecision,
+  decision: SafeHouseDecision,
   env: Env
 ): Promise<void> {
   try {
     await env.BILLING_CACHE?.put(
-      `cfd:result:${sessionId}:latest`,
+      `sh:result:${sessionId}:latest`,
       JSON.stringify(decision),
       { expirationTtl: 600 }
     );
@@ -4142,7 +4142,7 @@ async function logQuarantinedMessage(
   agentId: string,
   sessionId: string,
   contentHash: string,
-  decision: CFDDecision,
+  decision: SafeHouseDecision,
   sourceType: string,
   env: Env
 ): Promise<void> {
@@ -4174,15 +4174,15 @@ async function logQuarantinedMessage(
 }
 
 /**
- * Run full CFD analysis in observe mode (fire-and-forget).
+ * Run full Safe House analysis in observe mode (fire-and-forget).
  * The message is NOT modified — analysis happens in background.
- * Results are written to cfd_evaluations and cached in KV for AIP.
+ * Results are written to sh_evaluations and cached in KV for AIP.
  */
-async function runObserveCFD(
+async function runObserveSH(
   agentId: string,
   sessionId: string,
   content: string,
-  config: CFDConfig,
+  config: SafeHouseConfig,
   env: Env,
   /** Tool results to screen async alongside the user message (max 3, pre-sliced). */
   toolResultsToScreen?: string[],
@@ -4190,11 +4190,11 @@ async function runObserveCFD(
   try {
     const t0 = Date.now();
     const [patterns, sessionState] = await Promise.all([
-      fetchCFDThreatPatterns(env),
-      getCFDSessionState(sessionId, env),
+      fetchSHThreatPatterns(env),
+      getSHSessionState(sessionId, env),
     ]);
 
-    const userMsgCandidates = await getCFDCandidatePatterns(content, 'user_message', patterns, undefined, env);
+    const userMsgCandidates = await getSHCandidatePatterns(content, 'user_message', patterns, undefined, env);
     const l1 = runL1Detection(content, userMsgCandidates, { surface: 'user_message' });
 
     let finalThreats = l1.threats;
@@ -4203,7 +4203,7 @@ async function runObserveCFD(
     const detectionSources: string[] = l1.score > 0 ? ['PatternMatcher'] : [];
 
     if (l1.score >= 0.4 || shouldForceSemanticAnalysis(l1)) {
-      const l2Raw = await callCFDAnalysisLLM(content, 'user_message', env);
+      const l2Raw = await callSHAnalysisLLM(content, 'user_message', env);
       if (l2Raw) {
         const l2Result = parseL2Response(l2Raw);
         if (l2Result) {
@@ -4218,12 +4218,12 @@ async function runObserveCFD(
 
     const { multiplied_score, session_multiplier } = applySessionMultiplier(finalScore, sessionState);
     const thresholds = config.thresholds;
-    let verdict: CFDVerdict = 'pass';
+    let verdict: SafeHouseVerdict = 'pass';
     if (multiplied_score >= thresholds.block) verdict = 'block';
     else if (multiplied_score >= thresholds.quarantine) verdict = 'quarantine';
     else if (multiplied_score >= thresholds.warn) verdict = 'warn';
 
-    const decision: CFDDecision = {
+    const decision: SafeHouseDecision = {
       verdict,
       overall_risk: multiplied_score,
       threats: finalThreats,
@@ -4234,20 +4234,20 @@ async function runObserveCFD(
     };
 
     await Promise.all([
-      logCFDEvaluation(agentId, sessionId, 'observe', decision, 'user_message', env),
-      cacheCFDResultForAIP(sessionId, decision, env),
-      updateCFDSessionState(sessionId, agentId, multiplied_score, env),
+      logSHEvaluation(agentId, sessionId, 'observe', decision, 'user_message', env),
+      cacheSHResultForAIP(sessionId, decision, env),
+      updateSHSessionState(sessionId, agentId, multiplied_score, env),
     ]);
 
-    // Deliver CFD webhooks
-    await deliverCFDWebhooks(decision, agentId, sessionId, env);
+    // Deliver Safe House webhooks
+    await deliverSHWebhooks(decision, agentId, sessionId, env);
 
     // Write pre-emptive nudge — will be picked up on the NEXT request for this agent
     const nudge = buildPreemptiveNudgeContent(decision);
     if (nudge) await writePreemptiveNudge(agentId, sessionId, nudge, env);
 
     console.log(JSON.stringify({
-      event: 'cfd_observe',
+      event: 'sh_observe',
       verdict,
       pattern_score: l1.score,
       multiplied_score,
@@ -4255,18 +4255,18 @@ async function runObserveCFD(
       threat_count: finalThreats.length,
       duration_ms: decision.duration_ms,
     }));
-    incrementCFDUsage(agentId, env).catch(() => {});
+    incrementSHUsage(agentId, env).catch(() => {});
 
     // Screen tool results async (primary indirect injection surface).
     // Always triggers SemanticAnalyzer for tool results regardless of L1 score.
     if (toolResultsToScreen && toolResultsToScreen.length > 0) {
       await Promise.all(toolResultsToScreen.map(async (tr) => {
-        const trCandidates = await getCFDCandidatePatterns(tr, 'tool_result', patterns, undefined, env);
+        const trCandidates = await getSHCandidatePatterns(tr, 'tool_result', patterns, undefined, env);
         const tl1 = runL1Detection(tr, trCandidates, { surface: 'tool_result' });
         const tDetectorScores: Record<string, number | null> = { PatternMatcher: tl1.score, SemanticAnalyzer: null };
         const tDetectionSources: string[] = tl1.score > 0 ? ['PatternMatcher'] : [];
         // Always semantic for tool results — direct injection via tool output is the primary attack vector
-        const tl2Raw = await callCFDAnalysisLLM(tr, 'tool_result', env);
+        const tl2Raw = await callSHAnalysisLLM(tr, 'tool_result', env);
         if (tl2Raw) {
           const tl2 = parseL2Response(tl2Raw);
           if (tl2) {
@@ -4275,24 +4275,24 @@ async function runObserveCFD(
             if (tl2.overall_risk > 0) tDetectionSources.push('SemanticAnalyzer');
             const tMultiplied = Math.min(merged.score, 1.0);
             const tThresholds = config.thresholds;
-            const tVerdict: CFDVerdict =
+            const tVerdict: SafeHouseVerdict =
               tMultiplied >= tThresholds.quarantine ? 'quarantine'
               : tMultiplied >= tThresholds.warn ? 'warn' : 'pass';
             if (tVerdict !== 'pass') {
-              const tDecision: CFDDecision = {
+              const tDecision: SafeHouseDecision = {
                 verdict: tVerdict, overall_risk: tMultiplied, threats: merged.threats,
                 detector_scores: tDetectorScores, detection_sources: tDetectionSources,
                 session_multiplier: 1.0, duration_ms: 0,
               };
-              await logCFDEvaluation(agentId, sessionId, 'observe', tDecision, 'tool_result', env);
-              await deliverCFDWebhooks(tDecision, agentId, sessionId, env);
+              await logSHEvaluation(agentId, sessionId, 'observe', tDecision, 'tool_result', env);
+              await deliverSHWebhooks(tDecision, agentId, sessionId, env);
             }
           }
         }
       }));
     }
   } catch (err) {
-    console.warn('[cfd/observe] Error in observe-mode analysis (fail-open):', err);
+    console.warn('[safe-house/observe] Error in observe-mode analysis (fail-open):', err);
   }
 }
 
@@ -4381,13 +4381,13 @@ export async function handleProviderProxy(
     // Generate session ID
     const sessionId = generateSessionId(agentHash);
 
-    // CFD state — populated during Phase 0.5 pre-check, used for response headers
-    let cfdVerdict: CFDVerdict | undefined;
-    let cfdQuarantineId: string | undefined;
-    let cfdSessionRisk: string | undefined; // set in observe mode
+    // Safe House state — populated during Phase 0.5 pre-check, used for response headers
+    let shVerdict: SafeHouseVerdict | undefined;
+    let shQuarantineId: string | undefined;
+    let shSessionRisk: string | undefined; // set in observe mode
 
-    // Fetch CFD config early (KV cached — negligible latency)
-    const cfdConfig = await fetchCFDConfig(agent.id, env);
+    // Fetch Safe House config early (KV cached — negligible latency)
+    const shConfig = await fetchSHConfig(agent.id, env);
 
     // Build metadata header for CF AI Gateway
     const metadataHeader = buildMetadataHeader(
@@ -4499,7 +4499,7 @@ export async function handleProviderProxy(
       // ====================================================================
       // Wave 3: Conscience nudge injection (pre-forward, provider-specific)
       // ====================================================================
-      const cfdFeatureEnabled = quotaContext.feature_flags?.cfd_enabled === true;
+      const shFeatureEnabled = quotaContext.feature_flags?.sh_enabled === true;
       const agentEnforcementMode = agent.aip_enforcement_mode || 'observe';
       if (requestBody) {
         injectedNudgeIds = await injectPendingNudges(
@@ -4508,39 +4508,39 @@ export async function handleProviderProxy(
           agentEnforcementMode,
           env,
           provider,
-          { includePreemptive: cfdFeatureEnabled }
+          { includePreemptive: shFeatureEnabled }
         );
       }
 
       // ====================================================================
-      // Phase 0.5: Context Front Door (CFD) — inbound threat screening
+      // Phase 0.5: Safe House — inbound threat screening
       // ====================================================================
-      if (cfdFeatureEnabled && (
-        cfdConfig.mode === 'enforce' ||
-        cfdConfig.mode === 'enforce_sync' ||
-        cfdConfig.mode === 'sovereign' ||
-        cfdConfig.mode === 'observe' ||
-        cfdConfig.mode === 'simulate'
+      if (shFeatureEnabled && (
+        shConfig.mode === 'enforce' ||
+        shConfig.mode === 'enforce_sync' ||
+        shConfig.mode === 'sovereign' ||
+        shConfig.mode === 'observe' ||
+        shConfig.mode === 'simulate'
       ) && requestBody !== null) {
         const inboundMessage = extractLastUserMessage(requestBody as Record<string, unknown>, provider);
         if (inboundMessage) {
-          if (cfdConfig.mode === 'simulate') {
+          if (shConfig.mode === 'simulate') {
             // Simulate: run full analysis but touch NOTHING — no message modification,
             // no quarantine entries, no session state updates.
-            // Result goes only to cfd_evaluations with mode='simulate' and response header.
+            // Result goes only to sh_evaluations with mode='simulate' and response header.
             const t0 = Date.now();
             const [simPatterns, simSession] = await Promise.all([
-              fetchCFDThreatPatterns(env),
-              getCFDSessionState(sessionId, env),
+              fetchSHThreatPatterns(env),
+              getSHSessionState(sessionId, env),
             ]);
-            const simCandidates = await getCFDCandidatePatterns(inboundMessage, 'user_message', simPatterns, undefined, env);
+            const simCandidates = await getSHCandidatePatterns(inboundMessage, 'user_message', simPatterns, undefined, env);
             const simL1 = runL1Detection(inboundMessage, simCandidates, { surface: 'user_message' });
             let simThreats = simL1.threats;
             let simScore = simL1.score;
             const simDetectorScores: Record<string, number | null> = { PatternMatcher: simL1.score, SemanticAnalyzer: null };
             const simDetectionSources: string[] = simL1.score > 0 ? ['PatternMatcher'] : [];
             if (simL1.score >= 0.4 || shouldForceSemanticAnalysis(simL1)) {
-              const simL2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
+              const simL2Raw = await callSHAnalysisLLM(inboundMessage, 'user_message', env);
               if (simL2Raw) {
                 const simL2 = parseL2Response(simL2Raw);
                 if (simL2) {
@@ -4553,40 +4553,40 @@ export async function handleProviderProxy(
               }
             }
             const { multiplied_score: simMultiplied } = applySessionMultiplier(simScore, simSession);
-            const thresholds = cfdConfig.thresholds;
-            let simVerdict: CFDVerdict = 'pass';
+            const thresholds = shConfig.thresholds;
+            let simVerdict: SafeHouseVerdict = 'pass';
             if (simMultiplied >= thresholds.block) simVerdict = 'block';
             else if (simMultiplied >= thresholds.quarantine) simVerdict = 'quarantine';
             else if (simMultiplied >= thresholds.warn) simVerdict = 'warn';
 
-            // Log to cfd_evaluations but with mode='simulate' — no quarantine, no session update
+            // Log to sh_evaluations but with mode='simulate' — no quarantine, no session update
             if (simVerdict !== 'pass') {
-              const simDecision: CFDDecision = {
+              const simDecision: SafeHouseDecision = {
                 verdict: simVerdict, overall_risk: simMultiplied, threats: simThreats,
                 detector_scores: simDetectorScores, detection_sources: simDetectionSources,
                 session_multiplier: 1.0, duration_ms: Date.now() - t0,
               };
-              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, 'simulate', simDecision, 'user_message', env));
+              ctx.waitUntil(logSHEvaluation(agent.id, sessionId, 'simulate', simDecision, 'user_message', env));
             }
-            // Set simulated verdict — will be emitted as X-CFD-Simulated-Verdict below
-            cfdVerdict = simVerdict;
-          } else if (cfdConfig.mode === 'observe') {
+            // Set simulated verdict — will be emitted as X-Safe-House-Simulated-Verdict below
+            shVerdict = simVerdict;
+          } else if (shConfig.mode === 'observe') {
             // Observe mode: pass immediately, run full analysis in background.
             // Also screen tool results async if tool_result is in screen_surfaces.
-            const toolResultsForObserve = cfdConfig.screen_surfaces.includes('tool_result' as SourceType)
+            const toolResultsForObserve = shConfig.screen_surfaces.includes('tool_result' as SourceType)
               ? extractToolResults(requestBody as Record<string, unknown>, provider).slice(0, 3)
               : [];
-            ctx.waitUntil(runObserveCFD(agent.id, sessionId, inboundMessage, cfdConfig, env, toolResultsForObserve));
+            ctx.waitUntil(runObserveSH(agent.id, sessionId, inboundMessage, shConfig, env, toolResultsForObserve));
             // Sync session risk read for observe mode header (KV, ~1ms)
-            const observeSession = await getCFDSessionState(sessionId, env).catch(() => null);
-            cfdSessionRisk = observeSession?.session_threat_level ?? 'low';
+            const observeSession = await getSHSessionState(sessionId, env).catch(() => null);
+            shSessionRisk = observeSession?.session_threat_level ?? 'low';
           } else {
           const t0 = Date.now();
           const [patterns, sessionState] = await Promise.all([
-            fetchCFDThreatPatterns(env),
-            getCFDSessionState(sessionId, env),
+            fetchSHThreatPatterns(env),
+            getSHSessionState(sessionId, env),
           ]);
-          const enforceCandidates = await getCFDCandidatePatterns(inboundMessage, 'user_message', patterns, undefined, env);
+          const enforceCandidates = await getSHCandidatePatterns(inboundMessage, 'user_message', patterns, undefined, env);
           const l1 = runL1Detection(inboundMessage, enforceCandidates, { surface: 'user_message' });
 
           // SemanticAnalyzer: call Haiku when PatternMatcher score >= 0.4 OR
@@ -4597,7 +4597,7 @@ export async function handleProviderProxy(
           const detectionSources: string[] = l1.score > 0 ? ['PatternMatcher'] : [];
 
           if (l1.score >= 0.4 || shouldForceSemanticAnalysis(l1)) {
-            const l2Raw = await callCFDAnalysisLLM(inboundMessage, 'user_message', env);
+            const l2Raw = await callSHAnalysisLLM(inboundMessage, 'user_message', env);
             if (l2Raw) {
               const l2Result = parseL2Response(l2Raw);
               if (l2Result) {
@@ -4613,12 +4613,12 @@ export async function handleProviderProxy(
           const { multiplied_score, session_multiplier } = applySessionMultiplier(finalScore, sessionState);
 
           // Apply source trust rules (risk_multiplier from trusted_sources config)
-          const sourceType = (requestBody as Record<string, unknown>)?.['x_cfd_source_type'] as string ?? 'user_message';
-          const trustAdjustedScore = applySourceTrust(multiplied_score, sourceType, agent.id, cfdConfig.trusted_sources ?? []);
+          const sourceType = (requestBody as Record<string, unknown>)?.['x_sh_source_type'] as string ?? 'user_message';
+          const trustAdjustedScore = applySourceTrust(multiplied_score, sourceType, agent.id, shConfig.trusted_sources ?? []);
 
           // Determine verdict from thresholds
-          const thresholds = cfdConfig.thresholds;
-          let verdict: CFDVerdict = 'pass';
+          const thresholds = shConfig.thresholds;
+          let verdict: SafeHouseVerdict = 'pass';
           if (trustAdjustedScore >= thresholds.block) verdict = 'block';
           else if (trustAdjustedScore >= thresholds.quarantine) verdict = 'quarantine';
           else if (trustAdjustedScore >= thresholds.warn) verdict = 'warn';
@@ -4631,7 +4631,7 @@ export async function handleProviderProxy(
               quarantineId = generateQuarantineId();
             }
 
-            const decision: CFDDecision = {
+            const decision: SafeHouseDecision = {
               verdict,
               overall_risk: trustAdjustedScore,
               threats: finalThreats,
@@ -4646,25 +4646,25 @@ export async function handleProviderProxy(
               // Replace user message with quarantine notification
               const notification = buildQuarantineNotification(quarantineId!, decision);
               replaceLastUserMessageContent(requestBody as Record<string, unknown>, notification.xml, provider);
-              cfdVerdict = verdict;
-              cfdQuarantineId = quarantineId;
+              shVerdict = verdict;
+              shQuarantineId = quarantineId;
               // Log quarantine + evaluation (background)
               const contentHash = await hashContent(inboundMessage);
               ctx.waitUntil(logQuarantinedMessage(quarantineId!, agent.id, sessionId, contentHash, decision, 'user_message', env));
-              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, decision, 'user_message', env));
+              ctx.waitUntil(logSHEvaluation(agent.id, sessionId, shConfig.mode, decision, 'user_message', env));
             } else {
               // WARN: decorate message with XML Spotlighting annotation
               const annotated = decorateMessage(inboundMessage, decision);
               replaceLastUserMessageContent(requestBody as Record<string, unknown>, annotated.content, provider);
-              cfdVerdict = verdict;
-              ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, decision, 'user_message', env));
+              shVerdict = verdict;
+              ctx.waitUntil(logSHEvaluation(agent.id, sessionId, shConfig.mode, decision, 'user_message', env));
             }
 
-            // Deliver CFD webhooks for warn/quarantine/block events
-            ctx.waitUntil(deliverCFDWebhooks(decision, agent.id, sessionId, env));
+            // Deliver Safe House webhooks for warn/quarantine/block events
+            ctx.waitUntil(deliverSHWebhooks(decision, agent.id, sessionId, env));
 
-            // Cache CFD result in KV for AIP enrichment (Phase 1+)
-            ctx.waitUntil(cacheCFDResultForAIP(sessionId, decision, env));
+            // Cache Safe House result in KV for AIP enrichment (Phase 1+)
+            ctx.waitUntil(cacheSHResultForAIP(sessionId, decision, env));
             // Write pre-emptive nudge to enforcement channel when score >= 0.6
             // Gateway's existing injectPendingNudges() picks this up automatically
             const nudge = buildPreemptiveNudgeContent(decision);
@@ -4674,11 +4674,11 @@ export async function handleProviderProxy(
           }
 
           // Always update session state with this message's score
-          ctx.waitUntil(updateCFDSessionState(sessionId, agent.id, trustAdjustedScore, env));
-          ctx.waitUntil(incrementCFDUsage(agent.id, env));
+          ctx.waitUntil(updateSHSessionState(sessionId, agent.id, trustAdjustedScore, env));
+          ctx.waitUntil(incrementSHUsage(agent.id, env));
 
           console.log(JSON.stringify({
-            event: 'cfd',
+            event: 'sh',
             verdict,
             pattern_score: l1.score,
             multiplied_score: trustAdjustedScore,
@@ -4691,17 +4691,17 @@ export async function handleProviderProxy(
           // Screen tool results in parallel — primary indirect injection surface.
           // Always triggers SemanticAnalyzer (tool results should be data, not instructions).
           // Uses real `patterns` array (not empty []) for MinHash matching.
-          if (cfdConfig.screen_surfaces.includes('tool_result' as SourceType)) {
+          if (shConfig.screen_surfaces.includes('tool_result' as SourceType)) {
             const toolResultsList = extractToolResults(requestBody as Record<string, unknown>, provider).slice(0, 3);
             await Promise.all(toolResultsList.map(async (toolResult) => {
-              const trEnforceCandidates = await getCFDCandidatePatterns(toolResult, 'tool_result', patterns, undefined, env);
+              const trEnforceCandidates = await getSHCandidatePatterns(toolResult, 'tool_result', patterns, undefined, env);
               const tl1 = runL1Detection(toolResult, trEnforceCandidates, { surface: 'tool_result' });
               const tDetectorScores: Record<string, number | null> = { PatternMatcher: tl1.score, SemanticAnalyzer: null };
               const tDetectionSources: string[] = tl1.score > 0 ? ['PatternMatcher'] : [];
               let tFinalThreats = tl1.threats;
               let tFinalScore = tl1.score;
               // Always semantic for tool results
-              const tl2Raw = await callCFDAnalysisLLM(toolResult, 'tool_result', env);
+              const tl2Raw = await callSHAnalysisLLM(toolResult, 'tool_result', env);
               if (tl2Raw) {
                 const tl2Result = parseL2Response(tl2Raw);
                 if (tl2Result) {
@@ -4712,20 +4712,20 @@ export async function handleProviderProxy(
                   if (tl2Result.overall_risk > 0) tDetectionSources.push('SemanticAnalyzer');
                 }
               }
-              const tThresholds = cfdConfig.thresholds;
-              let tVerdict: CFDVerdict = 'pass';
+              const tThresholds = shConfig.thresholds;
+              let tVerdict: SafeHouseVerdict = 'pass';
               if (tFinalScore >= tThresholds.quarantine) tVerdict = 'quarantine';
               else if (tFinalScore >= tThresholds.warn) tVerdict = 'warn';
               if (tVerdict !== 'pass') {
-                const tDecision: CFDDecision = {
+                const tDecision: SafeHouseDecision = {
                   verdict: tVerdict, overall_risk: tFinalScore, threats: tFinalThreats,
                   detector_scores: tDetectorScores, detection_sources: tDetectionSources,
                   session_multiplier: 1.0, duration_ms: 0,
                 };
                 const tAnnotated = decorateMessage(toolResult, tDecision);
                 replaceToolResultContent(requestBody as Record<string, unknown>, toolResult, tAnnotated.content, provider);
-                ctx.waitUntil(logCFDEvaluation(agent.id, sessionId, cfdConfig.mode, tDecision, 'tool_result', env));
-                console.log(JSON.stringify({ event: 'cfd_tool_result', verdict: tVerdict, score: tFinalScore }));
+                ctx.waitUntil(logSHEvaluation(agent.id, sessionId, shConfig.mode, tDecision, 'tool_result', env));
+                console.log(JSON.stringify({ event: 'sh_tool_result', verdict: tVerdict, score: tFinalScore }));
               }
             }));
           }
@@ -4911,21 +4911,21 @@ export async function handleProviderProxy(
     responseHeaders.set('x-smoltbot-session', sessionId); // deprecated: remove after 6-month transition (2026-10)
     responseHeaders.set('x-mnemom-session', sessionId);   // canonical new name
 
-    // Add CFD headers if screening ran
-    if (cfdVerdict) {
-      if (cfdConfig.mode === 'simulate') {
-        responseHeaders.set('X-CFD-Simulated-Verdict', cfdVerdict);
-        responseHeaders.set('X-CFD-Mode', 'simulate');
+    // Add Safe House headers if screening ran
+    if (shVerdict) {
+      if (shConfig.mode === 'simulate') {
+        responseHeaders.set('X-Safe-House-Simulated-Verdict', shVerdict);
+        responseHeaders.set('X-Safe-House-Mode', 'simulate');
       } else {
-        responseHeaders.set('X-CFD-Verdict', cfdVerdict);
-        if (cfdQuarantineId) responseHeaders.set('X-CFD-Quarantine-Id', cfdQuarantineId);
+        responseHeaders.set('X-Safe-House-Verdict', shVerdict);
+        if (shQuarantineId) responseHeaders.set('X-Safe-House-Quarantine-Id', shQuarantineId);
       }
     }
-    if (cfdSessionRisk) {
-      responseHeaders.set('X-CFD-Session-Risk', cfdSessionRisk);
+    if (shSessionRisk) {
+      responseHeaders.set('X-Safe-House-Session-Risk', shSessionRisk);
     }
-    if (cfdConfig.mode === 'observe') {
-      responseHeaders.set('X-CFD-Mode', 'observe');
+    if (shConfig.mode === 'observe') {
+      responseHeaders.set('X-Safe-House-Mode', 'observe');
     }
 
     // Add policy verdict header if evaluation ran
@@ -4985,7 +4985,7 @@ export async function handleProviderProxy(
       // CBD streaming fast path: inline canary scanner before client sees bytes.
       // If a canary is detected, the stream is aborted mid-flight.
       // Cost: ~1ms KV read (cached) + ~0ms per chunk (string search).
-      const cbdCanaries = (env.CFD_ENABLED === 'true' && env.BILLING_CACHE)
+      const cbdCanaries = (env.SAFE_HOUSE_ENABLED === 'true' && env.BILLING_CACHE)
         ? await fetchAgentCanaries(agent.id, env).catch(() => [] as string[])
         : [] as string[];
       const cbdFilteredBody = response.body
@@ -5027,7 +5027,7 @@ export async function handleProviderProxy(
     let canaryTriggered = false;
     const responseBodyText = await response.text();
 
-    // CFD Canary detection: scan response for planted canary credentials
+    // Safe House Canary detection: scan response for planted canary credentials
     // This is in the fail-open wrapper — any error continues without blocking
     try {
       const canaries = await fetchAgentCanaries(agent.id, env);
@@ -5053,7 +5053,7 @@ export async function handleProviderProxy(
         if (triggered) {
           canaryTriggered = true;
           console.log(JSON.stringify({
-            event: 'cbd_canary_triggered',
+            event: 'sh_canary_triggered',
             agent_id: agent.id,
             session_id: sessionId,
             canary_prefix: triggered.slice(0, 6) + '****',
@@ -5073,10 +5073,10 @@ export async function handleProviderProxy(
 
     if (canaryTriggered) {
       // CBD P0: block the response entirely — do not return the compromised content
-      responseHeaders.set('X-CBD-Canary-Triggered', 'true');
+      responseHeaders.set('X-Safe-House-Canary-Triggered', 'true');
       return new Response(JSON.stringify({
         error: 'Agent response blocked — canary credential detected (confirmed compromise)',
-        type: 'cbd_canary_triggered',
+        type: 'sh_canary_triggered',
         agent_id: agent.id,
         session_id: sessionId,
       }), {
@@ -5150,10 +5150,10 @@ export async function handleProviderProxy(
 
       // ====================================================================
       // CBD Outbound DLP — screen agent response for data leaks
-      // Scans extracted text content; logs to cbd_evaluations.
+      // Scans extracted text content; logs to sh_exit_evaluations.
       // ====================================================================
       let outboundDLPDetected = false;
-      if (env.CFD_ENABLED === 'true' && env.BILLING_CACHE) {
+      if (env.SAFE_HOUSE_ENABLED === 'true' && env.BILLING_CACHE) {
         try {
           const textToScan = outputText ?? (() => {
             try {
@@ -5180,7 +5180,7 @@ export async function handleProviderProxy(
                 })),
                 0.9, env));
               console.log(JSON.stringify({
-                event: 'cbd_outbound_dlp',
+                event: 'sh_exit_dlp',
                 agent_id: agent.id,
                 match_types: [...new Set(matches.map(m => m.type))],
               }));
@@ -5190,11 +5190,11 @@ export async function handleProviderProxy(
       }
 
       if (outboundDLPDetected) {
-        responseHeaders.set('X-CBD-DLP', 'detected');
+        responseHeaders.set('X-Safe-House-DLP', 'detected');
       }
 
       // CBD Semantic analysis — async, never blocks the response
-      if (env.CFD_ENABLED === 'true' && outputText) {
+      if (env.SAFE_HOUSE_ENABLED === 'true' && outputText) {
         ctx.waitUntil(runCBDSemanticAnalysis(outputText, agent.id, sessionId, env));
       }
 
@@ -5347,9 +5347,9 @@ export async function handleProviderProxy(
       ].filter(Boolean);
       const gatewayTaskContext = gatewayTaskParts.length > 0 ? gatewayTaskParts.join(' ') : undefined;
 
-      // Retrieve cached CFD result for this session (written during pre-check, Phase 0.5)
-      const cachedCFDResult = await env.BILLING_CACHE?.get(`cfd:result:${sessionId}:latest`)
-        .then(raw => raw ? JSON.parse(raw) as CFDDecision : null)
+      // Retrieve cached Safe House result for this session (written during pre-check, Phase 0.5)
+      const cachedCFDResult = await env.BILLING_CACHE?.get(`sh:result:${sessionId}:latest`)
+        .then(raw => raw ? JSON.parse(raw) as SafeHouseDecision : null)
         .catch(() => null) ?? null;
       const cfdThreatContext = cachedCFDResult ? buildThreatContextForAIP(cachedCFDResult) : undefined;
       const enrichedTaskContext = [gatewayTaskContext, cfdThreatContext].filter(Boolean).join('\n\n') || undefined;
@@ -5440,9 +5440,9 @@ export async function handleProviderProxy(
           reasoning_summary: cp.reasoning_summary,
         })),
         ...(cachedCFDResult ? [{
-          checkpoint_id: `cfd:${sessionId}:latest`,
+          checkpoint_id: `sh:${sessionId}:latest`,
           verdict: cachedCFDResult.verdict as string,
-          reasoning_summary: `CFD pre-screen: risk=${cachedCFDResult.overall_risk.toFixed(2)} threats=${cachedCFDResult.threats.map((t: { type: string }) => t.type).join(',')}`,
+          reasoning_summary: `Safe House pre-screen: risk=${cachedCFDResult.overall_risk.toFixed(2)} threats=${cachedCFDResult.threats.map((t: { type: string }) => t.type).join(',')}`,
         }] : []),
       ];
       const attestation = await attestCheckpoint(
@@ -5743,7 +5743,7 @@ export default {
           'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, x-api-key, anthropic-version, anthropic-beta, authorization, x-goog-api-key, x-mnemom-api-key, x-smoltbot-agent, x-mnemom-agent',
-          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, x-mnemom-agent, x-mnemom-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-CFD-Verdict, X-CFD-Quarantine-Id, X-CFD-Session-Risk, X-CFD-Mode, X-CFD-Simulated-Verdict, X-CBD-Canary-Triggered, X-CBD-DLP',
+          'Access-Control-Expose-Headers': 'x-smoltbot-agent, x-smoltbot-session, x-mnemom-agent, x-mnemom-session, X-AIP-Verdict, X-AIP-Checkpoint-Id, X-AIP-Action, X-AIP-Proceed, X-AIP-Synthetic, X-AIP-Certificate-Id, X-AIP-Chain-Hash, X-Mnemom-Usage-Warning, X-Mnemom-Usage-Percent, X-Safe-House-Verdict, X-Safe-House-Quarantine-Id, X-Safe-House-Session-Risk, X-Safe-House-Mode, X-Safe-House-Simulated-Verdict, X-Safe-House-Canary-Triggered, X-Safe-House-DLP',
           'Access-Control-Max-Age': '86400',
           'Vary': 'Origin',
         },
