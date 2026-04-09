@@ -14,7 +14,7 @@ usage_model = "standard"
 crons = ["* * * * *"]
 
 [env.production.vars]
-GATEWAY_ID = "smoltbot"
+GATEWAY_ID = "mnemom"
 OBSERVER_MAX_LOGS = "5000"
 
 [[env.production.kv_namespaces]]
@@ -36,7 +36,7 @@ name = "mnemom-observer-staging"
 crons = ["*/5 * * * *"]
 
 [env.staging.vars]
-GATEWAY_ID = "smoltbot-staging"
+GATEWAY_ID = "mnemom-staging"
 OBSERVER_MAX_LOGS = "5000"
 
 [[env.staging.kv_namespaces]]
