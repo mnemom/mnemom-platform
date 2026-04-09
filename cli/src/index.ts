@@ -18,11 +18,12 @@ import {
 import { registerCommand } from "./commands/register.js";
 import { agentsListCommand, agentsRemoveCommand, agentsAddCommand, agentsDefaultCommand, agentsRekeyCommand, agentsCheckBindingCommand } from "./commands/agents.js";
 import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
+import { makeMigrateConfigCommand } from "./commands/migrate-config.js";
 
 program
-  .name("smoltbot")
+  .name("mnemom")
   .description("Transparent AI agent tracing - AAP compliant")
-  .version("0.4.0")
+  .version("0.6.0")
   .option("--agent <name>", "Select agent by name");
 
 program
@@ -389,5 +390,7 @@ program
       process.exit(1);
     }
   });
+
+program.addCommand(makeMigrateConfigCommand());
 
 program.parse();

@@ -32,12 +32,22 @@ function buildProviderRoutes(): Record<Provider, { baseUrl: string; apiType: str
 export const PROVIDER_ROUTES = buildProviderRoutes();
 
 /**
- * Smoltbot provider key names in OpenClaw config.
- * smoltbot -> Anthropic (backward compatible)
- * smoltbot-openai -> OpenAI
- * smoltbot-gemini -> Gemini
+ * Mnemom provider key names in OpenClaw config (canonical, new installs).
+ * mnemom -> Anthropic
+ * mnemom-openai -> OpenAI
+ * mnemom-gemini -> Gemini
  */
 export const PROVIDER_CONFIG_KEYS: Record<Provider, string> = {
+  anthropic: "mnemom",
+  openai: "mnemom-openai",
+  gemini: "mnemom-gemini",
+};
+
+/**
+ * Legacy smoltbot provider key names — used for backward-compat detection
+ * of existing configurations and migration source keys.
+ */
+export const LEGACY_PROVIDER_CONFIG_KEYS: Record<Provider, string> = {
   anthropic: "smoltbot",
   openai: "smoltbot-openai",
   gemini: "smoltbot-gemini",
@@ -313,38 +323,52 @@ export function getCurrentModel(): {
 }
 
 /**
- * Check if smoltbot provider is already configured (any provider)
+ * Check if smoltbot/mnemom provider is already configured (any provider).
+ * Returns true if either mnemom* OR smoltbot* provider keys exist in the OpenClaw config.
  */
 export function isSmoltbotConfigured(): boolean {
   const config = loadOpenClawConfig();
   if (!config?.models?.providers) return false;
-  return Object.values(PROVIDER_CONFIG_KEYS).some(
-    (key) => !!config.models?.providers?.[key]
-  );
+  const allKeys = [
+    ...Object.values(PROVIDER_CONFIG_KEYS),
+    ...Object.values(LEGACY_PROVIDER_CONFIG_KEYS),
+  ];
+  return allKeys.some((key) => !!config.models?.providers?.[key]);
 }
 
 /**
- * Get list of smoltbot-configured providers
+ * Get list of smoltbot/mnemom-configured providers.
+ * Checks both new mnemom* keys and legacy smoltbot* keys.
  */
 export function getSmoltbotConfiguredProviders(): Provider[] {
   const config = loadOpenClawConfig();
   if (!config?.models?.providers) return [];
 
-  const configured: Provider[] = [];
+  const configured = new Set<Provider>();
   for (const [provider, key] of Object.entries(PROVIDER_CONFIG_KEYS)) {
     if (config.models.providers[key]) {
-      configured.push(provider as Provider);
+      configured.add(provider as Provider);
     }
   }
-  return configured;
+  for (const [provider, key] of Object.entries(LEGACY_PROVIDER_CONFIG_KEYS)) {
+    if (config.models.providers[key]) {
+      configured.add(provider as Provider);
+    }
+  }
+  return Array.from(configured);
 }
 
 /**
- * Get the existing smoltbot provider config
+ * Get the existing mnemom/smoltbot provider config (Anthropic provider).
+ * Checks mnemom key first, falls back to legacy smoltbot key.
  */
 export function getSmoltbotProvider(): SmoltbotProvider | null {
   const config = loadOpenClawConfig();
-  return config?.models?.providers?.smoltbot || null;
+  return (
+    config?.models?.providers?.mnemom ||
+    config?.models?.providers?.smoltbot ||
+    null
+  );
 }
 
 /**
@@ -565,19 +589,19 @@ export function configureSmoltbotProviders(
 
 /**
  * Get provider routes for a named agent.
- * Named agents use the same base URLs as default, but add x-smoltbot-agent header.
+ * Named agents use the same base URLs as default, but add x-mnemom-agent header.
  */
 export function getProviderRoutes(
   agentName?: string
 ): Record<Provider, { baseUrl: string; apiType: string }> {
-  // Same URLs for all agents — agent identity is in the x-smoltbot-agent header
+  // Same URLs for all agents — agent identity is in the x-mnemom-agent header
   return PROVIDER_ROUTES;
 }
 
 /**
  * Get provider config keys for a named agent.
- * Default agent uses existing keys (smoltbot, smoltbot-openai, smoltbot-gemini).
- * Named agents use: smoltbot-{name}, smoltbot-{name}-openai, smoltbot-{name}-gemini.
+ * Default agent uses mnemom* keys (PROVIDER_CONFIG_KEYS).
+ * Named agents use: mnemom-{name}, mnemom-{name}-openai, mnemom-{name}-gemini.
  */
 export function getProviderConfigKeys(
   agentName?: string
@@ -587,9 +611,9 @@ export function getProviderConfigKeys(
   }
 
   return {
-    anthropic: `smoltbot-${agentName}`,
-    openai: `smoltbot-${agentName}-openai`,
-    gemini: `smoltbot-${agentName}-gemini`,
+    anthropic: `mnemom-${agentName}`,
+    openai: `mnemom-${agentName}-openai`,
+    gemini: `mnemom-${agentName}-gemini`,
   };
 }
 
@@ -632,7 +656,7 @@ export function configureNamedAgentProviders(
       baseUrl: route.baseUrl,
       apiKey: data.apiKey,
       api: route.apiType,
-      defaultHeaders: { "x-smoltbot-agent": agentName },
+      defaultHeaders: { "x-mnemom-agent": agentName },
       models: data.models,
     };
 
