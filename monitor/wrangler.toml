@@ -4,7 +4,7 @@ compatibility_date = "2024-01-01"
 
 # ─── Production ───────────────────────────────────────────────────────────────
 [env.production]
-name = "smoltbot-monitor"
+name = "mnemom-monitor"
 
 [env.production.triggers]
 crons = ["*/5 * * * *"]
@@ -14,7 +14,7 @@ crons = ["*/5 * * * *"]
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
-name = "smoltbot-monitor-staging"
+name = "mnemom-monitor-staging"
 
 [env.staging.triggers]
 crons = ["*/15 * * * *"]

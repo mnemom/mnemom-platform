@@ -132,7 +132,7 @@ Webhook event: `quota.cfd_warning` fires when threshold is crossed.
 
 ## Environment variable (self-hosted / gateway workers)
 
-If you run the smoltbot gateway yourself, set:
+If you run the mnemom gateway yourself, set:
 ```
 CFD_ENABLED=true
 ```

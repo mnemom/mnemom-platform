@@ -9,7 +9,7 @@
 
 Transparent AI agent tracing. [AAP](https://github.com/mnemom/aap)-compliant.
 
-Smoltbot observes your AI agent's API calls and builds verifiable alignment traces — what decisions were made, what alternatives were considered, and whether behavior matches declared values. Your prompts and responses are never stored.
+mnemom observes your AI agent's API calls and builds verifiable alignment traces — what decisions were made, what alternatives were considered, and whether behavior matches declared values. Your prompts and responses are never stored.
 
 ## Documentation
 
@@ -92,7 +92,7 @@ Claiming gives you a private dashboard with full trace history, integrity scores
 
 ## What Gets Traced
 
-Smoltbot builds [AP-Traces](https://github.com/mnemom/aap) that record:
+mnemom builds [AP-Traces](https://github.com/mnemom/aap) that record:
 
 - **Action** — What the agent did (type, name, category)
 - **Decision** — What alternatives were considered and why one was selected
@@ -114,7 +114,7 @@ What is **not** stored: your prompts, responses, or API key.
 
 ## Enforcement Modes
 
-Smoltbot supports three enforcement modes for integrity violations:
+mnemom supports three enforcement modes for integrity violations:
 
 | Mode | Behavior |
 |------|----------|
@@ -143,7 +143,7 @@ Set enforcement mode via the API: `PUT /v1/agents/:id/enforcement` with `{"mode"
 
 ## Self-Hosting
 
-Smoltbot is designed to run on Cloudflare Workers + Supabase. To self-host:
+mnemom-platform is designed to run on Cloudflare Workers + Supabase. To self-host:
 
 1. Create a Supabase project and run the schema from [`mnemom-api`](https://github.com/mnemom/mnemom-api)
 2. Deploy workers: `cd gateway && wrangler deploy`, `cd observer && wrangler deploy`, and deploy the API from `mnemom-api`
