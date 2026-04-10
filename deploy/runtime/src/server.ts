@@ -66,8 +66,8 @@ export function createApp(config: ServerConfig): Hono {
         'x-mnemom-api-key',
       ],
       exposeHeaders: [
-        'x-smoltbot-agent',
-        'x-smoltbot-session',
+        'x-mnemom-agent',
+        'x-mnemom-session',
         'X-AIP-Verdict',
         'X-AIP-Checkpoint-Id',
         'X-AIP-Action',

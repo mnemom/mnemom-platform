@@ -45,7 +45,7 @@ id = "2310e7878a364496b397b88540923c1f"
 
 # Secrets (set via: wrangler secret put <NAME> --env staging):
 # SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
-# CF_ACCOUNT_ID, CF_API_TOKEN, CF_AI_GATEWAY_URL (smoltbot-staging)
+# CF_ACCOUNT_ID, CF_API_TOKEN, CF_AI_GATEWAY_URL (mnemom-staging)
 # ANTHROPIC_API_KEY, ANALYSIS_API_KEY
 # OTLP_ENDPOINT, OTLP_AUTH
 # TRIGGER_SECRET

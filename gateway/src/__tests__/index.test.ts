@@ -568,7 +568,7 @@ describe('handleAnthropicProxy', () => {
   });
 
   it('should return 401 if x-api-key header is missing', async () => {
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
     });
     const ctx = createMockContext();
@@ -635,7 +635,7 @@ describe('handleAnthropicProxy', () => {
     );
 
     // Use GET request without body to avoid Node.js duplex stream issues
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/models', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/models', {
       method: 'GET',
       headers: {
         'x-api-key': 'sk-ant-test-key',
@@ -700,7 +700,7 @@ describe('handleAnthropicProxy', () => {
       body: null,
     });
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -760,7 +760,7 @@ describe('handleAnthropicProxy', () => {
       body: null,
     });
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -824,7 +824,7 @@ describe('handleAnthropicProxy', () => {
       new Response(null, { status: 200, statusText: 'OK' })
     );
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -884,7 +884,7 @@ describe('handleAnthropicProxy', () => {
       body: null,
     });
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -898,7 +898,7 @@ describe('handleAnthropicProxy', () => {
   it('should return 500 on internal error', async () => {
     mockFetch.mockRejectedValueOnce(new Error('Network failure'));
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -962,7 +962,7 @@ describe('handleAnthropicProxy', () => {
       body: null,
     });
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages?stream=true', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages?stream=true', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -986,7 +986,7 @@ describe('Request handler integration', () => {
   });
 
   it('should handle OPTIONS requests for CORS preflight', async () => {
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'OPTIONS',
     });
     const env = createTestEnv();
@@ -1005,7 +1005,7 @@ describe('Request handler integration', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2024-01-15T10:30:00.000Z'));
 
-    const request = new Request('https://gateway.smoltbot.com/health', {
+    const request = new Request('https://gateway.mnemom.ai/health', {
       method: 'GET',
     });
     const env = createTestEnv();
@@ -1024,7 +1024,7 @@ describe('Request handler integration', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2024-01-15T10:30:00.000Z'));
 
-    const request = new Request('https://gateway.smoltbot.com/health/', {
+    const request = new Request('https://gateway.mnemom.ai/health/', {
       method: 'GET',
     });
     const env = createTestEnv();
@@ -1040,7 +1040,7 @@ describe('Request handler integration', () => {
   });
 
   it('should return 404 for unknown paths', async () => {
-    const request = new Request('https://gateway.smoltbot.com/unknown/path', {
+    const request = new Request('https://gateway.mnemom.ai/unknown/path', {
       method: 'GET',
     });
     const env = createTestEnv();
@@ -1054,7 +1054,7 @@ describe('Request handler integration', () => {
   });
 
   it('should return 404 for root path', async () => {
-    const request = new Request('https://gateway.smoltbot.com/', {
+    const request = new Request('https://gateway.mnemom.ai/', {
       method: 'GET',
     });
     const env = createTestEnv();
@@ -1113,7 +1113,7 @@ describe('Request handler integration', () => {
       body: null,
     });
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -1127,7 +1127,7 @@ describe('Request handler integration', () => {
   });
 
   it('should route /anthropic (without trailing path) to proxy handler', async () => {
-    const request = new Request('https://gateway.smoltbot.com/anthropic', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic', {
       method: 'POST',
       headers: { 'x-api-key': 'test-key' },
     });
@@ -1838,7 +1838,7 @@ describe('Billing enforcement integration', () => {
       })
     );
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': 'sk-ant-test-key' },
       body: JSON.stringify({ model: 'claude-sonnet-4-20250514', messages: [{ role: 'user', content: 'hi' }] }),
@@ -1896,7 +1896,7 @@ describe('Billing enforcement integration', () => {
       })
     );
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': 'sk-ant-test-key',
@@ -1950,7 +1950,7 @@ describe('Billing enforcement integration', () => {
       }),
     });
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': 'sk-ant-test-key',
@@ -1979,7 +1979,7 @@ describe('Billing enforcement integration', () => {
       json: () => Promise.resolve({ valid: false }),
     });
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': 'sk-ant-test-key',
@@ -2051,7 +2051,7 @@ describe('Billing enforcement integration', () => {
       })
     );
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': 'sk-ant-test-key',
@@ -2117,7 +2117,7 @@ describe('Billing enforcement integration', () => {
       })
     );
 
-    const request = new Request('https://gateway.smoltbot.com/anthropic/v1/messages', {
+    const request = new Request('https://gateway.mnemom.ai/anthropic/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': 'sk-ant-test-key',

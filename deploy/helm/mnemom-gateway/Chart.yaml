@@ -11,7 +11,7 @@ keywords:
   - enterprise
 home: https://mnemom.ai
 sources:
-  - https://github.com/mnemom/smoltbot
+  - https://github.com/mnemom/mnemom-platform
 maintainers:
   - name: mnemom
     email: support@mnemom.ai

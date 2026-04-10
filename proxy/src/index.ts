@@ -1,5 +1,5 @@
 /**
- * Smoltbot Proxy Worker
+ * Mnemom Proxy Worker
  *
  * Transparent HTTP proxy for reaching hosts unreachable from Fly.io
  * (e.g. Vercel-hosted sites that block datacenter IPs).
@@ -53,7 +53,7 @@ export default {
     // Health check
     const url = new URL(request.url);
     if (url.pathname === '/health') {
-      return Response.json({ status: 'ok', service: 'smoltbot-proxy' });
+      return Response.json({ status: 'ok', service: 'mnemom-proxy' });
     }
 
     // Auth check — uses X-Proxy-Token so Authorization passes through to target
@@ -107,7 +107,7 @@ export default {
       // Pass through response with CORS
       const respHeaders = new Headers(resp.headers);
       respHeaders.set('Access-Control-Allow-Origin', '*');
-      respHeaders.set('X-Proxied-Via', 'smoltbot-proxy');
+      respHeaders.set('X-Proxied-Via', 'mnemom-proxy');
 
       return new Response(resp.body, {
         status: resp.status,

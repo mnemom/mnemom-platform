@@ -5,7 +5,7 @@
  * log aggregators (ELK, Loki, CloudWatch, etc.).
  *
  * Format:
- *   {"timestamp":"2025-01-15T12:00:00.000Z","level":"info","service":"smoltbot-gateway","message":"..."}
+ *   {"timestamp":"2025-01-15T12:00:00.000Z","level":"info","service":"mnemom-gateway","message":"..."}
  *
  * Features:
  *   - Configurable LOG_LEVEL (debug/info/warn/error) via env
@@ -32,7 +32,7 @@ type LogLevel = keyof typeof LOG_LEVELS;
 // ---------------------------------------------------------------------------
 
 let currentLevel: LogLevel = 'info';
-let serviceName = 'smoltbot-gateway';
+let serviceName = 'mnemom-gateway';
 
 // Store original console methods before patching
 const originalConsole = {
@@ -120,7 +120,7 @@ export const logger = {
  * Call once at startup before any logging occurs.
  *
  * @param opts.level - Minimum log level (default: process.env.LOG_LEVEL or 'info')
- * @param opts.service - Service name for log entries (default: 'smoltbot-gateway')
+ * @param opts.service - Service name for log entries (default: 'mnemom-gateway')
  */
 export function initLogger(opts?: { level?: string; service?: string }): void {
   const rawLevel = opts?.level ?? process.env.LOG_LEVEL ?? 'info';

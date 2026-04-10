@@ -1,7 +1,7 @@
 version: "3.9"
 
 # =============================================================================
-# smoltbot Self-Hosted Gateway — Docker Compose Stack
+# mnemom Self-Hosted Gateway — Docker Compose Stack
 # =============================================================================
 # Brings up PostgreSQL, Redis, runs migrations, and starts the gateway
 # and observer (scheduler) services.
@@ -18,15 +18,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: smoltbot
-      POSTGRES_USER: smoltbot
+      POSTGRES_DB: mnemom
+      POSTGRES_USER: mnemom
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U smoltbot"]
+      test: ["CMD-SHELL", "pg_isready -U mnemom"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -57,7 +57,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.gateway
     environment:
-      SMOLTBOT_ROLE: gateway
+      MNEMOM_ROLE: gateway
       SUPABASE_URL: http://postgres:5432
       SUPABASE_KEY: ${SUPABASE_KEY}
       REDIS_URL: redis://redis:6379
@@ -88,7 +88,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.gateway
     environment:
-      SMOLTBOT_ROLE: scheduler
+      MNEMOM_ROLE: scheduler
       SUPABASE_URL: http://postgres:5432
       SUPABASE_KEY: ${SUPABASE_KEY}
       REDIS_URL: redis://redis:6379

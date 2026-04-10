@@ -1,5 +1,5 @@
 /**
- * Entrypoint — main entry point for the self-hosted smoltbot runtime
+ * Entrypoint — main entry point for the self-hosted mnemom runtime
  *
  * Orchestrates:
  *   1. Structured logger initialization
@@ -10,7 +10,7 @@
  *   6. Heartbeat client for license compliance
  *   7. Graceful shutdown on SIGTERM/SIGINT
  *
- * Supports SMOLTBOT_ROLE env var:
+ * Supports MNEMOM_ROLE env var:
  *   - "gateway"   — HTTP server only (no cron jobs)
  *   - "scheduler" — Cron jobs only (no HTTP server)
  *   - "all"       — Both HTTP server and cron jobs (default)
@@ -35,7 +35,7 @@ import { incCronRun } from './metrics.js';
 type Role = 'gateway' | 'scheduler' | 'all';
 
 function getRole(): Role {
-  const role = process.env.SMOLTBOT_ROLE?.toLowerCase();
+  const role = process.env.MNEMOM_ROLE?.toLowerCase();
   if (role === 'gateway' || role === 'scheduler' || role === 'all') {
     return role;
   }
@@ -51,10 +51,10 @@ async function main(): Promise<void> {
   const role = getRole();
   initLogger({
     level: process.env.LOG_LEVEL,
-    service: `smoltbot-${role}`,
+    service: `mnemom-${role}`,
   });
 
-  logger.info(`Starting smoltbot self-hosted runtime (role=${role})`);
+  logger.info(`Starting mnemom self-hosted runtime (role=${role})`);
   logger.info(`Node.js ${process.version}, platform=${process.platform}`);
 
   // 2. Install fetch interceptor for AI Gateway URL rewriting

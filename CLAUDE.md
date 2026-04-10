@@ -14,7 +14,7 @@
 ## Deploy Guardrails
 
 ### Allowed
-- Trigger staging deploys: `gh workflow run deploy.yml --repo mnemom/deploy -f repos=smoltbot -f environment=staging`
+- Trigger staging deploys: `gh workflow run deploy.yml --repo mnemom/deploy -f repos=mnemom-platform -f environment=staging`
 - Check deploy status: `gh run list --repo mnemom/deploy --workflow deploy.yml --limit 5`
 - Roll back staging gateway: `gh workflow run rollback.yml --repo mnemom/deploy -f service=gateway -f environment=staging`
 - Roll back staging observer: `gh workflow run rollback.yml --repo mnemom/deploy -f service=observer -f environment=staging`
