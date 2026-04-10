@@ -74,7 +74,10 @@ jobs:
       - name: Publish
         if: steps.check.outputs.skip != 'true'
         working-directory: ${{ inputs.npm-directory }}
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag latest
+          # --tag latest: required because @mnemom/smoltbot has legacy 2.x versions
+          # which are higher in semver than our 0.x line. Without --tag latest, npm
+          # refuses to implicitly set the latest tag to a lower version number.
 
       - name: Generate SBOM
         uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11 # v0
