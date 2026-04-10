@@ -30,7 +30,7 @@ jobs:
       cli: ${{ steps.filter.outputs.cli }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         id: filter
         with:
           filters: |
@@ -149,7 +149,7 @@ jobs:
         run: npm test -- --run --coverage
 
       - name: Upload coverage
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: cli
@@ -182,7 +182,7 @@ jobs:
         run: npm test -- --run --coverage
 
       - name: Upload coverage
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: gateway
@@ -268,14 +268,14 @@ jobs:
       !contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
         id: app-token
         with:
           app-id: ${{ secrets.DEPLOY_APP_ID }}
           private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
           owner: mnemom
 
-      - uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
+      - uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
           repository: mnemom/deploy
@@ -296,7 +296,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
         id: app-token
         with:
           app-id: ${{ secrets.DEPLOY_APP_ID }}
@@ -345,7 +345,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: "20"
       - run: npm ci
