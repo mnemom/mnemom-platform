@@ -26,16 +26,20 @@ jobs:
 
       - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6
         with:
-          node-version: "22"
-          # Node 22.14+ ships with npm 10.9+ which is required for OIDC trusted publishing.
-          # npm 11.5.1+ (Node 24) is ideal but Node 22 is sufficient.
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          # Node 24 ships with npm 11.5.1+ which is required for OIDC Trusted Publisher
+          # publishing to work correctly.
           #
-          # DO NOT add registry-url here. When setup-node sets registry-url it creates
-          # an .npmrc that sets NODE_AUTH_TOKEN="", which causes npm to authenticate
-          # with an empty bearer token instead of using its internal OIDC exchange.
-          # Result: E404 "not in this registry" even with Trusted Publisher configured.
-          # npm publish --provenance handles the full OIDC exchange internally when
-          # NODE_AUTH_TOKEN is absent. (Regression introduced in #121 — fixed here.)
+          # registry-url is needed: it creates an .npmrc with NODE_AUTH_TOKEN="". With npm
+          # 11.5.1+, an empty NODE_AUTH_TOKEN causes npm to fall back to the OIDC exchange
+          # automatically (using ACTIONS_ID_TOKEN_REQUEST_URL). This is the correct behavior
+          # for Trusted Publisher publishing.
+          #
+          # With npm <11 (Node 20/22): empty NODE_AUTH_TOKEN causes E404 (npm tries to
+          # auth with empty bearer token). Without registry-url at all: ENEEDAUTH (npm
+          # v10 doesn't auto-detect OIDC). Node 24 + registry-url is the correct combo.
+          # (History: registry-url added in #121, broke on Node 20. Node 24 fixes it.)
 
       - name: Install and build shared dependencies
         run: |
