@@ -26,18 +26,20 @@ jobs:
 
       - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6
         with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-          # Node 20 ships with npm 10.x which supports --provenance natively.
-          # Removed Node 22 + `npm install -g npm@latest`: GitHub Actions runners
-          # have a recurring promise-retry MODULE_NOT_FOUND corruption on Node 22
-          # that breaks npm entirely. Node 20 is unaffected.
-          # registry-url is required for --provenance publish: setup-node uses it
-          # to configure NODE_AUTH_TOKEN from GitHub's OIDC exchange.
+          node-version: "22"
+          # Node 22.14+ ships with npm 10.9+ which is required for OIDC trusted publishing.
+          # npm 11.5.1+ (Node 24) is ideal but Node 22 is sufficient.
+          #
+          # DO NOT add registry-url here. When setup-node sets registry-url it creates
+          # an .npmrc that sets NODE_AUTH_TOKEN="", which causes npm to authenticate
+          # with an empty bearer token instead of using its internal OIDC exchange.
+          # Result: E404 "not in this registry" even with Trusted Publisher configured.
+          # npm publish --provenance handles the full OIDC exchange internally when
+          # NODE_AUTH_TOKEN is absent. (Regression introduced in #121 — fixed here.)
 
       - name: Install and build shared dependencies
         run: |
-          for pkg in shared/policy-engine shared/cfd; do
+          for pkg in shared/policy-engine shared/safe-house; do
             if [ -d "$pkg" ]; then
               echo "Building $pkg..."
               (cd "$pkg" && npm ci --silent && npm run build)
