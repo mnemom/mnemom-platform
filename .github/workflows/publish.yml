@@ -40,8 +40,8 @@ jobs:
     permissions:
       contents: write
       id-token: write
-    # mnemom/.github @ scale/step-29-fix-artifact-name merge (ADR-020)
-    uses: mnemom/.github/.github/workflows/npm-publish.yml@0514f87f1642dfdd3ad26a32c0fe4dcbe9a478b9
+    # mnemom/.github @ scale/step-29-cleanup merge (ADR-020)
+    uses: mnemom/.github/.github/workflows/npm-publish.yml@e9906593dcd1f0d2d642b92e46818bda1cc46e24
     with:
       npm-directory: ${{ inputs.npm-directory }}
       dispatch-id: ${{ inputs.dispatch-id || '' }}
