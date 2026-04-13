@@ -257,7 +257,7 @@ export async function agentsRekeyCommand(name?: string): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.startsWith("409") || msg.includes("conflict")) {
       // Extract conflict agent ID if present
-      const match = msg.match(/conflict: (smolt-[0-9a-f]{8})/);
+      const match = msg.match(/conflict: ((?:smolt-[0-9a-f]{8}|mnm-[0-9a-f-]{36}))/);
       const shadowId = match ? match[1] : "(unknown)";
       console.log(fmt.error("Key conflict: a different agent was already auto-created for this key.\n"));
       console.log(`  Shadow agent ID: ${shadowId}`);

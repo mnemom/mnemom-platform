@@ -55,23 +55,26 @@ describe("config", () => {
   });
 
   describe("generateAgentId", () => {
-    it("should generate an agent ID with smolt- prefix", () => {
+    // ADR-019 / scale/step-25b: new agents use mnm-{uuid_v4} format
+    it("should generate an agent ID with mnm- prefix and UUID v4 format", () => {
       const agentId = generateAgentId();
-      expect(agentId).toMatch(/^smolt-[a-f0-9]{8}$/);
+      expect(agentId).toMatch(
+        /^mnm-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      );
     });
 
-    it("should generate ID based on random bytes", () => {
+    it("should use crypto.randomUUID() (not randomBytes)", () => {
       const agentId = generateAgentId();
-      // With mocked randomBytes returning "deadbeef" as hex
-      expect(agentId).toBe("smolt-deadbeef");
+      // Verify it no longer uses randomBytes mock ("deadbeef" would appear in smolt- IDs)
+      expect(agentId).not.toContain("smolt-");
+      expect(agentId.startsWith("mnm-")).toBe(true);
     });
 
-    it("should generate different IDs when randomBytes returns different values", () => {
-      mockRandomBytes.mockReturnValueOnce(Buffer.from("12345678", "hex"));
-
-      const agentId = generateAgentId();
-
-      expect(agentId).toBe("smolt-12345678");
+    it("should generate distinct IDs on each call", () => {
+      const id1 = generateAgentId();
+      const id2 = generateAgentId();
+      // UUID v4 is random — two calls should produce different values
+      expect(id1).not.toBe(id2);
     });
   });
 

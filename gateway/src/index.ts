@@ -184,6 +184,8 @@ export interface Env {
   KV?: KVNamespace;
   // Safe House
   SAFE_HOUSE_ENABLED?: string;  // "true" to enable Safe House DB fetches; default off to avoid test interference
+  // Canonical agent creation (scale/step-25b): gateway delegates to mnemom-api
+  INTERNAL_API_KEY?: string;    // Shared service-to-service key (same as mnemom-api INTERNAL_API_KEY)
 }
 
 interface Agent {
@@ -670,35 +672,43 @@ export async function getOrCreateAgent(
     return { agent: existing, isNew: false };
   }
 
-  // Create new agent - generate id from hash prefix per spec
-  const agentId = `smolt-${agentHash.slice(0, 8)}`;
+  // Delegate new agent creation to mnemom-api — the single canonical creation path.
+  // This ensures: mnm-{uuid} IDs, consistent alignment card creation, single code path.
+  // (scale/step-25b: ADR-019 consolidation — gateway no longer writes agents directly)
+  const apiBase = env.MNEMOM_ANALYZE_URL
+    ? env.MNEMOM_ANALYZE_URL.replace('/v1/analyze', '')
+    : 'https://api.mnemom.ai';
 
-  const createResponse = await supabaseFetch(
-    `${env.SUPABASE_URL}/rest/v1/agents`,
-    {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        id: agentId,
-        agent_hash: agentHash,
-        ...(agentName ? { name: agentName } : {}),
-        ...(keyPrefix ? { key_prefix: keyPrefix } : {}),
-        last_seen: new Date().toISOString(),
-      }),
-    }
-  );
+  const createResponse = await fetch(`${apiBase}/internal/agents`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Internal-Key': env.INTERNAL_API_KEY ?? '',
+    },
+    body: JSON.stringify({
+      agent_hash: agentHash,
+      ...(agentName ? { name: agentName } : {}),
+      ...(keyPrefix ? { key_prefix: keyPrefix } : {}),
+    }),
+  });
 
   if (!createResponse.ok) {
-    const errorText = await createResponse.text();
+    // On failure, retry the read — another request may have won the race
+    const retryResponse = await supabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/agents?agent_hash=eq.${agentHash}&select=*`,
+      { headers }
+    );
+    if (retryResponse.ok) {
+      const retryAgents: Agent[] = await retryResponse.json();
+      if (retryAgents.length > 0) {
+        return { agent: retryAgents[0], isNew: false };
+      }
+    }
+    const errorText = await createResponse.text().catch(() => '');
     throw new Error(`Failed to create agent: ${createResponse.status} - ${errorText}`);
   }
 
-  const newAgents: Agent[] = await createResponse.json();
-  const newAgent = newAgents[0];
-
-  // Create alignment card for new agent
-  await ensureAlignmentCard(newAgent.id, env);
-
+  const newAgent: Agent = await createResponse.json();
   return { agent: newAgent, isNew: true };
 }
 
