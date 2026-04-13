@@ -1,5 +1,5 @@
 {
-  "name": "@mnemom/smoltbot",
+  "name": "@mnemom/mnemom",
   "version": "0.7.0",
   "description": "Transparent AI agent tracing - AAP compliant",
   "type": "module",
