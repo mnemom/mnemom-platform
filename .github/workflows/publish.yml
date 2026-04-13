@@ -1,5 +1,19 @@
 name: Publish
 
+# Thin caller for the canonical npm publish recipe — see ADR-020.
+# All Node version, registry-url, OIDC, provenance, and SBOM logic lives in
+# mnemom/.github/.github/workflows/npm-publish.yml. To change the recipe,
+# edit the canonical workflow there; do not re-add steps inline here.
+#
+# Publishes from this repo (selected via npm-directory input):
+#   - cli/                  → @mnemom/mnemom
+#   - shared/policy-engine/ → @mnemom/policy-engine
+#   - shared/safe-house/    → @mnemom/safe-house
+#
+# Each target package's own `build` script handles building its sibling
+# dependencies (e.g., cli's build runs `npm run build --prefix
+# ../shared/policy-engine` first), so no shared-build preamble is needed.
+
 on:
   workflow_dispatch:
     inputs:
@@ -16,76 +30,20 @@ on:
 permissions: {}
 jobs:
   publish:
+    # NOTE on permissions: contents: write is over-granted relative to what
+    # this dispatch-only workflow actually needs (the `gh release upload`
+    # step in the reusable workflow is gated on `event_name == 'release'`
+    # and never runs here). But GitHub validates the caller's declared
+    # permissions against the called workflow's declared permissions at
+    # workflow load time, before any `if:` is evaluated. The reusable
+    # workflow declares `contents: write`; callers must grant the union.
     permissions:
-      contents: read
+      contents: write
       id-token: write
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-          # Node 24 ships with npm 11.5.1+ which is required for OIDC Trusted Publisher
-          # publishing to work correctly.
-          #
-          # registry-url is needed: it creates an .npmrc with NODE_AUTH_TOKEN="". With npm
-          # 11.5.1+, an empty NODE_AUTH_TOKEN causes npm to fall back to the OIDC exchange
-          # automatically (using ACTIONS_ID_TOKEN_REQUEST_URL). This is the correct behavior
-          # for Trusted Publisher publishing.
-          #
-          # With npm <11 (Node 20/22): empty NODE_AUTH_TOKEN causes E404 (npm tries to
-          # auth with empty bearer token). Without registry-url at all: ENEEDAUTH (npm
-          # v10 doesn't auto-detect OIDC). Node 24 + registry-url is the correct combo.
-          # (History: registry-url added in #121, broke on Node 20. Node 24 fixes it.)
-
-      - name: Install and build shared dependencies
-        run: |
-          for pkg in shared/policy-engine shared/safe-house; do
-            if [ -d "$pkg" ]; then
-              echo "Building $pkg..."
-              (cd "$pkg" && npm ci --silent && npm run build)
-            fi
-          done
-
-      - name: Install and build
-        working-directory: ${{ inputs.npm-directory }}
-        run: |
-          npm ci || npm install
-          npm run build --if-present
-
-      - name: Check if already published
-        id: check
-        working-directory: ${{ inputs.npm-directory }}
-        run: |
-          PKG_NAME=$(node -p "require('./package.json').name")
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          PUBLISHED=$(npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null || echo "")
-          if [ "$PUBLISHED" = "$PKG_VERSION" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "$PKG_NAME@$PKG_VERSION already published — skipping"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Will publish $PKG_NAME@$PKG_VERSION"
-          fi
-
-      - name: Publish
-        if: steps.check.outputs.skip != 'true'
-        working-directory: ${{ inputs.npm-directory }}
-        run: npm publish --access public --provenance --tag latest
-          # --tag latest: required because @mnemom/smoltbot has legacy 2.x versions
-          # which are higher in semver than our 0.x line. Without --tag latest, npm
-          # refuses to implicitly set the latest tag to a lower version number.
-
-      - name: Generate SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
-        with:
-          format: cyclonedx-json
-          output-file: sbom.cdx.json
-      - name: Upload SBOM
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        with:
-          name: sbom
-          path: sbom.cdx.json
+    # mnemom/.github @ scale/step-29-fix-artifact-name merge (ADR-020)
+    uses: mnemom/.github/.github/workflows/npm-publish.yml@0514f87f1642dfdd3ad26a32c0fe4dcbe9a478b9
+    with:
+      npm-directory: ${{ inputs.npm-directory }}
+      dispatch-id: ${{ inputs.dispatch-id || '' }}
+      tag: latest
+      attach-sbom-to-release: false   # dispatch path has no release to attach to
