@@ -29,7 +29,7 @@
   },
   "devDependencies": {
     "typescript": "^5.3.3",
-    "vitest": "^1.2.0"
+    "vitest": "^4.1.4"
   },
   "dependencies": {
     "@types/js-yaml": "^4.0.9",
