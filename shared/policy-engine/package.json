@@ -1,10 +1,10 @@
 {
   "name": "@mnemom/policy-engine",
   "version": "0.2.0",
-  "description": "Shared policy-as-code engine for smoltbot verification checkpoints",
+  "description": "Shared policy-as-code engine for mnemom verification checkpoints",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mnemom/smoltbot",
+    "url": "https://github.com/mnemom/mnemom-platform",
     "directory": "shared/policy-engine"
   },
   "type": "module",
@@ -29,7 +29,7 @@
   },
   "devDependencies": {
     "typescript": "^5.3.3",
-    "vitest": "^1.2.0"
+    "vitest": "^4.1.4"
   },
   "dependencies": {
     "@types/js-yaml": "^4.0.9",

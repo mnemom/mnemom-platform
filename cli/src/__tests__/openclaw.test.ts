@@ -32,6 +32,9 @@ import {
   type AuthProfilesFile,
 } from "../lib/openclaw.js";
 
+// The canonical provider key for Anthropic is now "mnemom"
+const ANTHROPIC_PROVIDER_KEY = "mnemom";
+
 describe("openclaw", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -323,7 +326,29 @@ describe("openclaw", () => {
       expect(result).toBe(false);
     });
 
-    it("should return true when smoltbot provider is configured", () => {
+    it("should return true when mnemom provider is configured (new key)", () => {
+      const mockConfig: OpenClawConfig = {
+        models: {
+          providers: {
+            mnemom: {
+              baseUrl: "https://gateway.mnemom.ai/anthropic",
+              apiKey: "test-key",
+              api: "anthropic-messages",
+              models: [],
+            },
+          },
+        },
+      };
+
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(mockConfig));
+
+      const result = isSmoltbotConfigured();
+
+      expect(result).toBe(true);
+    });
+
+    it("should return true when legacy smoltbot provider key exists (backward compat)", () => {
       const mockConfig: OpenClawConfig = {
         models: {
           providers: {
@@ -445,7 +470,7 @@ describe("openclaw", () => {
   });
 
   describe("configureSmoltbotProvider", () => {
-    it("should add smoltbot provider to config", () => {
+    it("should add mnemom provider to config (canonical key)", () => {
       const existingConfig: OpenClawConfig = {
         meta: { lastTouchedAt: "old-date" },
       };
@@ -466,12 +491,13 @@ describe("openclaw", () => {
       const writtenContent = vi.mocked(fs.writeFileSync).mock.calls[0][1];
       const parsedConfig = JSON.parse(writtenContent as string);
 
-      expect(parsedConfig.models.providers.smoltbot).toBeDefined();
-      expect(parsedConfig.models.providers.smoltbot.apiKey).toBe("test-api-key");
-      expect(parsedConfig.models.providers.smoltbot.baseUrl).toBe(
+      // configureSmoltbotProvider now writes under "mnemom" key (PROVIDER_CONFIG_KEYS.anthropic)
+      expect(parsedConfig.models.providers[ANTHROPIC_PROVIDER_KEY]).toBeDefined();
+      expect(parsedConfig.models.providers[ANTHROPIC_PROVIDER_KEY].apiKey).toBe("test-api-key");
+      expect(parsedConfig.models.providers[ANTHROPIC_PROVIDER_KEY].baseUrl).toBe(
         "https://gateway.mnemom.ai/anthropic"
       );
-      expect(parsedConfig.models.providers.smoltbot.models).toEqual(models);
+      expect(parsedConfig.models.providers[ANTHROPIC_PROVIDER_KEY].models).toEqual(models);
     });
 
     it("should throw error when config doesn't exist", () => {

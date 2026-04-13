@@ -5,14 +5,14 @@ changed=$(git diff --name-only @{push} 2>/dev/null || git diff --name-only HEAD~
 
 # Build shared packages if gateway or observer changes are detected and dist/ is missing.
 # CI builds these in setup-workspace; this ensures the same is true locally.
-if echo "$changed" | grep -qE "^(gateway|observer|shared/policy-engine|shared/cfd)/"; then
+if echo "$changed" | grep -qE "^(gateway|observer|shared/policy-engine|shared/safe-house)/"; then
   if [ ! -d "shared/policy-engine/dist" ]; then
     echo "Building shared/policy-engine (dist/ missing)..."
     (cd shared/policy-engine && npm install --silent 2>/dev/null && npm run build) || exit 1
   fi
-  if [ ! -d "shared/cfd/dist" ]; then
-    echo "Building shared/cfd (dist/ missing)..."
-    (cd shared/cfd && npm install --silent 2>/dev/null && npm run build) || exit 1
+  if [ ! -d "shared/safe-house/dist" ]; then
+    echo "Building shared/safe-house (dist/ missing)..."
+    (cd shared/safe-house && npm install --silent 2>/dev/null && npm run build) || exit 1
   fi
 fi
 

@@ -1,15 +1,15 @@
-# smoltbot
+# mnemom-platform
 
-[![CI](https://github.com/mnemom/smoltbot/actions/workflows/ci.yml/badge.svg)](https://github.com/mnemom/smoltbot/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/mnemom/smoltbot/actions/workflows/codeql.yml/badge.svg)](https://github.com/mnemom/smoltbot/actions/workflows/codeql.yml)
-[![npm](https://img.shields.io/npm/v/smoltbot.svg)](https://www.npmjs.com/package/smoltbot)
+[![CI](https://github.com/mnemom/mnemom-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/mnemom/mnemom-platform/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/mnemom/mnemom-platform/actions/workflows/codeql.yml/badge.svg)](https://github.com/mnemom/mnemom-platform/actions/workflows/codeql.yml)
+[![npm](https://img.shields.io/npm/v/%40mnemom%2Fsmoltbot.svg)](https://www.npmjs.com/package/@mnemom/smoltbot)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![AAP](https://img.shields.io/badge/AAP-compliant-green.svg)](https://github.com/mnemom/aap)
 [![AIP](https://img.shields.io/badge/AIP-compliant-green.svg)](https://github.com/mnemom/aip)
 
 Transparent AI agent tracing. [AAP](https://github.com/mnemom/aap)-compliant.
 
-Smoltbot observes your AI agent's API calls and builds verifiable alignment traces — what decisions were made, what alternatives were considered, and whether behavior matches declared values. Your prompts and responses are never stored.
+mnemom observes your AI agent's API calls and builds verifiable alignment traces — what decisions were made, what alternatives were considered, and whether behavior matches declared values. Your prompts and responses are never stored.
 
 ## Documentation
 
@@ -92,7 +92,7 @@ Claiming gives you a private dashboard with full trace history, integrity scores
 
 ## What Gets Traced
 
-Smoltbot builds [AP-Traces](https://github.com/mnemom/aap) that record:
+mnemom builds [AP-Traces](https://github.com/mnemom/aap) that record:
 
 - **Action** — What the agent did (type, name, category)
 - **Decision** — What alternatives were considered and why one was selected
@@ -114,7 +114,7 @@ What is **not** stored: your prompts, responses, or API key.
 
 ## Enforcement Modes
 
-Smoltbot supports three enforcement modes for integrity violations:
+mnemom supports three enforcement modes for integrity violations:
 
 | Mode | Behavior |
 |------|----------|
@@ -143,7 +143,7 @@ Set enforcement mode via the API: `PUT /v1/agents/:id/enforcement` with `{"mode"
 
 ## Self-Hosting
 
-Smoltbot is designed to run on Cloudflare Workers + Supabase. To self-host:
+mnemom-platform is designed to run on Cloudflare Workers + Supabase. To self-host:
 
 1. Create a Supabase project and run the schema from [`mnemom-api`](https://github.com/mnemom/mnemom-api)
 2. Deploy workers: `cd gateway && wrangler deploy`, `cd observer && wrangler deploy`, and deploy the API from `mnemom-api`

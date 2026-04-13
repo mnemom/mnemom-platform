@@ -26,18 +26,24 @@ jobs:
 
       - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          # Node 20 ships with npm 10.x which supports --provenance natively.
-          # Removed Node 22 + `npm install -g npm@latest`: GitHub Actions runners
-          # have a recurring promise-retry MODULE_NOT_FOUND corruption on Node 22
-          # that breaks npm entirely. Node 20 is unaffected.
-          # registry-url is required for --provenance publish: setup-node uses it
-          # to configure NODE_AUTH_TOKEN from GitHub's OIDC exchange.
+          # Node 24 ships with npm 11.5.1+ which is required for OIDC Trusted Publisher
+          # publishing to work correctly.
+          #
+          # registry-url is needed: it creates an .npmrc with NODE_AUTH_TOKEN="". With npm
+          # 11.5.1+, an empty NODE_AUTH_TOKEN causes npm to fall back to the OIDC exchange
+          # automatically (using ACTIONS_ID_TOKEN_REQUEST_URL). This is the correct behavior
+          # for Trusted Publisher publishing.
+          #
+          # With npm <11 (Node 20/22): empty NODE_AUTH_TOKEN causes E404 (npm tries to
+          # auth with empty bearer token). Without registry-url at all: ENEEDAUTH (npm
+          # v10 doesn't auto-detect OIDC). Node 24 + registry-url is the correct combo.
+          # (History: registry-url added in #121, broke on Node 20. Node 24 fixes it.)
 
       - name: Install and build shared dependencies
         run: |
-          for pkg in shared/policy-engine shared/cfd; do
+          for pkg in shared/policy-engine shared/safe-house; do
             if [ -d "$pkg" ]; then
               echo "Building $pkg..."
               (cd "$pkg" && npm ci --silent && npm run build)
@@ -68,7 +74,10 @@ jobs:
       - name: Publish
         if: steps.check.outputs.skip != 'true'
         working-directory: ${{ inputs.npm-directory }}
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag latest
+          # --tag latest: required because @mnemom/smoltbot has legacy 2.x versions
+          # which are higher in semver than our 0.x line. Without --tag latest, npm
+          # refuses to implicitly set the latest tag to a lower version number.
 
       - name: Generate SBOM
         uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11 # v0

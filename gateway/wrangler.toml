@@ -19,7 +19,7 @@ workers_dev = true
 [env.production.vars]
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "true"
-CFD_ENABLED = "true"   # Enables CFD DB lookups; per-agent mode controlled via cfd_configs table
+SAFE_HOUSE_ENABLED = "true"   # Enables Safe House DB lookups; per-agent mode controlled via cfd_configs table
 
 [[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
@@ -32,6 +32,7 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 # MNEMOM_ANALYZE_URL, MNEMOM_API_KEY, MNEMOM_LICENSE_JWT
 # ED25519_SIGNING_KEY, ED25519_KEY_ID
 # PROVER_URL, PROVER_API_KEY
+# INTERNAL_API_KEY  ← shared service key for POST /internal/agents on mnemom-api (scale/step-25b)
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
@@ -46,8 +47,8 @@ workers_dev = true
 [env.staging.vars]
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "false"
-CFD_ENABLED = "true"
-# Sovereign agent recommended CFD config (set via /v1/agents/:id/cfd/config):
+SAFE_HOUSE_ENABLED = "true"
+# Sovereign agent recommended Safe House config (set via /v1/agents/:id/cfd/config):
 # mode: enforce, screen_surfaces: all, thresholds: 0.5/0.70/0.85
 # Canaries: POST /v1/cfd/canaries for each primary tool credential
 
@@ -57,7 +58,8 @@ id = "2310e7878a364496b397b88540923c1f"
 
 # Secrets (set via: wrangler secret put <NAME> --env staging):
 # SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
-# CF_AI_GATEWAY_URL (smoltbot-staging gateway)
+# CF_AI_GATEWAY_URL (mnemom-staging gateway)
 # ANTHROPIC_API_KEY, CF_AIG_TOKEN
 # OTLP_ENDPOINT, OTLP_AUTH
 # ED25519_SIGNING_KEY, ED25519_KEY_ID
+# INTERNAL_API_KEY  ← shared service key for POST /internal/agents on mnemom-api (scale/step-25b)

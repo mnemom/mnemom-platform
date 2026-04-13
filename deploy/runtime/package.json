@@ -1,5 +1,5 @@
 {
-  "name": "smoltbot-self-hosted",
+  "name": "mnemom-self-hosted",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -12,8 +12,8 @@
     "dev": "tsx watch src/entrypoint.ts"
   },
   "dependencies": {
-    "hono": "^4.4.0",
-    "@hono/node-server": "^1.19.13",
+    "hono": "^4.12.12",
+    "@hono/node-server": "^1.11.0",
     "ioredis": "^5.4.0",
     "node-cron": "^3.0.3",
     "prom-client": "^15.1.0"

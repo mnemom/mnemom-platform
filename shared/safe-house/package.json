@@ -1,7 +1,7 @@
 {
-  "name": "@mnemom/cfd",
+  "name": "@mnemom/safe-house",
   "version": "0.1.0",
-  "description": "Context Front Door — inbound threat screening for AI agent pipelines",
+  "description": "Safe House — bidirectional threat screening for AI agent pipelines",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,6 +19,6 @@
   "files": ["dist"],
   "devDependencies": {
     "typescript": "^5.3.3",
-    "vitest": "^1.2.0"
+    "vitest": "^4.1.4"
   }
 }

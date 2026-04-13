@@ -4,7 +4,7 @@ compatibility_date = "2024-01-01"
 
 # ─── Production ───────────────────────────────────────────────────────────────
 [env.production]
-name = "smoltbot-proxy"
+name = "mnemom-proxy"
 
 workers_dev = true
 
@@ -16,7 +16,7 @@ ALLOWED_TARGETS = "rentahuman.ai"
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
-name = "smoltbot-proxy-staging"
+name = "mnemom-proxy-staging"
 
 workers_dev = true
 
