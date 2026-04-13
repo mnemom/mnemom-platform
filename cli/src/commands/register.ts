@@ -226,6 +226,12 @@ export async function registerCommand(
     );
 
     if (testResult.ok && testResult.response) {
+      // Update stored agent ID to match the server-assigned UUID (scale/step-25b).
+      // The gateway now generates mnm-{uuid} IDs — the locally-derived ID is a placeholder.
+      if (testResult.agentId && config.agents[name]) {
+        config.agents[name].agentId = testResult.agentId;
+        saveConfig(config);
+      }
       console.log(fmt.success("Connected! First response from " + name + ":") + "\n");
       console.log(`    "${testResult.response}"\n`);
       console.log(fmt.success("Agent created on mnemom.ai") + "\n");
@@ -318,6 +324,7 @@ interface GatewayTestResult {
   response?: string;
   authError?: boolean;
   error?: string;
+  agentId?: string;  // Server-assigned agent ID from x-mnemom-agent response header (scale/step-25b)
 }
 
 const HELLO_PROMPT = "Say hello in one short sentence. Keep it under 15 words.";
@@ -393,7 +400,8 @@ async function testGatewayCall(
     }
 
     if (response.status === 429) {
-      return { ok: true, response: "(rate limited — but key is valid)" };
+      const agentId = response.headers.get("x-mnemom-agent") ?? undefined;
+      return { ok: true, response: "(rate limited — but key is valid)", agentId };
     }
 
     if (!response.ok) {
@@ -401,10 +409,13 @@ async function testGatewayCall(
       return { ok: false, error: `HTTP ${response.status}: ${errorBody.slice(0, 200)}` };
     }
 
+    // Extract server-assigned agent ID from response header (scale/step-25b)
+    const agentId = response.headers.get("x-mnemom-agent") ?? undefined;
+
     // Extract response text from provider-specific format
     const data = await response.json();
     const text = extractResponseText(data, provider);
-    return { ok: true, response: text || "(empty response)" };
+    return { ok: true, response: text || "(empty response)", agentId };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message.includes("abort") || message.includes("timeout")) {

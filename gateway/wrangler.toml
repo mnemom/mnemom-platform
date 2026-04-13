@@ -32,6 +32,7 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 # MNEMOM_ANALYZE_URL, MNEMOM_API_KEY, MNEMOM_LICENSE_JWT
 # ED25519_SIGNING_KEY, ED25519_KEY_ID
 # PROVER_URL, PROVER_API_KEY
+# INTERNAL_API_KEY  ← shared service key for POST /internal/agents on mnemom-api (scale/step-25b)
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
@@ -61,3 +62,4 @@ id = "2310e7878a364496b397b88540923c1f"
 # ANTHROPIC_API_KEY, CF_AIG_TOKEN
 # OTLP_ENDPOINT, OTLP_AUTH
 # ED25519_SIGNING_KEY, ED25519_KEY_ID
+# INTERNAL_API_KEY  ← shared service key for POST /internal/agents on mnemom-api (scale/step-25b)

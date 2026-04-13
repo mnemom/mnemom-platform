@@ -282,8 +282,9 @@ export async function requireAgent(agentName?: string): Promise<AgentConfig> {
 // ---------------------------------------------------------------------------
 
 export function generateAgentId(): string {
-  const randomHex = crypto.randomBytes(4).toString("hex");
-  return `smolt-${randomHex}`;
+  // New format per ADR-019 (scale/step-25b): mnm-{uuid_v4} for all new agents.
+  // crypto.randomUUID() is a Node.js built-in (>=14.17), no new dependencies.
+  return `mnm-${crypto.randomUUID()}`;
 }
 
 /**

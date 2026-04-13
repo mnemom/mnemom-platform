@@ -201,9 +201,9 @@ describe('getOrCreateAgent', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  it('should create new agent when not found', async () => {
+  it('should create new agent when not found (delegates to mnemom-api, scale/step-25b)', async () => {
     const newAgent = {
-      id: 'new-agent-uuid',
+      id: 'mnm-550e8400-e29b-41d4-a716-446655440000',
       agent_hash: testAgentHash,
       key_prefix: 'sk-ant-test-key-',
       name: null,
@@ -211,28 +211,29 @@ describe('getOrCreateAgent', () => {
       last_seen: '2024-01-15T10:00:00Z',
     };
 
-    // First call - lookup returns empty
+    // Call 1: Supabase lookup → empty (no existing agent)
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve([]),
     });
 
-    // Second call - create agent
+    // Call 2: POST /internal/agents on mnemom-api → returns agent JSON directly
+    // (API now owns ID generation and alignment card creation)
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve([newAgent]),
-    });
-
-    // Third call - create alignment card
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
+      json: () => Promise.resolve(newAgent),
     });
 
     const result = await getOrCreateAgent(testAgentHash, env);
 
     expect(result.agent).toEqual(newAgent);
     expect(result.isNew).toBe(true);
-    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch).toHaveBeenCalledTimes(2); // lookup + API create (no separate card call)
+
+    // Verify the second call went to the internal API endpoint
+    const apiCall = mockFetch.mock.calls[1];
+    expect(apiCall[0]).toContain('/internal/agents');
+    expect(apiCall[1].headers['X-Internal-Key']).toBeDefined();
   });
 
   it('should throw error on lookup failure', async () => {
@@ -246,18 +247,24 @@ describe('getOrCreateAgent', () => {
     );
   });
 
-  it('should throw error on create failure', async () => {
-    // Lookup returns empty
+  it('should throw error on create failure (after retry lookup also empty)', async () => {
+    // Call 1: Supabase lookup → empty
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve([]),
     });
 
-    // Create fails
+    // Call 2: API /internal/agents → fails
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 400,
       text: () => Promise.resolve('Bad request'),
+    });
+
+    // Call 3: Retry Supabase lookup → also empty (no race winner to fall back to)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([]),
     });
 
     await expect(getOrCreateAgent(testAgentHash, env)).rejects.toThrow(
@@ -288,15 +295,16 @@ describe('getOrCreateAgent', () => {
   });
 
   it('should query with correct agent_hash filter', async () => {
+    // Call 1: Supabase lookup → empty
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve([]),
     });
+    // Call 2: API /internal/agents → returns agent (scale/step-25b: no alignment card call)
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve([{ id: '123' }]),
+      json: () => Promise.resolve({ id: 'mnm-test', agent_hash: testAgentHash }),
     });
-    mockFetch.mockResolvedValueOnce({ ok: true });
 
     await getOrCreateAgent(testAgentHash, env);
 
@@ -306,15 +314,14 @@ describe('getOrCreateAgent', () => {
     );
   });
 
-  it('should include key_prefix in INSERT body when creating a new agent', async () => {
+  it('should include key_prefix in API body when creating a new agent', async () => {
     const newAgent = {
-      id: 'smolt-abc123de',
+      id: 'mnm-550e8400-e29b-41d4-a716-446655440000',
       agent_hash: testAgentHash,
-      key_prefix: 'sk-ant-test-key-',
+      key_prefix: 'sk-ant-api03-abcd',
       name: null,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
-      key_prefix: 'sk-ant-api03-abcd',
     };
     const keyPrefix = 'sk-ant-api03-abcd';
 
@@ -323,28 +330,27 @@ describe('getOrCreateAgent', () => {
       ok: true,
       json: () => Promise.resolve([]),
     });
-    // Create agent
+    // API /internal/agents call returns agent (not Supabase POST)
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve([newAgent]),
+      json: () => Promise.resolve(newAgent),
     });
-    // Create alignment card
-    mockFetch.mockResolvedValueOnce({ ok: true });
 
     const result = await getOrCreateAgent(testAgentHash, env, undefined, keyPrefix);
 
     expect(result.isNew).toBe(true);
-    // Find the POST call (second fetch call)
-    const createCall = mockFetch.mock.calls[1];
-    const createBody = JSON.parse(createCall[1].body);
-    expect(createBody.key_prefix).toBe(keyPrefix);
+    // Find the API call (second fetch call)
+    const apiCall = mockFetch.mock.calls[1];
+    expect(apiCall[0]).toContain('/internal/agents');
+    const apiBody = JSON.parse(apiCall[1].body);
+    expect(apiBody.key_prefix).toBe(keyPrefix);
   });
 
-  it('should NOT include key_prefix in INSERT body when keyPrefix is not provided', async () => {
+  it('should NOT include key_prefix in API body when keyPrefix is not provided', async () => {
     const newAgent = {
-      id: 'smolt-abc123de',
+      id: 'mnm-550e8400-e29b-41d4-a716-446655440000',
       agent_hash: testAgentHash,
-      key_prefix: 'sk-ant-test-key-',
+      key_prefix: null,
       name: null,
       created_at: '2024-01-15T10:00:00Z',
       last_seen: '2024-01-15T10:00:00Z',
@@ -356,38 +362,29 @@ describe('getOrCreateAgent', () => {
     });
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve([newAgent]),
+      json: () => Promise.resolve(newAgent),
     });
-    mockFetch.mockResolvedValueOnce({ ok: true });
 
     await getOrCreateAgent(testAgentHash, env, undefined, undefined);
 
-    const createCall = mockFetch.mock.calls[1];
-    const createBody = JSON.parse(createCall[1].body);
-    expect(createBody).not.toHaveProperty('key_prefix');
+    const apiCall = mockFetch.mock.calls[1];
+    const apiBody = JSON.parse(apiCall[1].body);
+    expect(apiBody).not.toHaveProperty('key_prefix');
   });
 
   it('named agent: key_prefix is apiKey.slice(0,16), not (apiKey+"|"+name).slice(0,16)', async () => {
-    const rawKey = 'sk-ant-api03-verylongkey9999';
     const agentNameStr = 'my-named-agent';
-    const keyPrefix = rawKey.slice(0, 16);
-    // The combined prefix would differ
-    const combinedPrefix = (rawKey + '|' + agentNameStr).slice(0, 16);
-    expect(keyPrefix).toBe('sk-ant-api03-ver');
-    expect(combinedPrefix).toBe('sk-ant-api03-ver'); // first 16 chars happen to be same in this case
-
-    // Use a key where they differ to prove the assertion
     const shortKey = 'sk-XYZ';
     const shortCombined = (shortKey + '|' + agentNameStr).slice(0, 16);
     const shortPrefix = shortKey.slice(0, 16);
     // shortKey is only 6 chars so prefix is "sk-XYZ"
-    // combined starts with "sk-XYZ|my-named" (16 chars)
+    // combined starts with "sk-XYZ|my-named-" (16 chars)
     expect(shortPrefix).toBe('sk-XYZ');
     expect(shortCombined).toBe('sk-XYZ|my-named-');
     expect(shortPrefix).not.toBe(shortCombined);
 
     const newAgent = {
-      id: 'smolt-abc123de',
+      id: 'mnm-550e8400-e29b-41d4-a716-446655440000',
       agent_hash: testAgentHash,
       key_prefix: shortPrefix,
       name: agentNameStr,
@@ -401,16 +398,16 @@ describe('getOrCreateAgent', () => {
     });
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve([newAgent]),
+      json: () => Promise.resolve(newAgent),
     });
-    mockFetch.mockResolvedValueOnce({ ok: true });
 
     await getOrCreateAgent(testAgentHash, env, agentNameStr, shortPrefix);
 
-    const createCall = mockFetch.mock.calls[1];
-    const createBody = JSON.parse(createCall[1].body);
+    const apiCall = mockFetch.mock.calls[1];
+    const apiBody = JSON.parse(apiCall[1].body);
     // key_prefix must be the raw key slice, not the combined string slice
-    expect(createBody.key_prefix).not.toBe(shortCombined);
+    expect(apiBody.key_prefix).not.toBe(shortCombined);
+    expect(apiBody.key_prefix).toBe(shortPrefix);
   });
 });
 
