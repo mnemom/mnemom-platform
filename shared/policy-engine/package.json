@@ -1,6 +1,6 @@
 {
   "name": "@mnemom/policy-engine",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Shared policy-as-code engine for mnemom verification checkpoints",
   "repository": {
     "type": "git",
