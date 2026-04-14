@@ -1,28 +1,28 @@
-# smoltbot
+# Mnemom CLI
 
-[![CI](https://github.com/mnemom/smoltbot/actions/workflows/ci.yml/badge.svg)](https://github.com/mnemom/smoltbot/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/mnemom/smoltbot/actions/workflows/codeql.yml/badge.svg)](https://github.com/mnemom/smoltbot/actions/workflows/codeql.yml)
-[![npm](https://img.shields.io/npm/v/smoltbot.svg)](https://www.npmjs.com/package/smoltbot)
+[![CI](https://github.com/mnemom/mnemom-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/mnemom/mnemom-platform/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/mnemom/mnemom-platform/actions/workflows/codeql.yml/badge.svg)](https://github.com/mnemom/mnemom-platform/actions/workflows/codeql.yml)
+[![npm](https://img.shields.io/npm/v/%40mnemom%2Fmnemom.svg)](https://www.npmjs.com/package/@mnemom/mnemom)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![AAP](https://img.shields.io/badge/AAP-compliant-green.svg)](https://github.com/mnemom/aap)
 [![AIP](https://img.shields.io/badge/AIP-compliant-green.svg)](https://github.com/mnemom/aip)
 
 Transparent AI agent tracing. [AAP](https://github.com/mnemom/aap)-compliant.
 
-Smoltbot observes your AI agent's API calls and builds verifiable alignment traces — what decisions were made, what alternatives were considered, and whether behavior matches declared values. Your prompts and responses are never stored.
+Mnemom observes your AI agent's API calls and builds verifiable alignment traces — what decisions were made, what alternatives were considered, and whether behavior matches declared values. Your prompts and responses are never stored.
 
 ## Documentation
 
-Full documentation is at **[docs.mnemom.ai/smoltbot/overview](https://docs.mnemom.ai/smoltbot/overview)**.
+Full documentation is at **[docs.mnemom.ai](https://docs.mnemom.ai)**.
 
 ## Quick Start
 
 ```bash
-npm install -g smoltbot
-smoltbot init
+npm install -g @mnemom/mnemom
+mnemom init
 ```
 
-That's it. `smoltbot init` detects your configured AI provider API keys (Anthropic, OpenAI, Gemini) and configures your local environment to route API calls through the Mnemom gateway, where they're traced and verified. Your API keys never leave your machine — only SHA-256 hashes are used for agent identification.
+That's it. `mnemom init` detects your configured AI provider API keys (Anthropic, OpenAI, Gemini) and configures your local environment to route API calls through the Mnemom gateway, where they're traced and verified. Your API keys never leave your machine — only SHA-256 hashes are used for agent identification.
 
 ## Supported Providers
 
@@ -36,28 +36,28 @@ That's it. `smoltbot init` detects your configured AI provider API keys (Anthrop
 
 | Command | Description |
 |---------|-------------|
-| `smoltbot init` | Configure tracing for your AI agent (multi-provider) |
-| `smoltbot status` | Show agent status, providers, and connection info |
-| `smoltbot integrity` | Display integrity score and verification stats |
-| `smoltbot logs [-l N]` | Show recent traces and actions |
-| `smoltbot card show` | Display active alignment card |
-| `smoltbot card publish <file>` | Publish alignment card from JSON file |
-| `smoltbot card validate <file>` | Validate card JSON locally |
+| `mnemom init` | Configure tracing for your AI agent (multi-provider) |
+| `mnemom status` | Show agent status, providers, and connection info |
+| `mnemom integrity` | Display integrity score and verification stats |
+| `mnemom logs [-l N]` | Show recent traces and actions |
+| `mnemom card show` | Display active alignment card |
+| `mnemom card publish <file>` | Publish alignment card from JSON file |
+| `mnemom card validate <file>` | Validate card JSON locally |
 
 ## How It Works
 
 ```
-                    ┌─── /anthropic/* ──→ Anthropic (Claude)
-Your App → smoltbot ├─── /openai/*    ──→ OpenAI (GPT-5)
-           gateway  └─── /gemini/*    ──→ Google (Gemini)
-                ↓
-           CF AI Gateway
-                ↓
-           Observer Worker
-                ↓
-         AP-Trace + Verify → Supabase
-                ↓
-         Dashboard (mnemom.ai)
+                   ┌─── /anthropic/* ──→ Anthropic (Claude)
+Your App → mnemom  ├─── /openai/*    ──→ OpenAI (GPT-5)
+           gateway └─── /gemini/*    ──→ Google (Gemini)
+               ↓
+          CF AI Gateway
+               ↓
+          Observer Worker
+               ↓
+        AP-Trace + Verify → Supabase
+               ↓
+        Dashboard (mnemom.ai)
 ```
 
 1. **Gateway** — A Cloudflare Worker that intercepts API requests to Anthropic, OpenAI, and Gemini. It identifies your agent via API key hash (zero-config), attaches tracing metadata, injects thinking/reasoning per provider, performs real-time integrity checking, injects conscience nudges, and delivers webhooks. Your prompts and responses pass through unchanged.
@@ -66,13 +66,13 @@ Your App → smoltbot ├─── /openai/*    ──→ OpenAI (GPT-5)
 
 3. **API** — Serves agent data, traces, integrity scores, drift alerts, enforcement status, and a unified conscience timeline. Powers both the CLI and the web dashboard.
 
-4. **CLI** — The `smoltbot` command. Configures your local environment and queries your agent's transparency data.
+4. **CLI** — The `mnemom` command. Configures your local environment and queries your agent's transparency data.
 
 5. **Dashboard** — Web UI at [mnemom.ai](https://mnemom.ai) where you can view the conscience timeline, claim your agent, and monitor alignment.
 
 ## What Gets Traced
 
-Smoltbot builds [AP-Traces](https://github.com/mnemom/aap) that record:
+Mnemom builds [AP-Traces](https://github.com/mnemom/aap) that record:
 
 - **Action** — What the agent did (type, name, category)
 - **Decision** — What alternatives were considered and why one was selected
@@ -109,12 +109,16 @@ Enforcement works across all providers where AIP is supported.
 
 ## Dependencies
 
-- [Agent Alignment Protocol (AAP)](https://github.com/mnemom/aap) — `@mnemom/agent-alignment-protocol@0.1.8` on npm
-- [Agent Integrity Protocol (AIP)](https://github.com/mnemom/aip) — `@mnemom/agent-integrity-protocol@0.1.4` on npm
+- [Agent Alignment Protocol (AAP)](https://github.com/mnemom/aap) — `@mnemom/agent-alignment-protocol@1.0.0` on npm
+- [Agent Integrity Protocol (AIP)](https://github.com/mnemom/aip) — `@mnemom/agent-integrity-protocol@1.0.0` on npm
 - [Cloudflare Workers](https://workers.cloudflare.com/) — Gateway, observer, and API hosting
 - [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) — Request logging and analytics
 - [Supabase](https://supabase.com/) — Postgres database with row-level security
 - API keys: Anthropic (required for AIP analysis), OpenAI and Gemini (optional, for multi-provider tracing)
+
+## Supply Chain
+
+All `@mnemom/*` packages are published with [SLSA build provenance](https://docs.mnemom.ai/guides/supply-chain-trust). Verify with `npm audit signatures`.
 
 ## License
 
