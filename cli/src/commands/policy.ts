@@ -9,7 +9,6 @@ import {
   validatePolicySchema,
   evaluatePolicy,
   type ValidationResult,
-  type Policy,
   type EvaluationResult,
 } from "@mnemom/policy-engine";
 
@@ -535,11 +534,27 @@ export async function policyEvaluateCommand(
     process.exit(1);
   }
 
-  // 4. Run evaluation
+  // 4. Run evaluation.
+  //
+  // UC-8 deprecation note: under @mnemom/policy-engine 0.3.0 the policy is
+  // derived from the alignment card via extractPolicyFromCard. The standalone
+  // policy file the user passed in still gets validated above (schema check),
+  // but the evaluator now reads `capabilities`, `enforcement`, and
+  // `autonomy.escalation_triggers` off the card. UC-9 will formally collapse
+  // this CLI command onto the card-only surface.
+  if (policyParsed) {
+    console.log(
+      fmt.warn(
+        "Note: @mnemom/policy-engine 0.3.0 derives policy from the alignment card. " +
+          "The provided policy file is validated for schema but no longer drives evaluation. " +
+          "Run `mnemom card publish` to make card-derived policy changes effective.",
+      ),
+    );
+  }
+
   const result: EvaluationResult = evaluatePolicy({
     context: "cicd",
-    policy: policyParsed as unknown as Policy,
-    card: cardContent,
+    card: cardContent as Parameters<typeof evaluatePolicy>[0]["card"],
     tools,
   });
 

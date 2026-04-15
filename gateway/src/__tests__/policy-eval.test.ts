@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   evaluatePolicy,
-  mergePolicies,
+  extractPolicyFromCard,
   type Policy,
-  type AlignmentCard,
+  type UnifiedAlignmentCard,
   type EvaluationResult,
 } from '@mnemom/policy-engine';
 
@@ -68,44 +68,40 @@ function extractToolsFromRequest(
 }
 
 // ============================================================================
-// Test fixtures
+// UC-8 test fixtures — evaluator now takes a unified card (no separate policy).
+// Fixtures produce a card whose extractPolicyFromCard derivation matches what
+// the pre-UC-8 makePolicy() emitted, so behavioural assertions are preserved.
 // ============================================================================
 
-function makePolicy(overrides?: Partial<Policy>): Policy {
+function makeCard(overrides?: Partial<UnifiedAlignmentCard>): UnifiedAlignmentCard {
   return {
-    meta: { schema_version: '1.0', name: 'test-policy', scope: 'org' },
-    capability_mappings: {
+    card_id: 'ac-test',
+    card_version: '2026-04-15',
+    autonomy: {
+      bounded_actions: ['web_fetch', 'file_read', 'file_write', 'code_execution'],
+      escalation_triggers: [],
+    },
+    capabilities: {
       web_fetch: {
         description: 'Web browsing',
         tools: ['WebFetch', 'WebSearch'],
-        card_actions: ['web_fetch'],
+        required_actions: ['web_fetch'],
       },
       file_system: {
         tools: ['Read', 'Write', 'Edit', 'Glob'],
-        card_actions: ['file_read', 'file_write'],
+        required_actions: ['file_read', 'file_write'],
       },
       code_execution: {
         tools: ['Bash'],
-        card_actions: ['code_execution'],
+        required_actions: ['code_execution'],
       },
     },
-    forbidden: [
-      { pattern: 'mcp__*__delete*', reason: 'Destructive deletion forbidden', severity: 'critical' },
-    ],
-    escalation_triggers: [],
-    defaults: {
+    enforcement: {
+      forbidden_tools: [
+        { pattern: 'mcp__*__delete*', reason: 'Destructive deletion forbidden', severity: 'critical' },
+      ],
       unmapped_tool_action: 'warn',
-      unmapped_severity: 'medium',
       fail_open: true,
-    },
-    ...overrides,
-  };
-}
-
-function makeCard(overrides?: Partial<AlignmentCard>): AlignmentCard {
-  return {
-    autonomy_envelope: {
-      bounded_actions: ['web_fetch', 'file_read', 'file_write', 'code_execution'],
     },
     ...overrides,
   };
@@ -185,15 +181,17 @@ describe('extractToolsFromRequest', () => {
 // Gateway policy evaluation scenarios
 // ============================================================================
 
-describe('gateway policy evaluation', () => {
+describe('gateway policy evaluation (UC-8)', () => {
   it('enforce mode: reject on fail returns violations', () => {
-    const policy = makePolicy({
-      forbidden: [{ pattern: 'Bash', reason: 'No shell access', severity: 'critical' }],
+    const card = makeCard({
+      enforcement: {
+        forbidden_tools: [{ pattern: 'Bash', reason: 'No shell access', severity: 'critical' }],
+        unmapped_tool_action: 'warn',
+        fail_open: true,
+      },
     });
-    const card = makeCard();
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
       card,
       tools: [{ name: 'Bash' }],
     });
@@ -204,45 +202,42 @@ describe('gateway policy evaluation', () => {
   });
 
   it('warn mode: forward on fail with verdict', () => {
-    const policy = makePolicy({
-      forbidden: [{ pattern: 'Bash', reason: 'No shell access', severity: 'critical' }],
+    const card = makeCard({
+      enforcement: {
+        forbidden_tools: [{ pattern: 'Bash', reason: 'No shell access', severity: 'critical' }],
+        unmapped_tool_action: 'warn',
+        fail_open: true,
+      },
     });
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
-      card: makeCard(),
+      card,
       tools: [{ name: 'Bash' }],
     });
 
-    // In warn mode, the gateway would still forward — we just verify the verdict
     expect(result.verdict).toBe('fail');
-    // The gateway decides what to do with this based on enforcement_mode
   });
 
-  it('no policy → skip evaluation (null merge)', () => {
-    const merged = mergePolicies(null, null, false);
-    expect(merged).toBeNull();
+  it('extractPolicyFromCard: no capabilities/enforcement → empty policy', () => {
+    const policy = extractPolicyFromCard({ card_id: 'ac-empty' });
+    expect(policy.capability_mappings).toEqual({});
+    expect(policy.forbidden).toHaveLength(0);
+    expect(policy.defaults.unmapped_tool_action).toBe('allow');
   });
 
-  it('fail-open: evaluation runs successfully even with empty card', () => {
-    const policy = makePolicy();
+  it('fail-open: evaluation runs with a bare card', () => {
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
-      card: {},
+      card: { card_id: 'ac-bare' },
       tools: [{ name: 'Read' }],
     });
-
-    // With empty card, mapped tools will have capability_exceeded (no bounded_actions)
     expect(result).toBeDefined();
     expect(result.context).toBe('gateway');
   });
 
   it('no tools in request → empty result', () => {
-    const policy = makePolicy();
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
       card: makeCard(),
       tools: [],
     });
@@ -253,36 +248,29 @@ describe('gateway policy evaluation', () => {
   });
 
   it('card_gaps are empty in gateway context', () => {
-    const policy = makePolicy();
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
-      card: makeCard({ autonomy_envelope: { bounded_actions: [] } }),
+      card: makeCard({ autonomy: { bounded_actions: [], escalation_triggers: [] } }),
       tools: [{ name: 'Bash' }],
     });
 
     expect(result.card_gaps).toHaveLength(0);
   });
 
-  it('policy merge: agent cannot weaken org forbidden rules', () => {
-    const orgPolicy = makePolicy({
-      forbidden: [
-        { pattern: 'mcp__*__delete*', reason: 'Org forbids deletion', severity: 'critical' },
-      ],
-    });
-    const agentPolicy = makePolicy({
-      meta: { schema_version: '1.0', name: 'agent-policy', scope: 'agent' },
-      forbidden: [], // Agent tries to have no forbidden rules
-    });
-
-    const merged = mergePolicies(orgPolicy, agentPolicy, false);
-    expect(merged).not.toBeNull();
-
-    // Org forbidden rules persist
+  it('forbidden rules come from card.enforcement.forbidden_tools', () => {
+    // Post-UC-8 the card is the source of truth — org+agent were already merged
+    // at storage time by the composition engine in mnemom-api.
     const result = evaluatePolicy({
       context: 'gateway',
-      policy: merged!,
-      card: makeCard(),
+      card: makeCard({
+        enforcement: {
+          forbidden_tools: [
+            { pattern: 'mcp__*__delete*', reason: 'Org forbids deletion', severity: 'critical' },
+          ],
+          unmapped_tool_action: 'warn',
+          fail_open: true,
+        },
+      }),
       tools: [{ name: 'mcp__fs__delete_file' }],
     });
 
@@ -290,21 +278,39 @@ describe('gateway policy evaluation', () => {
     expect(result.violations.some((v) => v.type === 'forbidden')).toBe(true);
   });
 
-  it('enforcement_mode defaults are accepted in policy', () => {
-    const policy = makePolicy({
-      defaults: {
-        unmapped_tool_action: 'warn',
-        unmapped_severity: 'medium',
-        fail_open: true,
-        enforcement_mode: 'enforce',
-        grace_period_hours: 48,
+  it('transaction guardrails intersect with card-derived policy', () => {
+    const txnPolicy: Policy = {
+      meta: { schema_version: '1.0', name: 'txn', scope: 'agent' },
+      capability_mappings: {
+        file_system: { tools: ['Read'], card_actions: ['file_read', 'file_write'] },
       },
-    });
-
+      forbidden: [
+        { pattern: 'Write', reason: 'Txn restricts writes', severity: 'critical' },
+      ],
+      escalation_triggers: [],
+      defaults: { unmapped_tool_action: 'warn', unmapped_severity: 'medium', fail_open: true },
+    };
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
       card: makeCard(),
+      tools: [{ name: 'Write' }],
+      transactionGuardrails: txnPolicy,
+    });
+    expect(result.verdict).toBe('fail');
+    expect(result.violations.some((v) => v.type === 'forbidden')).toBe(true);
+  });
+
+  it('enforcement_mode from card.enforcement.mode', () => {
+    const result = evaluatePolicy({
+      context: 'gateway',
+      card: makeCard({
+        enforcement: {
+          unmapped_tool_action: 'warn',
+          fail_open: true,
+          mode: 'enforce',
+          grace_period_hours: 48,
+        },
+      }),
       tools: [{ name: 'Read' }],
     });
 
@@ -321,42 +327,35 @@ describe('grace period logic', () => {
     // Simulate: tool has no first_seen record → it's new → in grace
     // We test this at the policy engine level — violations are produced,
     // and the gateway's applyGracePeriod would downgrade them.
-    // Here we verify the violation is correctly produced.
-    const policy = makePolicy({
-      defaults: {
+    const card = makeCard({
+      enforcement: {
         unmapped_tool_action: 'deny',
-        unmapped_severity: 'high',
         fail_open: true,
         grace_period_hours: 24,
       },
     });
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
-      card: makeCard(),
+      card,
       tools: [{ name: 'NewUnknownTool' }],
     });
 
-    // Violation is produced by the engine
     expect(result.verdict).toBe('fail');
     expect(result.violations).toHaveLength(1);
     expect(result.violations[0].tool).toBe('NewUnknownTool');
-    // Grace period downgrading happens in the gateway layer (tested via integration)
   });
 
   it('grace period of 0 disables grace behavior', () => {
-    const policy = makePolicy({
-      defaults: {
+    const card = makeCard({
+      enforcement: {
         unmapped_tool_action: 'deny',
-        unmapped_severity: 'high',
         fail_open: true,
         grace_period_hours: 0,
       },
     });
     const result = evaluatePolicy({
       context: 'gateway',
-      policy,
-      card: makeCard(),
+      card,
       tools: [{ name: 'NewTool' }],
     });
 

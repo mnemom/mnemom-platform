@@ -1,5 +1,9 @@
 export { evaluatePolicy } from './evaluator.js';
-export { mergePolicies, mergeTransactionGuardrails } from './merge.js';
+// UC-8: mergePolicies removed from the public API — org+agent composition
+// happens at storage time in mnemom-api's composition engine. Ephemeral
+// mergeTransactionGuardrails stays for per-request override semantics.
+export { mergeTransactionGuardrails } from './merge.js';
+export { extractPolicyFromCard } from './card-policy.js';
 export { validatePolicySchema } from './validator.js';
 export { toolMatchesPattern, toolMatchesAny } from './glob.js';
 export { loadFromYAML, toYAML } from './yaml.js';
@@ -12,6 +16,7 @@ export type {
   EscalationTrigger,
   PolicyDefaults,
   AlignmentCard,
+  UnifiedAlignmentCard,
   ToolReference,
   EvaluationInput,
   EvaluationResult,

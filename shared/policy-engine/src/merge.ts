@@ -1,119 +1,35 @@
 import type { Policy, PolicyDefaults } from './types.js';
 
-/**
- * Merge an org-level policy with an agent-level policy.
- *
- * Merge rules follow the existing card-merge.ts pattern:
- * - capability_mappings: union (agent adds, can't remove org mappings)
- * - forbidden: union (org rules always enforced)
- * - escalation_triggers: concat (org first, then agent)
- * - defaults: org is the floor — agent can strengthen (warn→deny) but not weaken (deny→allow)
- *
- * @returns Merged policy, or null if no policies provided
- */
-export function mergePolicies(
-  orgPolicy: Policy | null,
-  agentPolicy: Policy | null,
-  isExempt: boolean
-): Policy | null {
-  // No policies at all
-  if (!orgPolicy && !agentPolicy) return null;
-
-  // Only agent policy (or agent is exempt from org)
-  if (!orgPolicy || isExempt) return agentPolicy ?? null;
-
-  // Only org policy
-  if (!agentPolicy) return orgPolicy;
-
-  // Both exist — merge with org as floor
-  return {
-    meta: {
-      schema_version: orgPolicy.meta.schema_version,
-      name: `${orgPolicy.meta.name}+${agentPolicy.meta.name}`,
-      description: agentPolicy.meta.description ?? orgPolicy.meta.description,
-      scope: 'agent',
-    },
-
-    // Union: agent adds mappings, can't remove org ones
-    capability_mappings: mergeCapabilityMappings(
-      orgPolicy.capability_mappings,
-      agentPolicy.capability_mappings
-    ),
-
-    // Union: org forbidden rules always enforced
-    forbidden: mergeForbidden(orgPolicy.forbidden, agentPolicy.forbidden),
-
-    // Concat: org triggers first, then agent
-    escalation_triggers: [
-      ...orgPolicy.escalation_triggers,
-      ...agentPolicy.escalation_triggers,
-    ],
-
-    // Org is floor: agent can strengthen but not weaken
-    defaults: mergeDefaults(orgPolicy.defaults, agentPolicy.defaults),
-  };
-}
-
 // ============================================================================
-// Internal merge helpers
+// UC-8 — mergePolicies was removed. Org+agent policy merging now happens at
+// storage time in mnemom-api's composition engine (the canonical alignment
+// card is pre-merged). Callers that previously ran
+//   mergePolicies(orgPolicy, agentPolicy, isExempt)
+// should now fetch the canonical card and call evaluatePolicy({card, tools});
+// the evaluator derives a Policy via extractPolicyFromCard.
+//
+// mergeTransactionGuardrails (below) stays because transaction guardrails are
+// ephemeral per-request overrides that don't live in the card.
 // ============================================================================
 
-function mergeCapabilityMappings(
-  org: Policy['capability_mappings'],
-  agent: Policy['capability_mappings']
-): Policy['capability_mappings'] {
-  // Start with deep clone of org mappings
-  const merged: Policy['capability_mappings'] = {};
-
-  // Copy org mappings
-  for (const [name, mapping] of Object.entries(org)) {
-    merged[name] = {
-      description: mapping.description,
-      tools: [...mapping.tools],
-      card_actions: [...mapping.card_actions],
-    };
-  }
-
-  // Merge agent mappings
-  for (const [name, mapping] of Object.entries(agent)) {
-    if (merged[name]) {
-      // Capability exists in org — union the tool patterns and card_actions
-      const toolSet = new Set([...merged[name].tools, ...mapping.tools]);
-      const actionSet = new Set([...merged[name].card_actions, ...mapping.card_actions]);
-      merged[name].tools = Array.from(toolSet);
-      merged[name].card_actions = Array.from(actionSet);
-      // Agent description overrides if provided
-      if (mapping.description) {
-        merged[name].description = mapping.description;
-      }
-    } else {
-      // New capability from agent — add it
-      merged[name] = {
-        description: mapping.description,
-        tools: [...mapping.tools],
-        card_actions: [...mapping.card_actions],
-      };
-    }
-  }
-
-  return merged;
-}
+// ----------------------------------------------------------------------------
+// Shared merge helpers (used by mergeTransactionGuardrails + historical
+// mergePolicies). Left as private functions in this module so the
+// transaction path can reuse them.
+// ----------------------------------------------------------------------------
 
 function mergeForbidden(
   org: Policy['forbidden'],
   agent: Policy['forbidden']
 ): Policy['forbidden'] {
-  // Deduplicate by pattern
   const seen = new Set<string>();
   const merged: Policy['forbidden'] = [];
-
   for (const rule of [...org, ...agent]) {
     if (!seen.has(rule.pattern)) {
       seen.add(rule.pattern);
       merged.push({ ...rule });
     }
   }
-
   return merged;
 }
 
@@ -129,27 +45,6 @@ const SEVERITY_ORDER: Record<string, number> = {
   high: 2,
   critical: 3,
 };
-
-function mergeDefaults(org: PolicyDefaults, agent: PolicyDefaults): PolicyDefaults {
-  return {
-    // Agent can strengthen (allow→warn, warn→deny) but not weaken
-    unmapped_tool_action: stronger(
-      org.unmapped_tool_action,
-      agent.unmapped_tool_action,
-      STRENGTH_ORDER
-    ) as PolicyDefaults['unmapped_tool_action'],
-
-    // Agent can escalate severity but not reduce it
-    unmapped_severity: stronger(
-      org.unmapped_severity,
-      agent.unmapped_severity,
-      SEVERITY_ORDER
-    ) as PolicyDefaults['unmapped_severity'],
-
-    // Agent cannot weaken fail_open (org false → stays false)
-    fail_open: org.fail_open ? agent.fail_open : false,
-  };
-}
 
 function stronger(orgVal: string, agentVal: string, order: Record<string, number>): string {
   const orgStrength = order[orgVal] ?? 0;

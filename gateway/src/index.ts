@@ -46,8 +46,15 @@ import {
 import { readStreamToText, parseSSEEvents } from './sse-parser';
 import { mergeOrgAndAgentCard } from './card-merge';
 import {
+  mapUnifiedCardToAAP,
+  mapCanonicalToSafeHouseConfig,
+  fetchCanonicalAlignmentCard,
+  fetchCanonicalProtectionCard,
+} from './card-mappers';
+import {
   evaluatePolicy,
-  mergePolicies,
+  // mergePolicies removed in UC-8 — policy is derived from the canonical card
+  // at evaluation time via extractPolicyFromCard (runs inside evaluatePolicy).
   mergeTransactionGuardrails,
   type Policy,
   type EvaluationResult,
@@ -1013,6 +1020,34 @@ async function fetchAlignmentData(
   conscienceValues: ConscienceValue[] | null;
   enforcementMode: string;
 }> {
+  // UC-6: prefer the pre-composed canonical alignment card written by the
+  // composition engine. Emits a structured card_source log so UC-14 can
+  // verify the fallback rate decays to zero.
+  try {
+    const canonical = await fetchCanonicalAlignmentCard(agentId, env);
+    if (canonical) {
+      console.log(JSON.stringify({
+        event: 'card_read', card_source: 'canonical_hit', agent_id: agentId,
+      }));
+      const aapShaped = mapUnifiedCardToAAP(canonical) as unknown as Record<string, any>;
+      const consciencePayload = canonical.conscience as { values?: ConscienceValue[] } | undefined;
+      const integrityPayload = canonical.integrity as { enforcement_mode?: string } | undefined;
+      return {
+        card: aapShaped,
+        conscienceValues: consciencePayload?.values ?? null,
+        enforcementMode: integrityPayload?.enforcement_mode ?? 'observe',
+      };
+    }
+    console.log(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_miss_fallback', agent_id: agentId,
+    }));
+  } catch (err) {
+    console.log(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_error_fallback', agent_id: agentId,
+      error: err instanceof Error ? err.message : String(err),
+    }));
+  }
+
   try {
     const supabaseHeaders = {
       apikey: env.SUPABASE_KEY,
@@ -3501,6 +3536,22 @@ async function applyGracePeriod(
  */
 async function fetchSHConfig(agentId: string, env: Env): Promise<SafeHouseConfig> {
   if (env.SAFE_HOUSE_ENABLED !== 'true' || !env.BILLING_CACHE) return { ...DEFAULT_SAFE_HOUSE_CONFIG };
+
+  // UC-6: prefer the pre-composed canonical protection card. XFD detectors
+  // build against the SafeHouseConfig type, so mapCanonicalToSafeHouseConfig
+  // is the only adapter that needs to exist at this seam.
+  try {
+    const canonical = await fetchCanonicalProtectionCard(agentId, env);
+    if (canonical) {
+      return mapCanonicalToSafeHouseConfig(canonical);
+    }
+  } catch (err) {
+    console.warn(
+      `[gateway/safe-house] canonical_protection_cards fetch errored for ${agentId}; falling back:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   const cacheKey = `sh:config:${agentId}`;
   try {
     const cached = await env.BILLING_CACHE.get(cacheKey);
@@ -4524,16 +4575,11 @@ export async function handleProviderProxy(
     // Read transaction ID from request header (used for transaction-scoped guardrails)
     const transactionId = request.headers.get('x-transaction-id');
 
-    // Always resolve quota context — agent_settings needed for feature gating
-    // Policy fetch runs in parallel with quota resolution (zero added latency)
-    // CLPI identity fix: use linked_agent_id if available, fall back to name lookup
-    const [quotaContext, policyData, txnGuardrails] = await Promise.all([
+    // Resolve quota context + transaction guardrails in parallel.
+    // UC-8: fetchPolicyForAgent + mergePolicies are no longer on the hot path.
+    // Policy is derived from the canonical alignment card inside evaluatePolicy.
+    const [quotaContext, txnGuardrails] = await Promise.all([
       resolveQuotaContext(agent.id, env, mnemomKeyHash),
-      fetchPolicyForAgent(agent.id, env, agent.linked_agent_id).then(async (result) => {
-        if (result) return result;
-        if (agentName) return fetchPolicyByAgentName(agentName, agent.id, env);
-        return null;
-      }),
       transactionId ? fetchTransactionGuardrails(agent.id, transactionId, env) : Promise.resolve(null),
     ]);
     const agentSettings = quotaContext.agent_settings;
@@ -4845,135 +4891,111 @@ export async function handleProviderProxy(
     }
 
     // ====================================================================
-    // CLPI Phase 2: Gateway policy evaluation (pre-action checkpoint)
+    // UC-8 gateway policy evaluation — canonical card is the source of
+    // truth. The card was already fetched (with KV caching) by
+    // fetchAlignmentData above, so this second fetchCanonicalAlignmentCard
+    // hits the cache. The evaluator derives a Policy from the card and
+    // layers any transaction guardrails via mergeTransactionGuardrails.
     // ====================================================================
     let policyVerdict: string | null = null;
     let policyCardGaps: unknown[] | null = null;
 
-    if (policyData) {
-      try {
-        const mergedPolicy = mergePolicies(
-          policyData.orgPolicy,
-          policyData.agentPolicy,
-          policyData.exempt
-        );
+    try {
+      const canonicalCard = await fetchCanonicalAlignmentCard(agent.id, env);
+      if (!canonicalCard) {
+        // No canonical card (e.g. brand-new agent pre-first-compose). Skip
+        // policy evaluation; fail-open posture. The fallback lazy-merge in
+        // fetchAlignmentData handles request metadata; policy is not enforced.
+        console.warn(`[gateway/policy] No canonical card for ${agent.id}; skipping policy enforcement`);
+      } else {
+        const enforcement = (canonicalCard.enforcement ?? {}) as Record<string, any>;
+        const enforcementMode: string =
+          (agentSettings as any)?.policy_enforcement_mode ??
+          enforcement.mode ??
+          'warn';
 
-        // Apply transaction-scoped guardrails (intersection semantics — can only restrict)
-        let finalPolicy = mergedPolicy;
-        if (txnGuardrails?.policy && finalPolicy) {
-          finalPolicy = mergeTransactionGuardrails(finalPolicy, txnGuardrails.policy);
-        }
+        if (enforcementMode !== 'off') {
+          const requestTools = extractToolsFromRequest(requestBody, provider);
 
-        if (finalPolicy) {
-          // Resolve enforcement mode: agent_settings > policy defaults > 'warn'
-          const enforcementMode: string =
-            (agentSettings as any)?.policy_enforcement_mode ??
-            finalPolicy.defaults.enforcement_mode ??
-            'warn';
+          if (requestTools.length > 0) {
+            let evalResult = evaluatePolicy({
+              context: 'gateway',
+              card: canonicalCard as Parameters<typeof evaluatePolicy>[0]['card'],
+              tools: requestTools,
+              transactionGuardrails: txnGuardrails?.policy ?? undefined,
+            });
 
-          if (enforcementMode !== 'off') {
-            // Extract tools from request body
-            const requestTools = extractToolsFromRequest(requestBody, provider);
+            // Apply grace period if there are violations
+            if (evalResult.violations.length > 0) {
+              const gracePeriodHours = enforcement.grace_period_hours ?? 24;
+              const graceResult = await applyGracePeriod(
+                agent.id,
+                evalResult.violations,
+                evalResult.warnings,
+                gracePeriodHours,
+                env
+              );
 
-            if (requestTools.length > 0) {
-              // Fetch alignment card for this agent (lightweight — reuse existing pattern)
-              let cardContent: Record<string, any> = {};
-              try {
-                const cardResp = await supabaseFetch(
-                  `${env.SUPABASE_URL}/rest/v1/alignment_cards?agent_id=eq.${agent.id}&is_active=eq.true&limit=1`,
-                  {
-                    headers: {
-                      apikey: env.SUPABASE_KEY,
-                      Authorization: `Bearer ${env.SUPABASE_KEY}`,
-                    },
-                  }
-                );
-                if (cardResp.ok) {
-                  const cards = (await cardResp.json()) as Array<{ card_json: Record<string, any> }>;
-                  if (cards.length > 0 && cards[0].card_json) {
-                    cardContent = cards[0].card_json;
-                  }
-                }
-              } catch {
-                // Fail-open: proceed without card
+              const hasCriticalOrHigh = graceResult.violations.some(
+                (v) => v.severity === 'critical' || v.severity === 'high'
+              );
+              const hasAnyViolation = graceResult.violations.length > 0;
+              let newVerdict: 'pass' | 'fail' | 'warn';
+              if (hasCriticalOrHigh) {
+                newVerdict = 'fail';
+              } else if (hasAnyViolation || graceResult.warnings.length > 0) {
+                newVerdict = 'warn';
+              } else {
+                newVerdict = 'pass';
               }
 
-              let evalResult = evaluatePolicy({
-                context: 'gateway',
-                policy: finalPolicy,
-                card: cardContent,
-                tools: requestTools,
+              evalResult = {
+                ...evalResult,
+                violations: graceResult.violations,
+                warnings: graceResult.warnings,
+                verdict: newVerdict,
+              };
+            }
+
+            policyVerdict = evalResult.verdict;
+            policyCardGaps = evalResult.card_gaps?.length ? evalResult.card_gaps : null;
+
+            // Store evaluation (non-blocking). Use canonical_id + card_version
+            // as the policy identifier; the audit trail now points at the
+            // card that produced the verdict.
+            const compositionMeta = (canonicalCard._composition ?? {}) as Record<string, any>;
+            const canonicalId = typeof compositionMeta.canonical_id === 'string'
+              ? compositionMeta.canonical_id
+              : (typeof canonicalCard.card_id === 'string' ? canonicalCard.card_id : 'unknown');
+            ctx.waitUntil(
+              submitGatewayPolicyEvaluation(
+                evalResult,
+                agent.id,
+                canonicalId,
+                1,  // card-derived policy has no independent version number
+                env,
+                transactionId
+              )
+            );
+
+            // Enforce mode: reject on fail
+            if (enforcementMode === 'enforce' && evalResult.verdict === 'fail') {
+              return new Response(JSON.stringify({
+                error: 'Request blocked by policy',
+                type: 'policy_violation',
+                verdict: evalResult.verdict,
+                violations: evalResult.violations,
+              }), {
+                status: 403,
+                headers: { 'Content-Type': 'application/json' },
               });
-
-              // Apply grace period if there are violations
-              if (evalResult.violations.length > 0) {
-                const gracePeriodHours = finalPolicy.defaults.grace_period_hours ?? 24;
-                const graceResult = await applyGracePeriod(
-                  agent.id,
-                  evalResult.violations,
-                  evalResult.warnings,
-                  gracePeriodHours,
-                  env
-                );
-
-                // Recompute verdict after grace period filtering
-                const hasCriticalOrHigh = graceResult.violations.some(
-                  (v) => v.severity === 'critical' || v.severity === 'high'
-                );
-                const hasAnyViolation = graceResult.violations.length > 0;
-                let newVerdict: 'pass' | 'fail' | 'warn';
-                if (hasCriticalOrHigh) {
-                  newVerdict = 'fail';
-                } else if (hasAnyViolation || graceResult.warnings.length > 0) {
-                  newVerdict = 'warn';
-                } else {
-                  newVerdict = 'pass';
-                }
-
-                evalResult = {
-                  ...evalResult,
-                  violations: graceResult.violations,
-                  warnings: graceResult.warnings,
-                  verdict: newVerdict,
-                };
-              }
-
-              policyVerdict = evalResult.verdict;
-              policyCardGaps = evalResult.card_gaps?.length ? evalResult.card_gaps : null;
-
-              // Store evaluation (non-blocking)
-              if (policyData.dbPolicyId && policyData.dbPolicyVersion != null) {
-                ctx.waitUntil(
-                  submitGatewayPolicyEvaluation(
-                    evalResult,
-                    agent.id,
-                    policyData.dbPolicyId,
-                    policyData.dbPolicyVersion,
-                    env,
-                    transactionId
-                  )
-                );
-              }
-
-              // Enforce mode: reject on fail
-              if (enforcementMode === 'enforce' && evalResult.verdict === 'fail') {
-                return new Response(JSON.stringify({
-                  error: 'Request blocked by policy',
-                  type: 'policy_violation',
-                  verdict: evalResult.verdict,
-                  violations: evalResult.violations,
-                }), {
-                  status: 403,
-                  headers: { 'Content-Type': 'application/json' },
-                });
-              }
             }
           }
         }
-      } catch (error) {
-        // Fail-open: policy evaluation errors never block requests
-        console.warn('[gateway/policy] Evaluation failed (fail-open):', error);
       }
+    } catch (error) {
+      // Fail-open: policy evaluation errors never block requests
+      console.warn('[gateway/policy] Evaluation failed (fail-open):', error);
     }
 
     // Build the forwarding URL — strip provider prefix, forward to CF AI Gateway
