@@ -1,4 +1,6 @@
 import { toolMatchesPattern, toolMatchesAny } from './glob.js';
+import { extractPolicyFromCard } from './card-policy.js';
+import { mergeTransactionGuardrails } from './merge.js';
 import type {
   EvaluationInput,
   EvaluationResult,
@@ -10,17 +12,36 @@ import type {
 } from './types.js';
 
 /**
- * Evaluate a set of tools against a policy and alignment card.
- * Pure, synchronous function with zero I/O.
+ * UC-8 — evaluate tools against a unified alignment card.
+ *
+ * Pure, synchronous, zero I/O. The evaluator:
+ *   1. Derives a Policy from the card via extractPolicyFromCard.
+ *   2. If transactionGuardrails is provided, intersects via
+ *      mergeTransactionGuardrails (ephemeral, can only restrict).
+ *   3. Walks the tools list, checking forbidden rules, capability mappings,
+ *      and escalation triggers against the effective policy.
+ *
+ * Dual-shape aware on bounded_actions: prefers autonomy.bounded_actions
+ * (unified) with fallback to autonomy_envelope.bounded_actions (legacy).
  */
 export function evaluatePolicy(input: EvaluationInput): EvaluationResult {
   const start = Date.now();
-  const { policy, card, tools, context } = input;
+  const { card, tools, context, transactionGuardrails } = input;
+
+  // Derive the policy from the card, then layer ephemeral txn guardrails.
+  const derivedPolicy = extractPolicyFromCard(card);
+  const policy = transactionGuardrails
+    ? mergeTransactionGuardrails(derivedPolicy, transactionGuardrails)
+    : derivedPolicy;
 
   const violations: PolicyViolation[] = [];
   const warnings: PolicyWarning[] = [];
   const cardGaps: CardGap[] = [];
-  const boundedActions = new Set(card.autonomy_envelope?.bounded_actions ?? []);
+  const boundedActions = new Set(
+    card.autonomy?.bounded_actions
+      ?? card.autonomy_envelope?.bounded_actions
+      ?? [],
+  );
 
   for (const tool of tools) {
     const toolName = tool.name;

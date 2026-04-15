@@ -30,9 +30,13 @@ import {
 import { createWorkersExporter, type WorkersOTelExporter } from '@mnemom/aip-otel-exporter/workers';
 import { mergeOrgAndAgentCard } from './card-merge';
 import { mapUnifiedCardToAAP, fetchCanonicalAlignmentCard } from './card-mappers';
+// Note: fetchCanonicalAlignmentCardRaw returns the unified-shape card without
+// mapping — used by the policy-eval block, which needs the unified capabilities
+// + enforcement sections. Defined inline at the call site for clarity.
 import {
   evaluatePolicy,
-  mergePolicies,
+  // UC-8: mergePolicies removed from the public API; policy is derived from
+  // the canonical card inside evaluatePolicy.
   type Policy,
   type EvaluationResult,
   type ToolReference,
@@ -486,10 +490,12 @@ async function processLog(
     `[observer] Extracted: thinking=${!!context.thinking}, tools=${context.toolCalls.length}, query=${!!context.userQuery}`
   );
 
-  // Fetch card and policy data in parallel
-  const [card, policyData] = await Promise.all([
+  // UC-8: fetch the AAP-shaped card for verifyTrace + the unified-shape
+  // canonical card for policy evaluation. Both are KV-backed, so the two
+  // calls collapse to a single network hit after the first.
+  const [card, unifiedCard] = await Promise.all([
     fetchCard(agent_id, env),
-    fetchPolicyForAgent(agent_id, env, metadata?.agent_name),
+    fetchCanonicalAlignmentCard(agent_id, env),
   ]);
 
   // Analyze reasoning with Claude Haiku (card-aware)
@@ -505,46 +511,40 @@ async function processLog(
     otelExporter.recordVerification(verification);
   }
 
-  // Policy evaluation (additive — agents without policies get current behavior)
+  // UC-8: policy evaluation runs against the canonical unified card. The
+  // evaluator derives a Policy from card.capabilities + card.enforcement +
+  // card.autonomy.escalation_triggers internally via extractPolicyFromCard.
   let policyResult: EvaluationResult | null = null;
-  if (policyData && card) {
-    const merged = mergePolicies(
-      policyData.orgPolicy,
-      policyData.agentPolicy,
-      policyData.exempt
-    );
-    if (merged) {
-      const tools = extractToolsFromTrace(trace);
-      if (tools.length > 0) {
-        policyResult = evaluatePolicy({
-          context: 'observer',
-          policy: merged,
-          card: card as any,
-          tools,
-        });
-        console.log(`[observer/policy] Agent ${agent_id}: verdict=${policyResult.verdict}, violations=${policyResult.violations.length}, warnings=${policyResult.warnings.length}`);
+  if (unifiedCard) {
+    const tools = extractToolsFromTrace(trace);
+    if (tools.length > 0) {
+      policyResult = evaluatePolicy({
+        context: 'observer',
+        card: unifiedCard as Parameters<typeof evaluatePolicy>[0]['card'],
+        tools,
+      });
+      console.log(`[observer/policy] Agent ${agent_id}: verdict=${policyResult.verdict}, violations=${policyResult.violations.length}, warnings=${policyResult.warnings.length}`);
 
-        // Record policy evaluation OTel span (requires aip-otel-exporter >=0.5.0 with policy support)
-        if (otelExporter && 'recordPolicyEvaluation' in otelExporter) {
-          (otelExporter as any).recordPolicyEvaluation({
-            agent_id,
-            policy_id: policyResult.policy_id,
-            policy_version: String(policyResult.policy_version),
-            verdict: policyResult.verdict,
-            violations_count: policyResult.violations.length,
-            warnings_count: policyResult.warnings.length,
-            coverage_pct: policyResult.coverage.coverage_pct,
-            context: policyResult.context,
-            duration_ms: policyResult.duration_ms,
-            enforcement_mode: 'observe',
-            violations: policyResult.violations.map(v => ({
-              type: v.type,
-              tool: v.tool,
-              severity: v.severity,
-              reason: v.reason,
-            })),
-          });
-        }
+      // Record policy evaluation OTel span
+      if (otelExporter && 'recordPolicyEvaluation' in otelExporter) {
+        (otelExporter as any).recordPolicyEvaluation({
+          agent_id,
+          policy_id: policyResult.policy_id,
+          policy_version: String(policyResult.policy_version),
+          verdict: policyResult.verdict,
+          violations_count: policyResult.violations.length,
+          warnings_count: policyResult.warnings.length,
+          coverage_pct: policyResult.coverage.coverage_pct,
+          context: policyResult.context,
+          duration_ms: policyResult.duration_ms,
+          enforcement_mode: 'observe',
+          violations: policyResult.violations.map(v => ({
+            type: v.type,
+            tool: v.tool,
+            severity: v.severity,
+            reason: v.reason,
+          })),
+        });
       }
     }
   }
@@ -558,9 +558,19 @@ async function processLog(
     throw error;
   }
 
-  // Store policy evaluation result (non-blocking)
-  if (policyResult && policyData?.dbPolicyId) {
-    ctx.waitUntil(submitPolicyEvaluation(policyResult, agent_id, trace.trace_id, policyData.dbPolicyId, policyData.dbPolicyVersion ?? 1, env));
+  // UC-8: Store policy evaluation result. The policy identifier is now the
+  // canonical card's composition id (or card_id), since there's no separate
+  // policy entity to reference.
+  if (policyResult && unifiedCard) {
+    const comp = ((unifiedCard as Record<string, any>)._composition ?? {}) as Record<string, any>;
+    const canonicalId = typeof comp.canonical_id === 'string'
+      ? comp.canonical_id
+      : (typeof (unifiedCard as Record<string, any>).card_id === 'string'
+          ? (unifiedCard as Record<string, any>).card_id
+          : 'unknown');
+    ctx.waitUntil(
+      submitPolicyEvaluation(policyResult, agent_id, trace.trace_id, canonicalId, 1, env),
+    );
   }
 
   // Submit usage event for admin tracking (non-blocking)

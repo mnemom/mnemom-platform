@@ -1785,7 +1785,7 @@ describe('Billing enforcement integration', () => {
     });
   }
 
-  // Helper to mock the standard agent-lookup + forward flow
+  // Helper to mock the standard agent-lookup + forward flow.
   function mockAgentLookupAndForward() {
     const existingAgent = {
       id: 'agent-uuid-billing',
@@ -1805,17 +1805,22 @@ describe('Billing enforcement integration', () => {
     return existingAgent;
   }
 
+  // UC-8: the gateway policy-eval block calls fetchCanonicalAlignmentCard
+  // after quota/txn resolution. Billing tests queue this right before the
+  // forward mock so the sequence stays deterministic.
+  function mockCanonicalAlignmentMiss() {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve([]) });
+  }
+
   it('should proceed without billing when x-mnemom-api-key is absent and billing enabled', async () => {
     const env = createBillingEnabledEnv();
 
     mockAgentLookupAndForward();
 
-    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
-    // Policy fetch RPC (returns null — no policy)
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve(null),
-    });
+    // UC-8: policy fetch RPC replaced by a canonical_agent_cards read inside
+    // the policy-eval block. Returning an empty array skips enforcement (no
+    // card → no policy). Sequenced here where the original policy mock lived.
+    mockCanonicalAlignmentMiss();
 
     // resolveQuotaContext RPC (no mnemom key, uses agent hash cache key)
     mockFetch.mockResolvedValueOnce({
@@ -1859,13 +1864,6 @@ describe('Billing enforcement integration', () => {
       json: () => Promise.resolve({ valid: true, account_id: 'ba-acct-valid' }),
     });
 
-    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
-    // Policy fetch RPC (returns null — no policy)
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve(null),
-    });
-
     // resolveQuotaContext RPC
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -1884,6 +1882,10 @@ describe('Billing enforcement integration', () => {
         past_due_since: null,
       }),
     });
+
+    // UC-8: policy-eval block reads the canonical card after quota. Empty →
+    // skip enforcement.
+    mockCanonicalAlignmentMiss();
 
     // Forward request to CF AI Gateway
     mockFetch.mockResolvedValueOnce(
@@ -1920,14 +1922,9 @@ describe('Billing enforcement integration', () => {
       json: () => Promise.resolve({ valid: true, account_id: 'ba-acct-overdue' }),
     });
 
-    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
-    // Policy fetch RPC (returns null — no policy)
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve(null),
-    });
-
-    // resolveQuotaContext RPC — return a past_due context that triggers rejection
+    // resolveQuotaContext RPC — return a past_due context that triggers rejection.
+    // Rejection happens before the policy-eval canonical read, so no canonical
+    // mock is needed for this test.
     const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -2080,13 +2077,6 @@ describe('Billing enforcement integration', () => {
       json: () => Promise.resolve({ valid: true, account_id: 'ba-acct-warn' }),
     });
 
-    // Policy fetch RPC runs first (no KV cache hop), quota RPC runs second (after KV miss)
-    // Policy fetch RPC (returns null — no policy)
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve(null),
-    });
-
     // resolveQuotaContext — team plan at 85% usage
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -2105,6 +2095,9 @@ describe('Billing enforcement integration', () => {
         past_due_since: null,
       }),
     });
+
+    // UC-8: policy-eval canonical fetch (empty → skip enforcement).
+    mockCanonicalAlignmentMiss();
 
     // Forward request
     mockFetch.mockResolvedValueOnce(
