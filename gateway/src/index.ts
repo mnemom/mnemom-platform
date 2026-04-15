@@ -258,6 +258,59 @@ export interface QuotaDecision {
   headers: Record<string, string>;
 }
 
+// ============================================================================
+// Rate Limiting (per-IP, per-org, per-agent)
+// ============================================================================
+
+const DEFAULT_RATE_LIMITS = {
+  per_ip_rpm: 100,
+  per_org_rpm: 1000,
+  per_agent_rpm: 100,
+};
+
+async function checkRateLimitTier(
+  kv: KVNamespace,
+  key: string,
+  limit: number,
+): Promise<{ count: number; allowed: boolean }> {
+  try {
+    const current = parseInt((await kv.get(key)) || '0', 10);
+    if (current >= limit) {
+      return { count: current, allowed: false };
+    }
+    await kv.put(key, String(current + 1), { expirationTtl: 120 });
+    return { count: current + 1, allowed: true };
+  } catch {
+    return { count: 0, allowed: true }; // fail-open
+  }
+}
+
+function rateLimitResponse(
+  tier: string, limit: number, minute: number
+): Response {
+  const resetAt = (minute + 1) * 60;
+  const retryAfter = Math.max(1, resetAt - Math.floor(Date.now() / 1000));
+  return new Response(
+    JSON.stringify({
+      error: 'Rate limit exceeded',
+      type: 'rate_limit_error',
+      tier,
+      limit,
+      retry_after: retryAfter,
+    }),
+    {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': String(retryAfter),
+        'X-RateLimit-Limit': String(limit),
+        'X-RateLimit-Remaining': '0',
+        'X-RateLimit-Reset': String(resetAt),
+      },
+    },
+  );
+}
+
 export const FREE_TIER_CONTEXT: QuotaContext = {
   plan_id: 'plan-free',
   billing_model: 'none',
@@ -4327,6 +4380,20 @@ export async function handleProviderProxy(
   provider: GatewayProvider,
   agentName?: string
 ): Promise<Response> {
+  // ====================================================================
+  // Phase A: Per-IP rate limit (before any DB calls — DDoS protection)
+  // ====================================================================
+  const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (env.BILLING_CACHE) {
+    const minute = Math.floor(Date.now() / 60000);
+    const ipResult = await checkRateLimitTier(
+      env.BILLING_CACHE, `rl:ip:${clientIp}:${minute}`, DEFAULT_RATE_LIMITS.per_ip_rpm
+    );
+    if (!ipResult.allowed) {
+      return rateLimitResponse('ip', DEFAULT_RATE_LIMITS.per_ip_rpm, minute);
+    }
+  }
+
   // Extract API key from header (provider-specific)
   const apiKey = extractApiKey(request, provider);
   if (!apiKey) {
@@ -4485,6 +4552,34 @@ export async function handleProviderProxy(
           status: isContainment ? 403 : 402,
           headers: { 'Content-Type': 'application/json', ...quotaDecision.headers },
         });
+      }
+    }
+
+    // ====================================================================
+    // Phase B: Per-agent + per-org rate limits (after identity resolution)
+    // ====================================================================
+    if (env.BILLING_CACHE) {
+      const minute = Math.floor(Date.now() / 60000);
+      const orgLimits = (quotaContext.limits ?? {}) as { per_org_rpm?: number; per_agent_rpm?: number };
+
+      // Per-agent check
+      const agentLimit = orgLimits.per_agent_rpm ?? DEFAULT_RATE_LIMITS.per_agent_rpm;
+      const agentResult = await checkRateLimitTier(
+        env.BILLING_CACHE, `rl:agent:${agentHash}:${minute}`, agentLimit
+      );
+      if (!agentResult.allowed) {
+        return rateLimitResponse('agent', agentLimit, minute);
+      }
+
+      // Per-org check (only if org association exists)
+      if (quotaContext.account_id) {
+        const orgLimit = orgLimits.per_org_rpm ?? DEFAULT_RATE_LIMITS.per_org_rpm;
+        const orgResult = await checkRateLimitTier(
+          env.BILLING_CACHE, `rl:org:${quotaContext.account_id}:${minute}`, orgLimit
+        );
+        if (!orgResult.allowed) {
+          return rateLimitResponse('org', orgLimit, minute);
+        }
       }
     }
 
