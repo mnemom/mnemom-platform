@@ -29,6 +29,7 @@ import {
 
 import { createWorkersExporter, type WorkersOTelExporter } from '@mnemom/aip-otel-exporter/workers';
 import { mergeOrgAndAgentCard } from './card-merge';
+import { mapUnifiedCardToAAP, fetchCanonicalAlignmentCard } from './card-mappers';
 import {
   evaluatePolicy,
   mergePolicies,
@@ -1412,6 +1413,25 @@ async function fetchCard(
   agentId: string,
   env: Env
 ): Promise<AlignmentCard | null> {
+  // UC-7: prefer the pre-composed canonical alignment card. verifyTrace()
+  // and detectDrift() expect AAP 1.0.x shape, so we adapt through
+  // mapUnifiedCardToAAP before returning. Fall back to the legacy lazy
+  // merge only if the canonical row is missing (rare post-UC-3).
+  try {
+    const canonical = await fetchCanonicalAlignmentCard(agentId, env);
+    if (canonical) {
+      return mapUnifiedCardToAAP(canonical) as unknown as AlignmentCard;
+    }
+    console.warn(
+      `[observer] canonical_agent_cards miss for ${agentId}; falling back to lazy merge`,
+    );
+  } catch (err) {
+    console.warn(
+      `[observer] canonical_agent_cards fetch errored for ${agentId}; falling back:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   try {
     const supabaseHeaders = {
       apikey: env.SUPABASE_KEY,

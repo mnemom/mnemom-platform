@@ -46,6 +46,12 @@ import {
 import { readStreamToText, parseSSEEvents } from './sse-parser';
 import { mergeOrgAndAgentCard } from './card-merge';
 import {
+  mapUnifiedCardToAAP,
+  mapCanonicalToSafeHouseConfig,
+  fetchCanonicalAlignmentCard,
+  fetchCanonicalProtectionCard,
+} from './card-mappers';
+import {
   evaluatePolicy,
   mergePolicies,
   mergeTransactionGuardrails,
@@ -960,6 +966,35 @@ async function fetchAlignmentData(
   conscienceValues: ConscienceValue[] | null;
   enforcementMode: string;
 }> {
+  // UC-6: prefer the pre-composed canonical alignment card written by the
+  // composition engine. Downstream consumers (mapCardToAIP, LLM prompt
+  // builders) read AAP 1.0.x paths (autonomy_envelope, audit_commitment),
+  // so we adapt unified → AAP via mapUnifiedCardToAAP before returning.
+  // conscienceValues + enforcementMode are lifted from the unified sections
+  // so the org_conscience_values and agents.aip_enforcement_mode RPCs are
+  // skipped entirely on the canonical path.
+  try {
+    const canonical = await fetchCanonicalAlignmentCard(agentId, env);
+    if (canonical) {
+      const aapShaped = mapUnifiedCardToAAP(canonical) as unknown as Record<string, any>;
+      const consciencePayload = canonical.conscience as { values?: ConscienceValue[] } | undefined;
+      const integrityPayload = canonical.integrity as { enforcement_mode?: string } | undefined;
+      return {
+        card: aapShaped,
+        conscienceValues: consciencePayload?.values ?? null,
+        enforcementMode: integrityPayload?.enforcement_mode ?? 'observe',
+      };
+    }
+    console.warn(
+      `[gateway/aip] canonical_agent_cards miss for ${agentId}; falling back to lazy merge`,
+    );
+  } catch (err) {
+    console.warn(
+      `[gateway/aip] canonical_agent_cards fetch errored for ${agentId}; falling back:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   try {
     const supabaseHeaders = {
       apikey: env.SUPABASE_KEY,
@@ -3448,6 +3483,22 @@ async function applyGracePeriod(
  */
 async function fetchSHConfig(agentId: string, env: Env): Promise<SafeHouseConfig> {
   if (env.SAFE_HOUSE_ENABLED !== 'true' || !env.BILLING_CACHE) return { ...DEFAULT_SAFE_HOUSE_CONFIG };
+
+  // UC-6: prefer the pre-composed canonical protection card. XFD detectors
+  // build against the SafeHouseConfig type, so mapCanonicalToSafeHouseConfig
+  // is the only adapter that needs to exist at this seam.
+  try {
+    const canonical = await fetchCanonicalProtectionCard(agentId, env);
+    if (canonical) {
+      return mapCanonicalToSafeHouseConfig(canonical);
+    }
+  } catch (err) {
+    console.warn(
+      `[gateway/safe-house] canonical_protection_cards fetch errored for ${agentId}; falling back:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   const cacheKey = `sh:config:${agentId}`;
   try {
     const cached = await env.BILLING_CACHE.get(cacheKey);
