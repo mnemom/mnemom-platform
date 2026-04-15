@@ -27,6 +27,7 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 # ANTHROPIC_API_KEY, ANALYSIS_API_KEY
 # OTLP_ENDPOINT, OTLP_AUTH
 # STRIPE_SECRET_KEY, TRIGGER_SECRET
+# SLACK_WEBHOOK_URL (DLQ dead-letter alerts)
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]

@@ -42,6 +42,11 @@ import { computeBandHashes, deserializeMinHash } from '@mnemom/safe-house';
 const AAP_VERSION = '1.0';
 const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
 
+// DLQ retry backoff schedule (indexed by attempts - 4, since inline delivery uses 4 attempts)
+// 1min, 5min, 30min, 2hr, 6hr, 24hr
+const DLQ_BACKOFF_MS = [60_000, 300_000, 1_800_000, 7_200_000, 21_600_000, 86_400_000];
+const DLQ_MAX_ATTEMPTS = 10;
+
 // ============================================================================
 // Supabase Fetch — 5s Timeout + Circuit Breaker
 // ============================================================================
@@ -103,6 +108,7 @@ interface Env {
   PROVER_API_KEY?: string;
   OBSERVER_MAX_LOGS?: string; // Max logs per cron tick; default "5000"; parsed as int
   BILLING_CACHE?: KVNamespace; // Shared KV namespace with gateway — used for LSH index
+  SLACK_WEBHOOK_URL?: string; // Slack incoming webhook for DLQ dead-letter alerts
 }
 
 interface GatewayLog {
@@ -184,6 +190,11 @@ export default {
       const now5 = now;
       if (now5.getUTCMinutes() % 5 === 0) {
         ctx.waitUntil(runSHAutoPromotion(env));
+      }
+
+      // Webhook DLQ retry scheduler (every 5 minutes, offset from auto-promotion)
+      if (now.getUTCMinutes() % 5 === 2) {
+        ctx.waitUntil(retryDLQWebhooks(env));
       }
 
       // Safe House adaptive threshold analysis (hourly, at :30)
@@ -3823,7 +3834,26 @@ async function deliverAAPWebhooks(
         }
       }
 
-      // 6. Record delivery
+      // 6. Record delivery (include payload + next_retry_at for DLQ retry on failure)
+      const totalAttempts = delivered ? 1 : retryDelays.length + 1;
+      const deliveryRecord: Record<string, unknown> = {
+        id: `del-${randomHex(12)}`,
+        registration_id: reg.registration_id,
+        checkpoint_id: null,
+        trace_id: trace.trace_id,
+        event_type: eventTypes[eventTypes.length - 1],
+        status: delivered ? 'success' : 'failed',
+        attempts: totalAttempts,
+        last_attempt_at: new Date().toISOString(),
+        error_message: lastError,
+      };
+
+      if (!delivered) {
+        // Store payload for DLQ replay and schedule first retry
+        deliveryRecord.payload = webhookPayload;
+        deliveryRecord.next_retry_at = new Date(Date.now() + DLQ_BACKOFF_MS[0]).toISOString();
+      }
+
       try {
         await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
           method: 'POST',
@@ -3833,17 +3863,7 @@ async function deliverAAPWebhooks(
             'Content-Type': 'application/json',
             Prefer: 'return=minimal',
           },
-          body: JSON.stringify({
-            id: `del-${randomHex(12)}`,
-            registration_id: reg.registration_id,
-            checkpoint_id: null,
-            trace_id: trace.trace_id,
-            event_type: eventTypes[eventTypes.length - 1],
-            status: delivered ? 'success' : 'failed',
-            attempts: delivered ? 1 : retryDelays.length + 1,
-            last_attempt_at: new Date().toISOString(),
-            error_message: lastError,
-          }),
+          body: JSON.stringify(deliveryRecord),
           signal: controller.signal,
         });
       } catch (error) {
@@ -3882,6 +3902,191 @@ async function deliverAAPWebhooks(
     }
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+// ============================================================================
+// Webhook DLQ Retry Scheduler
+// ============================================================================
+
+interface DLQDelivery {
+  id: string;
+  registration_id: string;
+  event_type: string;
+  status: string;
+  attempts: number;
+  payload: Record<string, unknown>;
+  error_message: string | null;
+  aip_webhook_registrations: {
+    callback_url: string;
+    secret: string;
+  };
+}
+
+async function retryDLQWebhooks(env: Env): Promise<void> {
+  try {
+    // Fetch failed deliveries due for retry, joined with registration for callback_url + secret
+    const nowISO = new Date().toISOString();
+    const queryUrl = `${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries` +
+      `?select=id,registration_id,event_type,status,attempts,payload,error_message,aip_webhook_registrations!inner(callback_url,secret)` +
+      `&status=eq.failed&attempts=lt.${DLQ_MAX_ATTEMPTS}&next_retry_at=lte.${encodeURIComponent(nowISO)}` +
+      `&order=next_retry_at.asc&limit=20`;
+
+    const response = await observerSupabaseFetch(queryUrl, {
+      headers: {
+        apikey: env.SUPABASE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      },
+    });
+
+    if (!response.ok) {
+      console.warn(`[observer/dlq] Failed to fetch DLQ deliveries: ${response.status}`);
+      return;
+    }
+
+    const deliveries = (await response.json()) as DLQDelivery[];
+    if (deliveries.length === 0) return;
+
+    let succeeded = 0;
+    let failed = 0;
+    let deadLettered = 0;
+
+    for (const delivery of deliveries) {
+      if (!delivery.payload || !delivery.aip_webhook_registrations) {
+        console.warn(`[observer/dlq] Skipping ${delivery.id}: missing payload or registration`);
+        continue;
+      }
+
+      const reg = delivery.aip_webhook_registrations;
+      const payloadString = JSON.stringify(delivery.payload);
+      const signature = await hmacSign(reg.secret, payloadString);
+
+      let retrySucceeded = false;
+      let lastError: string | null = null;
+
+      try {
+        const webhookResponse = await fetch(reg.callback_url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-AAP-Signature': `sha256=${signature}`,
+            'X-AAP-Version': AAP_VERSION,
+          },
+          body: payloadString,
+        });
+
+        if (webhookResponse.ok) {
+          retrySucceeded = true;
+        } else {
+          lastError = `HTTP ${webhookResponse.status}`;
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+
+      const newAttempts = delivery.attempts + 1;
+
+      if (retrySucceeded) {
+        // Success — clear retry state
+        await patchDelivery(env, delivery.id, {
+          status: 'success',
+          attempts: newAttempts,
+          last_attempt_at: new Date().toISOString(),
+          next_retry_at: null,
+          error_message: null,
+        });
+        succeeded++;
+      } else if (newAttempts >= DLQ_MAX_ATTEMPTS) {
+        // Permanently failed — dead-letter
+        await patchDelivery(env, delivery.id, {
+          status: 'dead',
+          attempts: newAttempts,
+          last_attempt_at: new Date().toISOString(),
+          next_retry_at: null,
+          error_message: lastError,
+        });
+        await sendDLQSlackAlert(env, delivery, lastError);
+        deadLettered++;
+      } else {
+        // Schedule next retry with backoff
+        const backoffIndex = Math.min(newAttempts - 4, DLQ_BACKOFF_MS.length - 1);
+        const backoffMs = DLQ_BACKOFF_MS[Math.max(0, backoffIndex)];
+        await patchDelivery(env, delivery.id, {
+          attempts: newAttempts,
+          last_attempt_at: new Date().toISOString(),
+          next_retry_at: new Date(Date.now() + backoffMs).toISOString(),
+          error_message: lastError,
+        });
+        failed++;
+      }
+    }
+
+    console.log(`[observer/dlq] Retried ${deliveries.length} deliveries: ${succeeded} succeeded, ${failed} failed, ${deadLettered} dead-lettered`);
+  } catch (error) {
+    console.error('[observer/dlq] DLQ retry scheduler failed:', error);
+  }
+}
+
+async function patchDelivery(
+  env: Env,
+  deliveryId: string,
+  fields: Record<string, unknown>
+): Promise<void> {
+  try {
+    await observerSupabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries?id=eq.${deliveryId}`,
+      {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify(fields),
+      }
+    );
+  } catch (error) {
+    console.warn(`[observer/dlq] Failed to patch delivery ${deliveryId}:`, error);
+  }
+}
+
+async function sendDLQSlackAlert(
+  env: Env,
+  delivery: DLQDelivery,
+  lastError: string | null
+): Promise<void> {
+  if (!env.SLACK_WEBHOOK_URL) {
+    console.warn('[observer/dlq] SLACK_WEBHOOK_URL not configured, skipping dead-letter alert');
+    return;
+  }
+
+  try {
+    await fetch(env.SLACK_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: `[DLQ] Webhook delivery permanently failed: ${delivery.id}`,
+        blocks: [
+          {
+            type: 'header',
+            text: { type: 'plain_text', text: 'Webhook Dead Letter', emoji: true },
+          },
+          {
+            type: 'section',
+            fields: [
+              { type: 'mrkdwn', text: `*Delivery ID:*\n${delivery.id}` },
+              { type: 'mrkdwn', text: `*Registration:*\n${delivery.registration_id}` },
+              { type: 'mrkdwn', text: `*Event Type:*\n${delivery.event_type}` },
+              { type: 'mrkdwn', text: `*Attempts:*\n${DLQ_MAX_ATTEMPTS}` },
+              { type: 'mrkdwn', text: `*Last Error:*\n${lastError ?? 'Unknown'}` },
+            ],
+          },
+        ],
+      }),
+    });
+  } catch (error) {
+    console.warn('[observer/dlq] Failed to send Slack alert:', error);
   }
 }
 
