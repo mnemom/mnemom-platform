@@ -118,6 +118,13 @@ interface KVEnv {
 
 const CANONICAL_CARD_KV_TTL_SECONDS = 300;
 
+/**
+ * Read a canonical alignment card. Prefers KV cache; when DB says
+ * `needs_recompose = true` (an org template change or exemption mutation
+ * is pending fan-out), bypass the cache and return the fresh row without
+ * repopulating. The next `recompose_pending()` cron run clears the flag
+ * and the subsequent read repopulates the cache.
+ */
 export async function fetchCanonicalAlignmentCard(
   agentId: string,
   env: KVEnv,
@@ -130,7 +137,7 @@ export async function fetchCanonicalAlignmentCard(
   const url = new URL(`${env.SUPABASE_URL}/rest/v1/canonical_agent_cards`);
   url.searchParams.set('agent_id', `eq.${agentId}`);
   url.searchParams.set('limit', '1');
-  url.searchParams.set('select', 'card_json');
+  url.searchParams.set('select', 'card_json,needs_recompose');
   const resp = await fetch(url.toString(), {
     headers: {
       apikey: env.SUPABASE_KEY,
@@ -138,15 +145,22 @@ export async function fetchCanonicalAlignmentCard(
     },
   });
   if (!resp.ok) return null;
-  const rows = (await resp.json()) as Array<{ card_json?: Record<string, unknown> }>;
-  const card = rows[0]?.card_json;
-  if (!card) return null;
-  if (env.BILLING_CACHE) {
-    await env.BILLING_CACHE.put(cacheKey, JSON.stringify(card), {
+  const rows = (await resp.json()) as Array<{
+    card_json?: Record<string, unknown>;
+    needs_recompose?: boolean;
+  }>;
+  const row = rows[0];
+  if (!row?.card_json) return null;
+
+  // If a recompose is pending, skip KV cache population — the card we just
+  // read is stale-in-intent. The next recompose_pending() cron cycle flips
+  // the flag and the subsequent read will repopulate cleanly.
+  if (!row.needs_recompose && env.BILLING_CACHE) {
+    await env.BILLING_CACHE.put(cacheKey, JSON.stringify(row.card_json), {
       expirationTtl: CANONICAL_CARD_KV_TTL_SECONDS,
     });
   }
-  return card;
+  return row.card_json;
 }
 
 export async function fetchCanonicalProtectionCard(
@@ -161,7 +175,7 @@ export async function fetchCanonicalProtectionCard(
   const url = new URL(`${env.SUPABASE_URL}/rest/v1/canonical_protection_cards`);
   url.searchParams.set('agent_id', `eq.${agentId}`);
   url.searchParams.set('limit', '1');
-  url.searchParams.set('select', 'card_json');
+  url.searchParams.set('select', 'card_json,needs_recompose');
   const resp = await fetch(url.toString(), {
     headers: {
       apikey: env.SUPABASE_KEY,
@@ -169,13 +183,16 @@ export async function fetchCanonicalProtectionCard(
     },
   });
   if (!resp.ok) return null;
-  const rows = (await resp.json()) as Array<{ card_json?: Record<string, unknown> }>;
-  const card = rows[0]?.card_json;
-  if (!card) return null;
-  if (env.BILLING_CACHE) {
-    await env.BILLING_CACHE.put(cacheKey, JSON.stringify(card), {
+  const rows = (await resp.json()) as Array<{
+    card_json?: Record<string, unknown>;
+    needs_recompose?: boolean;
+  }>;
+  const row = rows[0];
+  if (!row?.card_json) return null;
+  if (!row.needs_recompose && env.BILLING_CACHE) {
+    await env.BILLING_CACHE.put(cacheKey, JSON.stringify(row.card_json), {
       expirationTtl: CANONICAL_CARD_KV_TTL_SECONDS,
     });
   }
-  return card;
+  return row.card_json;
 }

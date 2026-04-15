@@ -968,15 +968,14 @@ async function fetchAlignmentData(
   enforcementMode: string;
 }> {
   // UC-6: prefer the pre-composed canonical alignment card written by the
-  // composition engine. Downstream consumers (mapCardToAIP, LLM prompt
-  // builders) read AAP 1.0.x paths (autonomy_envelope, audit_commitment),
-  // so we adapt unified → AAP via mapUnifiedCardToAAP before returning.
-  // conscienceValues + enforcementMode are lifted from the unified sections
-  // so the org_conscience_values and agents.aip_enforcement_mode RPCs are
-  // skipped entirely on the canonical path.
+  // composition engine. Emits a structured card_source log so UC-14 can
+  // verify the fallback rate decays to zero.
   try {
     const canonical = await fetchCanonicalAlignmentCard(agentId, env);
     if (canonical) {
+      console.log(JSON.stringify({
+        event: 'card_read', card_source: 'canonical_hit', agent_id: agentId,
+      }));
       const aapShaped = mapUnifiedCardToAAP(canonical) as unknown as Record<string, any>;
       const consciencePayload = canonical.conscience as { values?: ConscienceValue[] } | undefined;
       const integrityPayload = canonical.integrity as { enforcement_mode?: string } | undefined;
@@ -986,14 +985,14 @@ async function fetchAlignmentData(
         enforcementMode: integrityPayload?.enforcement_mode ?? 'observe',
       };
     }
-    console.warn(
-      `[gateway/aip] canonical_agent_cards miss for ${agentId}; falling back to lazy merge`,
-    );
+    console.log(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_miss_fallback', agent_id: agentId,
+    }));
   } catch (err) {
-    console.warn(
-      `[gateway/aip] canonical_agent_cards fetch errored for ${agentId}; falling back:`,
-      err instanceof Error ? err.message : err,
-    );
+    console.log(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_error_fallback', agent_id: agentId,
+      error: err instanceof Error ? err.message : String(err),
+    }));
   }
 
   try {

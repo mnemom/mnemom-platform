@@ -1423,23 +1423,25 @@ async function fetchCard(
   agentId: string,
   env: Env
 ): Promise<AlignmentCard | null> {
-  // UC-7: prefer the pre-composed canonical alignment card. verifyTrace()
-  // and detectDrift() expect AAP 1.0.x shape, so we adapt through
-  // mapUnifiedCardToAAP before returning. Fall back to the legacy lazy
-  // merge only if the canonical row is missing (rare post-UC-3).
+  // UC-7: prefer the pre-composed canonical alignment card. Emits a
+  // structured card_source log so UC-14 can verify the fallback rate
+  // decays to zero.
   try {
     const canonical = await fetchCanonicalAlignmentCard(agentId, env);
     if (canonical) {
+      console.log(JSON.stringify({
+        event: 'card_read', card_source: 'canonical_hit', agent_id: agentId,
+      }));
       return mapUnifiedCardToAAP(canonical) as unknown as AlignmentCard;
     }
-    console.warn(
-      `[observer] canonical_agent_cards miss for ${agentId}; falling back to lazy merge`,
-    );
+    console.log(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_miss_fallback', agent_id: agentId,
+    }));
   } catch (err) {
-    console.warn(
-      `[observer] canonical_agent_cards fetch errored for ${agentId}; falling back:`,
-      err instanceof Error ? err.message : err,
-    );
+    console.log(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_error_fallback', agent_id: agentId,
+      error: err instanceof Error ? err.message : String(err),
+    }));
   }
 
   try {
