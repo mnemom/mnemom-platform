@@ -339,6 +339,19 @@ jobs:
         working-directory: cli
         run: npm test -- --run
 
+  semgrep:
+    permissions:
+      contents: read
+    name: Semgrep
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Run Semgrep (fail on HIGH severity)
+        run: semgrep scan --config p/default --severity ERROR --error --exclude '*__tests__*' --exclude '*test*' gateway/ observer/
+
   lint:
     permissions:
       contents: read
