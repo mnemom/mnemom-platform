@@ -415,6 +415,39 @@ async function processAllLogs(
     console.warn(`[observer] Hit safety limit (${safetyLimit} logs) — observer may be behind`);
   }
 
+  // Emit tick health metrics to OTel (Step 41) — direct OTLP push, no SDK
+  if (env.OTLP_ENDPOINT) {
+    const traceId = crypto.randomUUID().replace(/-/g, '');
+    const spanId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const nowNs = String(Date.now() * 1_000_000);
+    const endNs = String(Date.now() * 1_000_000 + 1_000_000);
+    fetch(`${env.OTLP_ENDPOINT}/v1/traces`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(env.OTLP_AUTH ? { Authorization: env.OTLP_AUTH } : {}),
+      },
+      body: JSON.stringify({
+        resourceSpans: [{
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'mnemom-observer' } }] },
+          scopeSpans: [{
+            scope: { name: 'observer.health' },
+            spans: [{
+              traceId, spanId, name: 'observer.cron_tick', kind: 1,
+              startTimeUnixNano: nowNs, endTimeUnixNano: endNs,
+              attributes: [
+                { key: 'observer.logs_fetched', value: { intValue: String(stats.logs_fetched) } },
+                { key: 'observer.logs_processed', value: { intValue: String(stats.processed) } },
+                { key: 'observer.logs_errored', value: { intValue: String(stats.errors) } },
+                { key: 'observer.backlog_estimate', value: { stringValue: String(backlog_estimate) } },
+              ],
+            }],
+          }],
+        }],
+      }),
+    }).catch(() => {}); // fire-and-forget
+  }
+
   return stats;
 }
 

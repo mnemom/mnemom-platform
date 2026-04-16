@@ -3,6 +3,11 @@ interface Env {
   SUPABASE_URL: string;
   SUPABASE_KEY: string;
   MONITOR_SECRET: string;
+  // CF AI Gateway monitoring (Step 42)
+  CLOUDFLARE_API_TOKEN?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  AI_GATEWAY_ID?: string;
+  AI_GATEWAY_LOG_LIMIT?: string; // default: 100000
 }
 
 const PAGE_ID = '2vbfqw4638pl';
@@ -158,6 +163,38 @@ async function checkAnthropic(): Promise<Status> {
   }
 }
 
+// Step 42: CF AI Gateway log usage monitoring
+async function checkAiGatewayLogUsage(env: Env): Promise<{ status: Status; logCount?: number; limit?: number }> {
+  if (!env.CLOUDFLARE_API_TOKEN || !env.CLOUDFLARE_ACCOUNT_ID || !env.AI_GATEWAY_ID) {
+    return { status: 'operational' }; // not configured, skip
+  }
+
+  const limit = parseInt(env.AI_GATEWAY_LOG_LIMIT || '100000', 10);
+
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/ai-gateway/gateways/${env.AI_GATEWAY_ID}/logs?per_page=1`,
+      {
+        headers: { Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}` },
+        signal: AbortSignal.timeout(10000),
+      },
+    );
+    if (!res.ok) return { status: 'operational' }; // can't check, don't false-alarm
+
+    const data = await res.json() as { result_info?: { total_count?: number } };
+    const logCount = data.result_info?.total_count ?? 0;
+    const ratio = logCount / limit;
+
+    console.log(JSON.stringify({ ai_gateway_logs: { count: logCount, limit, ratio: ratio.toFixed(3) } }));
+
+    if (ratio >= 0.9) return { status: 'partial_outage', logCount, limit };
+    if (ratio >= 0.7) return { status: 'degraded_performance', logCount, limit };
+    return { status: 'operational', logCount, limit };
+  } catch {
+    return { status: 'operational' }; // can't reach CF API, don't false-alarm
+  }
+}
+
 async function checkAuth(env: Env): Promise<Status> {
   const start = Date.now();
   try {
@@ -210,6 +247,13 @@ export default {
       const result = results[i];
       const status: Status = result.status === 'fulfilled' ? result.value : 'major_outage';
       updates.push(updateComponent(env.STATUSPAGE_API_KEY, componentId, status));
+    }
+
+    // Step 42: AI Gateway log usage check (updates the ai_gateway component)
+    const logUsage = await checkAiGatewayLogUsage(env);
+    if (logUsage.status !== 'operational') {
+      updates.push(updateComponent(env.STATUSPAGE_API_KEY, COMPONENTS.ai_gateway, logUsage.status));
+      console.warn(`[monitor] AI Gateway log usage alert: ${logUsage.logCount}/${logUsage.limit} (${logUsage.status})`);
     }
 
     await Promise.allSettled(updates);
