@@ -4440,6 +4440,7 @@ export async function handleProviderProxy(
     const ipResult = await checkRateLimitTier(
       env.BILLING_CACHE, `rl:ip:${clientIp}:${minute}`, DEFAULT_RATE_LIMITS.per_ip_rpm
     );
+    console.log(JSON.stringify({ kv_rate_limit: { tier: 'ip', count: ipResult.count, limit: DEFAULT_RATE_LIMITS.per_ip_rpm, allowed: ipResult.allowed } }));
     if (!ipResult.allowed) {
       return rateLimitResponse('ip', DEFAULT_RATE_LIMITS.per_ip_rpm, minute);
     }
