@@ -34,7 +34,7 @@ export async function logsCommand(options: LogsOptions = {}): Promise<void> {
       displayTrace(trace);
     }
 
-    console.log(`\nView more: smoltbot logs --limit ${limit + 10}`);
+    console.log(`\nView more: mnemom logs --limit ${limit + 10}`);
     console.log(`Dashboard: https://mnemon.ai/dashboard/${agent.agentId}\n`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

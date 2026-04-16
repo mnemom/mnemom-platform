@@ -7,6 +7,8 @@ vi.mock("../lib/config.js", () => ({
   getAuthInfo: vi.fn(),
   saveAuthTokens: vi.fn(),
   loadConfig: vi.fn(),
+  envWithDeprecation: (newName: string, legacyName: string) =>
+    process.env[newName] ?? process.env[legacyName],
 }));
 
 import {
@@ -23,6 +25,7 @@ describe("auth", () => {
 
   beforeEach(() => {
     process.env = { ...originalEnv };
+    delete process.env.MNEMOM_TOKEN;
     delete process.env.SMOLTBOT_TOKEN;
     delete process.env.MNEMOM_API_KEY;
     vi.mocked(getAuthInfo).mockReturnValue(null);
@@ -69,8 +72,8 @@ describe("auth", () => {
   });
 
   describe("resolveAuth", () => {
-    it("should return JWT when SMOLTBOT_TOKEN is set", async () => {
-      process.env.SMOLTBOT_TOKEN = "jwt_token_123";
+    it("should return JWT when MNEMOM_TOKEN is set", async () => {
+      process.env.MNEMOM_TOKEN = "jwt_token_123";
       const cred = await resolveAuth();
       expect(cred).toEqual({ type: "jwt", token: "jwt_token_123" });
     });
@@ -111,7 +114,7 @@ describe("auth", () => {
     });
 
     it("should prefer JWT over API key when both available", async () => {
-      process.env.SMOLTBOT_TOKEN = "jwt_token";
+      process.env.MNEMOM_TOKEN = "jwt_token";
       process.env.MNEMOM_API_KEY = "mnm_api_key";
       const cred = await resolveAuth();
       expect(cred.type).toBe("jwt");
@@ -120,7 +123,7 @@ describe("auth", () => {
 
   describe("requireAuth", () => {
     it("should return JWT credential when available", async () => {
-      process.env.SMOLTBOT_TOKEN = "jwt_token";
+      process.env.MNEMOM_TOKEN = "jwt_token";
       const cred = await requireAuth();
       expect(cred.type).toBe("jwt");
     });
@@ -140,7 +143,7 @@ describe("auth", () => {
       await expect(requireAuth()).rejects.toThrow("process.exit");
       expect(mockExit).toHaveBeenCalledWith(1);
       expect(mockError).toHaveBeenCalledWith(
-        "Authentication required. Run `smoltbot login` or set MNEMOM_API_KEY."
+        "Authentication required. Run `mnemom login` or set MNEMOM_API_KEY."
       );
 
       mockExit.mockRestore();

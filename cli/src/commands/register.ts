@@ -1,11 +1,15 @@
 import { exec } from "node:child_process";
 import * as crypto from "node:crypto";
+import yaml from "js-yaml";
 import {
+  CONFIG_DIR,
   loadConfig,
   saveConfig,
   deriveAgentId,
   deriveAgentIdWithName,
+  getGatewayUrl,
   type AgentConfig,
+  type ConfigV2,
 } from "../lib/config.js";
 import {
   detectProviders,
@@ -20,6 +24,8 @@ import {
   detectProvider,
   formatModelName,
 } from "../lib/models.js";
+import { putAlignmentCard } from "../lib/api.js";
+import { requireAuth } from "../lib/auth.js";
 import { askYesNo, askInput, askSelect, isInteractive } from "../lib/prompt.js";
 import { fmt } from "../lib/format.js";
 
@@ -47,7 +53,7 @@ export async function registerCommand(
   name: string,
   options: RegisterOptions = {}
 ): Promise<void> {
-  console.log(fmt.header("smoltbot register - Add a named agent"));
+  console.log(fmt.header("mnemom register - Add a named agent"));
   console.log();
 
   // Validate name
@@ -57,12 +63,20 @@ export async function registerCommand(
     process.exit(1);
   }
 
-  // Load config
-  const config = loadConfig();
+  // Require authentication (UC-9: register requires login)
+  await requireAuth();
+
+  // Load or create config (UC-9: register handles first-run setup)
+  let config = loadConfig();
   if (!config) {
-    console.log(fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` first to set up the default agent.\n");
-    process.exit(1);
+    config = {
+      version: 2,
+      defaultAgent: name,
+      gateway: getGatewayUrl(),
+      agents: {},
+    } satisfies ConfigV2;
+    saveConfig(config);
+    console.log(fmt.success("Created config at ~/.mnemom/config.json") + "\n");
   }
 
   // Check for duplicate
@@ -156,7 +170,7 @@ export async function registerCommand(
   const agentId = deriveAgentIdWithName(apiKey, name);
   console.log(fmt.label("Agent ID:", ` ${agentId}`));
   console.log(fmt.label("Name:    ", ` ${name}`));
-  console.log(fmt.label("Gateway: ", ` ${config.gateway} (x-smoltbot-agent: ${name})`));
+  console.log(fmt.label("Gateway: ", ` ${config.gateway} (x-mnemom-agent: ${name})`));
   console.log();
 
   // Configure OpenClaw providers for named agent
@@ -184,7 +198,7 @@ export async function registerCommand(
 
       const configured = configureNamedAgentProviders(name, providerData);
       for (const provider of configured) {
-        const configKey = `smoltbot-${name}` + (provider === "anthropic" ? "" : `-${provider}`);
+        const configKey = `mnemom-${name}` + (provider === "anthropic" ? "" : `-${provider}`);
         console.log(fmt.success(`${provider} provider configured (${configKey})`));
       }
       console.log();
@@ -235,24 +249,42 @@ export async function registerCommand(
       console.log(fmt.success("Connected! First response from " + name + ":") + "\n");
       console.log(`    "${testResult.response}"\n`);
       console.log(fmt.success("Agent created on mnemom.ai") + "\n");
+
+      // UC-9: Create a default alignment card for the new agent
+      const finalAgentId = testResult.agentId ?? config.agents[name]?.agentId;
+      if (finalAgentId) {
+        try {
+          const defaultCard = yaml.dump({
+            principal: { name, type: "ai_agent" },
+            values: { declared: ["transparency", "safety", "honesty"] },
+            autonomy: { bounded_actions: [], forbidden_actions: [], escalation_triggers: [] },
+            enforcement: { mode: "observe" },
+          }, { lineWidth: 120, noRefs: true });
+          await putAlignmentCard(finalAgentId, defaultCard, "text/yaml");
+          console.log(fmt.success("Default alignment card created") + "\n");
+        } catch {
+          console.log(fmt.warn("Could not create default alignment card (non-critical)") + "\n");
+        }
+      }
+
       verified = true;
     } else if (testResult.authError) {
       console.log(fmt.error(`API key invalid: ${testResult.error}`) + "\n");
       console.log("  Check your API key and try again with:");
-      console.log(`    smoltbot register ${name}\n`);
+      console.log(`    mnemom register ${name}\n`);
       return;
     } else {
       console.log(fmt.error(`Connection failed: ${testResult.error}`) + "\n");
 
       if (!isInteractive()) {
-        console.log("  Run `smoltbot register " + name + "` to retry.\n");
+        console.log("  Run `mnemom register " + name + "` to retry.\n");
         return;
       }
 
       const retry = await askYesNo("Retry?", true);
       if (!retry) {
         console.log("\n  Agent is saved locally but NOT created on the server.");
-        console.log(`  Run \`smoltbot register ${name}\` to try again.\n`);
+        console.log(`  Run \`mnemom register ${name}\` to try again.\n`);
         return;
       }
       console.log();
@@ -288,29 +320,29 @@ export async function registerCommand(
   console.log();
 
   if (detection.installed && !options.standalone) {
-    console.log(`  openclaw models set smoltbot-${name}/<model-id>`);
+    console.log(`  openclaw models set mnemom-${name}/<model-id>`);
   } else {
-    console.log(`  Add the x-smoltbot-agent header to your API calls:\n`);
-    console.log(`    x-smoltbot-agent: ${name}\n`);
+    console.log(`  Add the x-mnemom-agent header to your API calls:\n`);
+    console.log(`    x-mnemom-agent: ${name}\n`);
     if (selectedProvider === "anthropic") {
       console.log(`  Python:     client = Anthropic(base_url="${config.gateway}/anthropic",`);
-      console.log(`                  default_headers={"x-smoltbot-agent": "${name}"})`);
+      console.log(`                  default_headers={"x-mnemom-agent": "${name}"})`);
       console.log(`  TypeScript: new Anthropic({ baseURL: "${config.gateway}/anthropic",`);
-      console.log(`                  defaultHeaders: { "x-smoltbot-agent": "${name}" } })`);
+      console.log(`                  defaultHeaders: { "x-mnemom-agent": "${name}" } })`);
     } else if (selectedProvider === "openai") {
       console.log(`  Python:     client = OpenAI(base_url="${config.gateway}/openai/v1",`);
-      console.log(`                  default_headers={"x-smoltbot-agent": "${name}"})`);
+      console.log(`                  default_headers={"x-mnemom-agent": "${name}"})`);
       console.log(`  TypeScript: new OpenAI({ baseURL: "${config.gateway}/openai/v1",`);
-      console.log(`                  defaultHeaders: { "x-smoltbot-agent": "${name}" } })`);
+      console.log(`                  defaultHeaders: { "x-mnemom-agent": "${name}" } })`);
     } else {
-      console.log(`  Add header: x-smoltbot-agent: ${name}`);
+      console.log(`  Add header: x-mnemom-agent: ${name}`);
       console.log(`  Endpoint:   ${config.gateway}/gemini/v1beta/models/{model}:generateContent`);
     }
   }
 
   console.log();
-  console.log(`  smoltbot status --agent ${name}    Check status`);
-  console.log(`  smoltbot agents                    List all agents`);
+  console.log(`  mnemom status --agent ${name}    Check status`);
+  console.log(`  mnemom agents                    List all agents`);
   console.log();
   console.log(`  Dashboard: ${DASHBOARD_URL}/agents/${agentId}\n`);
 }
@@ -340,7 +372,7 @@ async function testGatewayCall(
   apiKey: string,
   mnemomApiKey?: string,
 ): Promise<GatewayTestResult> {
-  const agentHeader = { "x-smoltbot-agent": agentName };
+  const agentHeader = { "x-mnemom-agent": agentName };
 
   try {
     let url: string;

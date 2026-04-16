@@ -21,7 +21,7 @@ export async function integrityCommand(agentName?: string): Promise<void> {
     console.log(`  ${fmt.label("Updated:   ", integrity.last_updated)}`);
 
     if (integrity.violations > 0) {
-      console.log("\n" + fmt.warn("You have integrity violations. Run `smoltbot logs` to investigate.") + "\n");
+      console.log("\n" + fmt.warn("You have integrity violations. Run `mnemom logs` to investigate.") + "\n");
     } else if (integrity.total_traces === 0) {
       console.log("\nNo traces recorded yet. Start using Claude to build your integrity score.\n");
     } else {

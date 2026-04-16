@@ -6,7 +6,7 @@ import { statusCommand } from "./commands/status.js";
 import { integrityCommand } from "./commands/integrity.js";
 import { logsCommand } from "./commands/logs.js";
 import { licenseActivateCommand, licenseStatusCommand, licenseDeactivateCommand } from "./commands/license.js";
-import { cardShowCommand, cardPublishCommand, cardValidateCommand } from "./commands/card.js";
+import { cardShowCommand, cardPublishCommand, cardValidateCommand, cardEditCommand, cardEvaluateCommand } from "./commands/card.js";
 import {
   policyInitCommand,
   policyValidateCommand,
@@ -15,6 +15,7 @@ import {
   policyTestCommand,
   policyEvaluateCommand,
 } from "./commands/policy.js";
+import { protectionShowCommand, protectionPublishCommand, protectionValidateCommand, protectionEditCommand } from "./commands/protection.js";
 import { registerCommand } from "./commands/register.js";
 import { agentsListCommand, agentsRemoveCommand, agentsAddCommand, agentsDefaultCommand, agentsRekeyCommand, agentsCheckBindingCommand } from "./commands/agents.js";
 import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
@@ -22,25 +23,20 @@ import { makeMigrateConfigCommand } from "./commands/migrate-config.js";
 
 program
   .name("mnemom")
-  .description("Transparent AI agent tracing - AAP compliant")
-  .version("0.6.0")
-  .option("--agent <name>", "Select agent by name");
+  .description("Transparent AI agent tracing")
+  .version("0.8.0")
+  .option("--agent <name>", "Select agent by name (or set MNEMOM_AGENT)");
 
 program
   .command("init")
-  .description("Initialize smoltbot for traced mode (interactive, --openclaw, or --standalone)")
-  .option("-y, --yes", "Skip confirmation prompts (accept defaults)")
-  .option("-f, --force", "Force reconfiguration even if already configured")
-  .option("--openclaw", "Configure using OpenClaw (requires OpenClaw installed)")
-  .option("--standalone", "Configure standalone (prompt for API keys directly)")
+  .description("(removed) Use `mnemom register <name>` instead")
+  .option("-y, --yes", "Skip confirmation prompts")
+  .option("-f, --force", "Force reconfiguration")
+  .option("--openclaw", "Configure using OpenClaw")
+  .option("--standalone", "Configure standalone")
   .action(async (options) => {
     try {
-      await initCommand({
-        yes: options.yes,
-        force: options.force,
-        openclaw: options.openclaw,
-        standalone: options.standalone,
-      });
+      await initCommand(options);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
@@ -128,13 +124,17 @@ license
     }
   });
 
+// ============================================================================
+// Card commands (alignment card)
+// ============================================================================
+
 const cardCmd = program
   .command("card")
   .description("Manage alignment card");
 
 cardCmd
   .command("show")
-  .description("Display active alignment card")
+  .description("Display alignment card (YAML)")
   .action(async () => {
     try {
       const opts = program.opts();
@@ -146,9 +146,22 @@ cardCmd
   });
 
 cardCmd
+  .command("edit")
+  .description("Edit alignment card in $EDITOR")
+  .action(async () => {
+    try {
+      const opts = program.opts();
+      await cardEditCommand(opts.agent);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+cardCmd
   .command("publish")
-  .argument("<file>", "Path to card JSON file")
-  .description("Publish alignment card from JSON file")
+  .argument("<file>", "Path to alignment card file (YAML or JSON)")
+  .description("Publish alignment card")
   .action(async (file: string) => {
     try {
       const opts = program.opts();
@@ -161,8 +174,8 @@ cardCmd
 
 cardCmd
   .command("validate")
-  .argument("<file>", "Path to card JSON file")
-  .description("Validate card JSON locally")
+  .argument("<file>", "Path to alignment card file (YAML or JSON)")
+  .description("Validate alignment card locally")
   .action(async (file: string) => {
     try {
       await cardValidateCommand(file);
@@ -172,93 +185,143 @@ cardCmd
     }
   });
 
-const policyCmd = program
-  .command("policy")
-  .description("Manage policy engine");
+cardCmd
+  .command("evaluate")
+  .argument("<file>", "Path to alignment card file (YAML or JSON)")
+  .option("--tools <tools>", "Comma-separated list of tool names")
+  .option("--tool-manifest <file>", "Path to tool manifest JSON file")
+  .option("--strict", "Exit with code 1 on warnings (not just failures)")
+  .description("Evaluate card policy against tools locally (for CI/CD)")
+  .action(async (file: string, options: { tools?: string; toolManifest?: string; strict?: boolean }) => {
+    try {
+      await cardEvaluateCommand(file, options);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
 
-policyCmd
-  .command("init")
-  .description("Scaffold a policy.json template")
+// ============================================================================
+// Protection card commands
+// ============================================================================
+
+const protectionCmd = program
+  .command("protection")
+  .description("Manage protection card");
+
+protectionCmd
+  .command("show")
+  .description("Display protection card (YAML)")
   .action(async () => {
     try {
-      await policyInitCommand();
+      const opts = program.opts();
+      await protectionShowCommand(opts.agent);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
     }
   });
 
-policyCmd
-  .command("validate")
-  .argument("<file>", "Path to policy JSON file")
-  .description("Validate policy locally")
-  .action(async (file: string) => {
+protectionCmd
+  .command("edit")
+  .description("Edit protection card in $EDITOR")
+  .action(async () => {
     try {
-      await policyValidateCommand(file);
+      const opts = program.opts();
+      await protectionEditCommand(opts.agent);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
     }
   });
 
-policyCmd
+protectionCmd
   .command("publish")
-  .argument("<file>", "Path to policy JSON file")
-  .description("Validate and publish policy to API")
+  .argument("<file>", "Path to protection card file (YAML or JSON)")
+  .description("Publish protection card")
   .action(async (file: string) => {
     try {
       const opts = program.opts();
-      await policyPublishCommand(file, opts.agent);
+      await protectionPublishCommand(file, opts.agent);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
     }
+  });
+
+protectionCmd
+  .command("validate")
+  .argument("<file>", "Path to protection card file (YAML or JSON)")
+  .description("Validate protection card locally")
+  .action(async (file: string) => {
+    try {
+      await protectionValidateCommand(file);
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+// ============================================================================
+// Policy commands (removed — stubs with migration guidance)
+// ============================================================================
+
+const policyCmd = program
+  .command("policy")
+  .description("(removed) Policy is now part of the alignment card");
+
+policyCmd
+  .command("init")
+  .description("(removed) Use `mnemom card validate`")
+  .action(async () => { await policyInitCommand(); });
+
+policyCmd
+  .command("validate")
+  .argument("<file>", "Path to policy file")
+  .description("(removed) Use `mnemom card validate`")
+  .action(async (file: string) => { await policyValidateCommand(file); });
+
+policyCmd
+  .command("publish")
+  .argument("<file>", "Path to policy file")
+  .description("(removed) Use `mnemom card publish`")
+  .action(async (file: string) => {
+    const opts = program.opts();
+    await policyPublishCommand(file, opts.agent);
   });
 
 policyCmd
   .command("list")
-  .description("List active policy for current agent")
+  .description("(removed) Use `mnemom card show`")
   .action(async () => {
-    try {
-      const opts = program.opts();
-      await policyListCommand(opts.agent);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
+    const opts = program.opts();
+    await policyListCommand(opts.agent);
   });
 
 policyCmd
   .command("test")
-  .argument("<file>", "Path to policy JSON file")
-  .option("--against-traces", "Test against historical traces")
-  .description("Dry-run policy against historical traces")
+  .argument("<file>", "Path to policy file")
+  .description("(removed) Use `mnemom card evaluate`")
   .action(async (file: string) => {
-    try {
-      const opts = program.opts();
-      await policyTestCommand(file, opts.agent);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
+    const opts = program.opts();
+    await policyTestCommand(file, opts.agent);
   });
 
 policyCmd
   .command("evaluate")
-  .argument("<file>", "Path to policy JSON file")
-  .option("--card <file>", "Path to alignment card JSON file")
+  .argument("<file>", "Path to policy file")
+  .option("--card <file>", "Path to card file")
   .option("--tools <tools>", "Comma-separated list of tool names")
   .option("--tool-manifest <file>", "Path to tool manifest JSON file")
-  .option("--strict", "Exit with code 1 on warnings (not just failures)")
-  .description("Evaluate policy against tools locally (for CI/CD)")
+  .option("--strict", "Exit with code 1 on warnings")
+  .description("(removed) Use `mnemom card evaluate`")
   .action(async (file: string, options: { card?: string; tools?: string; toolManifest?: string; strict?: boolean }) => {
-    try {
-      await policyEvaluateCommand(file, options);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
+    await policyEvaluateCommand(file, options);
   });
+
+// ============================================================================
+// Agent management
+// ============================================================================
 
 program
   .command("register <name>")
@@ -353,6 +416,10 @@ agentsCmd
       process.exit(1);
     }
   });
+
+// ============================================================================
+// Auth
+// ============================================================================
 
 program
   .command("login")

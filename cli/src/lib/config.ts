@@ -4,8 +4,70 @@ import * as os from "node:os";
 import * as crypto from "node:crypto";
 import type { AgentListItem } from "./api.js";
 
-export const CONFIG_DIR = path.join(os.homedir(), ".smoltbot");
+export const CONFIG_DIR = path.join(os.homedir(), ".mnemom");
 export const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+
+// Legacy config path — auto-migrated on first run (UC-9)
+export const LEGACY_CONFIG_DIR = path.join(os.homedir(), ".smoltbot");
+const LEGACY_CONFIG_FILE = path.join(LEGACY_CONFIG_DIR, "config.json");
+
+// ---------------------------------------------------------------------------
+// Env var deprecation helper
+// ---------------------------------------------------------------------------
+
+const _warnedEnvVars = new Set<string>();
+
+/**
+ * Read an env var with fallback to a deprecated name.
+ * Prints a one-time stderr warning when the legacy name is used.
+ */
+export function envWithDeprecation(newName: string, legacyName: string): string | undefined {
+  const val = process.env[newName];
+  if (val !== undefined) return val;
+
+  const legacy = process.env[legacyName];
+  if (legacy !== undefined) {
+    if (!_warnedEnvVars.has(legacyName)) {
+      _warnedEnvVars.add(legacyName);
+      console.error(`Warning: ${legacyName} is deprecated, use ${newName} instead`);
+    }
+    return legacy;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Config directory migration (~/.smoltbot → ~/.mnemom)
+// ---------------------------------------------------------------------------
+
+let _migrationChecked = false;
+
+/**
+ * Auto-migrate config from ~/.smoltbot/ to ~/.mnemom/ on first run.
+ * Copies config.json and models-cache.json if present.
+ * Does NOT delete the old directory.
+ */
+export function migrateConfigDir(): void {
+  if (_migrationChecked) return;
+  _migrationChecked = true;
+
+  // Only migrate if old exists and new does not
+  if (!fs.existsSync(LEGACY_CONFIG_FILE) || fs.existsSync(CONFIG_FILE)) return;
+
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+
+  // Copy config.json
+  fs.copyFileSync(LEGACY_CONFIG_FILE, CONFIG_FILE);
+
+  // Copy models-cache.json if present
+  const legacyCache = path.join(LEGACY_CONFIG_DIR, "models-cache.json");
+  const newCache = path.join(CONFIG_DIR, "models-cache.json");
+  if (fs.existsSync(legacyCache)) {
+    fs.copyFileSync(legacyCache, newCache);
+  }
+
+  console.error("Migrated config from ~/.smoltbot/ to ~/.mnemom/");
+}
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -35,11 +97,12 @@ const WEBSITE_URLS: Record<Environment, string> = {
  * Resolve the active environment.
  *
  * Resolution order:
- *  1. `SMOLTBOT_ENV` environment variable
- *  2. Defaults to `production`
+ *  1. `MNEMOM_ENV` environment variable (preferred)
+ *  2. `SMOLTBOT_ENV` (deprecated fallback)
+ *  3. Defaults to `production`
  */
 export function getEnvironment(): Environment {
-  const env = process.env.SMOLTBOT_ENV;
+  const env = envWithDeprecation("MNEMOM_ENV", "SMOLTBOT_ENV");
   if (env === "staging" || env === "local") return env;
   return "production";
 }
@@ -139,10 +202,13 @@ export function configExists(): boolean {
 
 /**
  * Load the config file.
+ * Auto-migrates ~/.smoltbot/ → ~/.mnemom/ on first call.
  * If the file is v1 (no `version` field), it is automatically migrated to v2
  * and written back to disk before returning.
  */
 export function loadConfig(): ConfigV2 | null {
+  migrateConfigDir();
+
   if (!configExists()) {
     return null;
   }
@@ -192,10 +258,10 @@ export function saveConfig(config: ConfigV2): void {
  *
  * Resolution order:
  *  1. Explicit `agentName` parameter (--agent flag)
- *  2. `SMOLTBOT_AGENT` environment variable
+ *  2. `MNEMOM_AGENT` env var (preferred) or `SMOLTBOT_AGENT` (deprecated)
  *
  * Returns `null` if no agent is specified or the agent is not found.
- * Callers must require --agent or SMOLTBOT_AGENT for agent-scoped commands.
+ * Callers must require --agent or MNEMOM_AGENT for agent-scoped commands.
  */
 export function getActiveAgent(agentName?: string): AgentConfig | null {
   const config = loadConfig();
@@ -205,7 +271,7 @@ export function getActiveAgent(agentName?: string): AgentConfig | null {
 
   const name =
     agentName ??
-    process.env.SMOLTBOT_AGENT;
+    envWithDeprecation("MNEMOM_AGENT", "SMOLTBOT_AGENT");
 
   if (!name) {
     return null;
@@ -216,15 +282,15 @@ export function getActiveAgent(agentName?: string): AgentConfig | null {
 
 /**
  * Require an explicit agent selection. Exits with a helpful error if
- * no agent was specified via --agent or SMOLTBOT_AGENT.
+ * no agent was specified via --agent or MNEMOM_AGENT.
  *
  * Falls back to API lookup if the agent is not in local config:
- *  - smolt-XXXXXXXX IDs: public endpoint, no auth required
- *  - Names: authenticated account listing (requires `smoltbot login`)
+ *  - smolt-XXXXXXXX / mnm-UUID IDs: public endpoint, no auth required
+ *  - Names: authenticated account listing (requires `mnemom login`)
  */
 export async function requireAgent(agentName?: string): Promise<AgentConfig> {
   if (!configExists()) {
-    console.error("\nsmoltbot is not initialized. Run `smoltbot init` first.\n");
+    console.error("\nmnemom is not configured. Run `mnemom register <name>` first.\n");
     process.exit(1);
   }
 
@@ -232,10 +298,10 @@ export async function requireAgent(agentName?: string): Promise<AgentConfig> {
   const localAgent = getActiveAgent(agentName);
   if (localAgent) return localAgent;
 
-  const name = agentName ?? process.env.SMOLTBOT_AGENT;
+  const name = agentName ?? envWithDeprecation("MNEMOM_AGENT", "SMOLTBOT_AGENT");
 
   if (!name) {
-    console.error("\nAgent required. Use --agent <name> or set SMOLTBOT_AGENT.\n");
+    console.error("\nAgent required. Use --agent <name> or set MNEMOM_AGENT.\n");
     console.error("Available agents:");
     const config = loadConfig();
     if (config) {
@@ -252,7 +318,7 @@ export async function requireAgent(agentName?: string): Promise<AgentConfig> {
     const { getAgent, getAgentByName } = await import("./api.js");
     let found: AgentListItem | { id: string; created_at: string } | null = null;
 
-    if (/^smolt-[0-9a-f]{8}$/.test(name)) {
+    if (/^(smolt-[0-9a-f]{8}|mnm-[0-9a-f-]{36})$/.test(name)) {
       // Public endpoint — no auth needed
       found = await getAgent(name);
     } else {
@@ -272,8 +338,8 @@ export async function requireAgent(agentName?: string): Promise<AgentConfig> {
   }
 
   console.error(`\nAgent not found: ${name}`);
-  console.error(`Run \`smoltbot agents add ${name}\` to register it locally,`);
-  console.error(`or check \`smoltbot agents\` to see agents in your account.\n`);
+  console.error(`Run \`mnemom agents add ${name}\` to register it locally,`);
+  console.error(`or check \`mnemom agents\` to see agents in your account.\n`);
   process.exit(1);
 }
 
@@ -325,7 +391,7 @@ export function deriveAgentIdWithName(apiKey: string, name: string): string {
 export function saveAuthTokens(tokens: AuthTokens): void {
   const config = loadConfig();
   if (!config) {
-    throw new Error("Config not initialized. Run `smoltbot init` first.");
+    throw new Error("Config not initialized. Run `mnemom register <name>` first.");
   }
   config.auth = tokens;
   saveConfig(config);

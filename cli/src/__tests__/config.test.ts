@@ -45,12 +45,12 @@ describe("config", () => {
   });
 
   describe("CONFIG_DIR and CONFIG_FILE", () => {
-    it("should set CONFIG_DIR to ~/.smoltbot", () => {
-      expect(CONFIG_DIR).toBe("/home/testuser/.smoltbot");
+    it("should set CONFIG_DIR to ~/.mnemom", () => {
+      expect(CONFIG_DIR).toBe("/home/testuser/.mnemom");
     });
 
-    it("should set CONFIG_FILE to ~/.smoltbot/config.json", () => {
-      expect(CONFIG_FILE).toBe("/home/testuser/.smoltbot/config.json");
+    it("should set CONFIG_FILE to ~/.mnemom/config.json", () => {
+      expect(CONFIG_FILE).toBe("/home/testuser/.mnemom/config.json");
     });
   });
 
@@ -325,7 +325,7 @@ describe("config", () => {
 
       expect(fs.renameSync).toHaveBeenCalledWith(
         expect.any(String),
-        "/home/testuser/.smoltbot/config.json"
+        "/home/testuser/.mnemom/config.json"
       );
     });
 

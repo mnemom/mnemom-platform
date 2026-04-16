@@ -36,18 +36,18 @@ const AIP_SUPPORT: Record<Provider, string> = {
 };
 
 export async function statusCommand(agentName?: string): Promise<void> {
-  console.log(fmt.header("smoltbot status"));
+  console.log(fmt.header("mnemom status"));
   console.log();
 
   const checks: StatusCheckResult[] = [];
 
-  // 1. Check smoltbot config
+  // 1. Check mnemom config
   const configCheck = checkSmoltbotConfig();
   checks.push(configCheck);
 
   if (configCheck.status === "error") {
     printChecks(checks);
-    console.log("\nRun `smoltbot init` to get started.\n");
+    console.log("\nRun `mnemom register <name>` to get started.\n");
     process.exit(1);
   }
 
@@ -108,7 +108,7 @@ export async function statusCommand(agentName?: string): Promise<void> {
       console.log("  Status: Traced mode NOT ACTIVE");
       if (modelId) {
         const detectedProvider = detectProvider(modelId);
-        const configKey = detectedProvider ? PROVIDER_CONFIG_KEYS[detectedProvider] : "smoltbot";
+        const configKey = detectedProvider ? PROVIDER_CONFIG_KEYS[detectedProvider] : "mnemom";
         console.log(`\n  To enable: openclaw models set ${configKey}/${modelId}`);
       }
     }
@@ -144,26 +144,26 @@ export async function statusCommand(agentName?: string): Promise<void> {
 function checkSmoltbotConfig(): StatusCheckResult {
   if (!configExists()) {
     return {
-      name: "Smoltbot Config",
+      name: "Mnemom Config",
       status: "error",
       message: "Not initialized",
-      details: "Run `smoltbot init` to configure",
+      details: "Run `mnemom register <name>` to configure",
     };
   }
 
   const config = loadConfig();
   if (!config) {
     return {
-      name: "Smoltbot Config",
+      name: "Mnemom Config",
       status: "error",
       message: "Config file corrupted",
-      details: "Delete ~/.smoltbot/config.json and run `smoltbot init`",
+      details: "Delete ~/.mnemom/config.json and run `mnemom register <name>`",
     };
   }
 
   const defaultAgent = config.agents[config.defaultAgent];
   return {
-    name: "Smoltbot Config",
+    name: "Mnemom Config",
     status: "ok",
     message: `Agent ID: ${defaultAgent?.agentId ?? "unknown"}`,
   };
@@ -187,7 +187,7 @@ function checkOpenClawConfig(): StatusCheckResult {
         name: "OpenClaw",
         status: "error",
         message: "OAuth auth (not supported)",
-        details: "smoltbot requires API key authentication",
+        details: "mnemom requires API key authentication",
       };
     }
 
@@ -214,15 +214,15 @@ function checkOpenClawConfig(): StatusCheckResult {
     return {
       name: "OpenClaw",
       status: "warning",
-      message: "smoltbot provider not configured",
-      details: "Run `smoltbot init` to configure",
+      message: "mnemom provider not configured",
+      details: "Run `mnemom register <name>` to configure",
     };
   }
 
   return {
     name: "OpenClaw",
     status: "ok",
-    message: "smoltbot provider configured",
+    message: "mnemom provider configured",
   };
 }
 
@@ -249,7 +249,7 @@ function checkConfiguredProviders(): StatusCheckResult[] {
         name: `${PROVIDER_LABELS[provider]}`,
         status: "warning",
         message: "API key found but not configured",
-        details: "Run `smoltbot init` to configure",
+        details: "Run `mnemom register <name>` to configure",
       });
     }
     // Don't show providers without keys (too noisy)
@@ -266,7 +266,7 @@ function checkCurrentModel(): StatusCheckResult {
       name: "Current Model",
       status: "warning",
       message: "No default model set",
-      details: "Run `openclaw models set smoltbot/<model>`",
+      details: "Run `openclaw models set mnemom/<model>`",
     };
   }
 
@@ -282,7 +282,7 @@ function checkCurrentModel(): StatusCheckResult {
     name: "Current Model",
     status: "warning",
     message: `${fullPath} (not traced)`,
-    details: `Switch with: openclaw models set smoltbot/${modelId}`,
+    details: `Switch with: openclaw models set mnemom/${modelId}`,
   };
 }
 

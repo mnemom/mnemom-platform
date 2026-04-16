@@ -6,8 +6,8 @@ import { askInput } from "../lib/prompt.js";
 export async function agentsListCommand(): Promise<void> {
   const config = loadConfig();
   if (!config) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
+    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
+    console.log("Run `mnemom register <name>` to get started.\n");
     process.exit(1);
   }
 
@@ -76,13 +76,13 @@ export async function agentsListCommand(): Promise<void> {
 export async function agentsDefaultCommand(name: string): Promise<void> {
   const config = loadConfig();
   if (!config) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
+    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
     process.exit(1);
   }
 
   if (!config.agents[name]) {
     console.log(fmt.error(`Agent "${name}" is not registered locally.`) + "\n");
-    console.log(`Run \`smoltbot agents add ${name}\` to register it first.\n`);
+    console.log(`Run \`mnemom agents add ${name}\` to register it first.\n`);
     process.exit(1);
   }
 
@@ -94,14 +94,14 @@ export async function agentsDefaultCommand(name: string): Promise<void> {
 }
 
 /**
- * smoltbot agents add <name-or-id> [--alias <alias>]
+ * mnemom agents add <name-or-id> [--alias <alias>]
  * Register an existing API agent in the local config.
  */
 export async function agentsAddCommand(nameOrId: string, alias?: string): Promise<void> {
   const config = loadConfig();
   if (!config) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
+    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
+    console.log("Run `mnemom register <name>` to get started.\n");
     process.exit(1);
   }
 
@@ -119,7 +119,7 @@ export async function agentsAddCommand(nameOrId: string, alias?: string): Promis
       const a = await getAgentByName(nameOrId);
       if (!a) {
         console.log(fmt.error(`Agent not found: ${nameOrId}`) + "\n");
-        console.log("Run `smoltbot agents` to see agents in your account.\n");
+        console.log("Run `mnemom agents` to see agents in your account.\n");
         process.exit(1);
       }
       agentId = a.id;
@@ -157,7 +157,7 @@ export async function agentsAddCommand(nameOrId: string, alias?: string): Promis
 export async function agentsRemoveCommand(name: string): Promise<void> {
   const config = loadConfig();
   if (!config) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
+    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
     process.exit(1);
   }
 
@@ -169,7 +169,7 @@ export async function agentsRemoveCommand(name: string): Promise<void> {
 
   if (name === "default" && Object.keys(config.agents).length === 1) {
     console.log(fmt.error("Cannot remove the only agent") + "\n");
-    console.log("Register another agent first with `smoltbot register <name>`.\n");
+    console.log("Register another agent first with `mnemom register <name>`.\n");
     process.exit(1);
   }
 
@@ -189,15 +189,15 @@ export async function agentsRemoveCommand(name: string): Promise<void> {
 }
 
 /**
- * smoltbot agents rekey [agent-name]
+ * mnemom agents rekey [agent-name]
  * Re-bind a claimed agent to a new provider API key.
  * The raw key is hashed locally (SHA-256) and never transmitted.
  */
 export async function agentsRekeyCommand(name?: string): Promise<void> {
   const config = loadConfig();
   if (!config) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
+    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
+    console.log("Run `mnemom register <name>` to get started.\n");
     process.exit(1);
   }
 
@@ -263,7 +263,7 @@ export async function agentsRekeyCommand(name?: string): Promise<void> {
       console.log(`  Shadow agent ID: ${shadowId}`);
       console.log("  Steps to resolve:");
       console.log("    1. Open the Mnemom dashboard and deactivate the shadow agent.");
-      console.log("    2. Run `smoltbot agents rekey` again.\n");
+      console.log("    2. Run `mnemom agents rekey` again.\n");
       console.log("  Or visit: https://www.mnemom.ai/docs/guides/agent-key-rotation\n");
     } else {
       console.log(fmt.error(msg) + "\n");
@@ -283,8 +283,8 @@ export async function agentsRekeyCommand(name?: string): Promise<void> {
 export async function agentsCheckBindingCommand(name?: string): Promise<void> {
   const config = loadConfig();
   if (!config) {
-    console.log('\n' + fmt.error('smoltbot is not initialized') + '\n');
-    console.log('Run `smoltbot init` to get started.\n');
+    console.log('\n' + fmt.error('mnemom is not configured') + '\n');
+    console.log('Run `mnemom register <name>` to get started.\n');
     process.exit(1);
   }
 

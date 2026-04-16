@@ -25,7 +25,7 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
 export async function licenseActivateCommand(jwt: string): Promise<void> {
   if (!jwt || jwt.trim() === "") {
     console.error("Error: License JWT is required");
-    console.error("Usage: smoltbot license activate <jwt>");
+    console.error("Usage: mnemom license activate <jwt>");
     process.exit(1);
   }
 
@@ -75,7 +75,7 @@ export async function licenseActivateCommand(jwt: string): Promise<void> {
   // Store in config
   const config = loadConfig();
   if (!config) {
-    console.log("No configuration found. Run 'smoltbot init' first.");
+    console.log("No mnemom configuration found. Run 'mnemom register <name>' first.");
     process.exit(1);
   }
   config.licenseJwt = jwt;
@@ -97,14 +97,14 @@ export async function licenseActivateCommand(jwt: string): Promise<void> {
 
 export async function licenseStatusCommand(): Promise<void> {
   if (!configExists()) {
-    console.error("Error: No smoltbot configuration found. Run 'smoltbot init' first.");
+    console.error("Error: No mnemom configuration found. Run 'mnemom register <name>' first.");
     process.exit(1);
   }
 
   const config = loadConfig();
   if (!config?.licenseJwt) {
     console.log("\nNo enterprise license configured.");
-    console.log("Use 'smoltbot license activate <jwt>' to activate a license.\n");
+    console.log("Use 'mnemom license activate <jwt>' to activate a license.\n");
     return;
   }
 
@@ -140,7 +140,7 @@ export async function licenseStatusCommand(): Promise<void> {
 
 export async function licenseDeactivateCommand(): Promise<void> {
   if (!configExists()) {
-    console.error("Error: No smoltbot configuration found.");
+    console.error("Error: No mnemom configuration found.");
     process.exit(1);
   }
 
