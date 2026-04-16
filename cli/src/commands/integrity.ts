@@ -1,14 +1,14 @@
-import { requireAgent } from "../lib/config.js";
+import { resolveAgentId } from "../lib/api.js";
 import { getIntegrity } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
 export async function integrityCommand(agentName?: string): Promise<void> {
-  const agent = await requireAgent(agentName);
+  const agentId = await resolveAgentId(agentName);
 
   console.log("\nFetching integrity score...\n");
 
   try {
-    const integrity = await getIntegrity(agent.agentId);
+    const integrity = await getIntegrity(agentId);
 
     const scorePercent = (integrity.score * 100).toFixed(1);
     const scoreBar = generateScoreBar(integrity.score);
@@ -21,7 +21,7 @@ export async function integrityCommand(agentName?: string): Promise<void> {
     console.log(`  ${fmt.label("Updated:   ", integrity.last_updated)}`);
 
     if (integrity.violations > 0) {
-      console.log("\n" + fmt.warn("You have integrity violations. Run `smoltbot logs` to investigate.") + "\n");
+      console.log("\n" + fmt.warn("You have integrity violations. Run `mnemom logs` to investigate.") + "\n");
     } else if (integrity.total_traces === 0) {
       console.log("\nNo traces recorded yet. Start using Claude to build your integrity score.\n");
     } else {
@@ -47,8 +47,8 @@ export async function integrityCommand(agentName?: string): Promise<void> {
 function generateScoreBar(score: number): string {
   const filled = Math.round(score * 10);
   const empty = 10 - filled;
-  const filledChar = "█";
-  const emptyChar = "░";
+  const filledChar = "\u2588";
+  const emptyChar = "\u2591";
 
   return `[${filledChar.repeat(filled)}${emptyChar.repeat(empty)}]`;
 }

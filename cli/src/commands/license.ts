@@ -1,4 +1,4 @@
-import { loadConfig, saveConfig, configExists } from "../lib/config.js";
+import { getLicenseJwt, saveLicenseJwt, clearLicenseJwt } from "../lib/auth.js";
 import { API_BASE } from "../lib/api.js";
 import { fmt } from "../lib/format.js";
 
@@ -25,7 +25,7 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
 export async function licenseActivateCommand(jwt: string): Promise<void> {
   if (!jwt || jwt.trim() === "") {
     console.error("Error: License JWT is required");
-    console.error("Usage: smoltbot license activate <jwt>");
+    console.error("Usage: mnemom license activate <jwt>");
     process.exit(1);
   }
 
@@ -72,14 +72,8 @@ export async function licenseActivateCommand(jwt: string): Promise<void> {
     console.log("  License stored locally (offline mode).\n");
   }
 
-  // Store in config
-  const config = loadConfig();
-  if (!config) {
-    console.log("No configuration found. Run 'smoltbot init' first.");
-    process.exit(1);
-  }
-  config.licenseJwt = jwt;
-  saveConfig(config);
+  // Store in auth store
+  saveLicenseJwt(jwt);
 
   // Display info
   const expiresAt = claims.exp ? new Date((claims.exp as number) * 1000) : null;
@@ -96,19 +90,14 @@ export async function licenseActivateCommand(jwt: string): Promise<void> {
 }
 
 export async function licenseStatusCommand(): Promise<void> {
-  if (!configExists()) {
-    console.error("Error: No smoltbot configuration found. Run 'smoltbot init' first.");
-    process.exit(1);
-  }
-
-  const config = loadConfig();
-  if (!config?.licenseJwt) {
+  const licenseJwt = getLicenseJwt();
+  if (!licenseJwt) {
     console.log("\nNo enterprise license configured.");
-    console.log("Use 'smoltbot license activate <jwt>' to activate a license.\n");
+    console.log("Use 'mnemom license activate <jwt>' to activate a license.\n");
     return;
   }
 
-  const claims = decodeJwtPayload(config.licenseJwt);
+  const claims = decodeJwtPayload(licenseJwt);
   if (!claims) {
     console.error("Error: Stored license JWT is invalid");
     process.exit(1);
@@ -139,19 +128,14 @@ export async function licenseStatusCommand(): Promise<void> {
 }
 
 export async function licenseDeactivateCommand(): Promise<void> {
-  if (!configExists()) {
-    console.error("Error: No smoltbot configuration found.");
-    process.exit(1);
-  }
-
-  const config = loadConfig();
-  if (!config?.licenseJwt) {
+  const licenseJwt = getLicenseJwt();
+  if (!licenseJwt) {
     console.log("\nNo enterprise license to deactivate.\n");
     return;
   }
 
   // Try to deactivate via API
-  const claims = decodeJwtPayload(config.licenseJwt);
+  const claims = decodeJwtPayload(licenseJwt);
   if (claims) {
     try {
       const hostname = (await import("node:os")).hostname();
@@ -160,7 +144,7 @@ export async function licenseDeactivateCommand(): Promise<void> {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: sanitizeForHttp(JSON.stringify({
-          license: String(config.licenseJwt),
+          license: String(licenseJwt),
           instance_id: hostname,
           instance_metadata: { deactivating: true },
         })),
@@ -170,9 +154,8 @@ export async function licenseDeactivateCommand(): Promise<void> {
     }
   }
 
-  // Remove from config
-  delete config.licenseJwt;
-  saveConfig(config);
+  // Remove from auth store
+  clearLicenseJwt();
 
   console.log("\nLicense deactivated and removed from local configuration.\n");
 }

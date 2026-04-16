@@ -1,11 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 import type { ModelDefinition, Provider } from "./openclaw.js";
 import { MODEL_REGISTRY, getModelDefinition as getStaticModelDefinition, detectProvider, formatModelName } from "./models.js";
+import { MNEMOM_DIR } from "./config.js";
 
-const SMOLTBOT_DIR = path.join(os.homedir(), ".smoltbot");
-const CACHE_FILE = path.join(SMOLTBOT_DIR, "models-cache.json");
+const CACHE_FILE = path.join(MNEMOM_DIR, "models-cache.json");
 const MODELS_URL = "https://gateway.mnemom.ai/models.json";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -48,13 +47,13 @@ function saveCache(models: Record<Provider, Record<string, ModelDefinition>>): v
   }
 
   // Ensure directory exists
-  if (!fs.existsSync(SMOLTBOT_DIR)) {
-    fs.mkdirSync(SMOLTBOT_DIR, { recursive: true });
+  if (!fs.existsSync(MNEMOM_DIR)) {
+    fs.mkdirSync(MNEMOM_DIR, { recursive: true });
   }
 
   // Validate write path stays within expected directory
   const resolvedCachePath = path.resolve(CACHE_FILE);
-  if (!resolvedCachePath.startsWith(path.resolve(SMOLTBOT_DIR))) {
+  if (!resolvedCachePath.startsWith(path.resolve(MNEMOM_DIR))) {
     throw new Error("Cache file path escapes expected directory");
   }
 

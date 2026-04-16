@@ -1,32 +1,55 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// Mock config module before importing auth
+// Mock fs so loadAuthStore inside auth.ts is controllable
+vi.mock("node:fs");
+
+// Mock config.js — only the exports that still exist
 vi.mock("../lib/config.js", () => ({
   getApiUrl: () => "https://api.mnemom.ai",
   getWebsiteUrl: () => "https://mnemom.ai",
-  getAuthInfo: vi.fn(),
-  saveAuthTokens: vi.fn(),
-  loadConfig: vi.fn(),
+  MNEMOM_DIR: "/home/testuser/.mnemom",
 }));
 
+import * as fs from "node:fs";
 import {
   getAccessToken,
   getMnemomApiKey,
+  getAuthInfo,
   resolveAuth,
   requireAuth,
   type AuthCredential,
 } from "../lib/auth.js";
-import { getAuthInfo, loadConfig } from "../lib/config.js";
+
+/** Helper: make fs.existsSync/readFileSync return a stored auth file. */
+function mockAuthStore(store: {
+  auth?: {
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: number;
+    userId: string;
+    email: string;
+  };
+  licenseJwt?: string;
+} | null): void {
+  if (store === null) {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  } else {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(store));
+  }
+}
 
 describe("auth", () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
     process.env = { ...originalEnv };
+    delete process.env.MNEMOM_TOKEN;
     delete process.env.SMOLTBOT_TOKEN;
     delete process.env.MNEMOM_API_KEY;
-    vi.mocked(getAuthInfo).mockReturnValue(null);
-    vi.mocked(loadConfig).mockReturnValue(null);
+    vi.clearAllMocks();
+    // Default: no auth store on disk
+    mockAuthStore(null);
   });
 
   afterEach(() => {
@@ -40,48 +63,50 @@ describe("auth", () => {
       expect(getMnemomApiKey()).toBe("mnm_env_key_123");
     });
 
-    it("should return config mnemomApiKey when no env var", () => {
-      vi.mocked(loadConfig).mockReturnValue({
-        version: 2,
-        gateway: "https://gateway.mnemom.ai",
-        agents: {},
-        defaultAgent: "default",
-        mnemomApiKey: "mnm_config_key_456",
-      });
-      expect(getMnemomApiKey()).toBe("mnm_config_key_456");
-    });
-
-    it("should prefer env var over config", () => {
-      process.env.MNEMOM_API_KEY = "mnm_env_key";
-      vi.mocked(loadConfig).mockReturnValue({
-        version: 2,
-        gateway: "https://gateway.mnemom.ai",
-        agents: {},
-        defaultAgent: "default",
-        mnemomApiKey: "mnm_config_key",
-      });
-      expect(getMnemomApiKey()).toBe("mnm_env_key");
-    });
-
     it("should return null when nothing configured", () => {
       expect(getMnemomApiKey()).toBeNull();
     });
   });
 
+  describe("getAuthInfo", () => {
+    it("should return null when no auth store exists", () => {
+      mockAuthStore(null);
+      expect(getAuthInfo()).toBeNull();
+    });
+
+    it("should return stored tokens when auth store exists", () => {
+      mockAuthStore({
+        auth: {
+          accessToken: "stored_jwt",
+          refreshToken: "refresh",
+          expiresAt: Math.floor(Date.now() / 1000) + 3600,
+          userId: "user-1",
+          email: "test@test.com",
+        },
+      });
+      const info = getAuthInfo();
+      expect(info).not.toBeNull();
+      expect(info!.accessToken).toBe("stored_jwt");
+      expect(info!.email).toBe("test@test.com");
+    });
+  });
+
   describe("resolveAuth", () => {
-    it("should return JWT when SMOLTBOT_TOKEN is set", async () => {
-      process.env.SMOLTBOT_TOKEN = "jwt_token_123";
+    it("should return JWT when MNEMOM_TOKEN is set", async () => {
+      process.env.MNEMOM_TOKEN = "jwt_token_123";
       const cred = await resolveAuth();
       expect(cred).toEqual({ type: "jwt", token: "jwt_token_123" });
     });
 
     it("should return JWT from stored auth", async () => {
-      vi.mocked(getAuthInfo).mockReturnValue({
-        accessToken: "stored_jwt",
-        refreshToken: "refresh",
-        expiresAt: Math.floor(Date.now() / 1000) + 3600,
-        userId: "user-1",
-        email: "test@test.com",
+      mockAuthStore({
+        auth: {
+          accessToken: "stored_jwt",
+          refreshToken: "refresh",
+          expiresAt: Math.floor(Date.now() / 1000) + 3600,
+          userId: "user-1",
+          email: "test@test.com",
+        },
       });
       const cred = await resolveAuth();
       expect(cred).toEqual({ type: "jwt", token: "stored_jwt" });
@@ -93,25 +118,13 @@ describe("auth", () => {
       expect(cred).toEqual({ type: "api-key", key: "mnm_fallback_key" });
     });
 
-    it("should fall back to config API key", async () => {
-      vi.mocked(loadConfig).mockReturnValue({
-        version: 2,
-        gateway: "https://gateway.mnemom.ai",
-        agents: {},
-        defaultAgent: "default",
-        mnemomApiKey: "mnm_config_key",
-      });
-      const cred = await resolveAuth();
-      expect(cred).toEqual({ type: "api-key", key: "mnm_config_key" });
-    });
-
     it("should return none when nothing configured", async () => {
       const cred = await resolveAuth();
       expect(cred).toEqual({ type: "none" });
     });
 
     it("should prefer JWT over API key when both available", async () => {
-      process.env.SMOLTBOT_TOKEN = "jwt_token";
+      process.env.MNEMOM_TOKEN = "jwt_token";
       process.env.MNEMOM_API_KEY = "mnm_api_key";
       const cred = await resolveAuth();
       expect(cred.type).toBe("jwt");
@@ -120,7 +133,7 @@ describe("auth", () => {
 
   describe("requireAuth", () => {
     it("should return JWT credential when available", async () => {
-      process.env.SMOLTBOT_TOKEN = "jwt_token";
+      process.env.MNEMOM_TOKEN = "jwt_token";
       const cred = await requireAuth();
       expect(cred.type).toBe("jwt");
     });
@@ -140,7 +153,7 @@ describe("auth", () => {
       await expect(requireAuth()).rejects.toThrow("process.exit");
       expect(mockExit).toHaveBeenCalledWith(1);
       expect(mockError).toHaveBeenCalledWith(
-        "Authentication required. Run `smoltbot login` or set MNEMOM_API_KEY."
+        "Authentication required. Run `mnemom login` or set MNEMOM_API_KEY."
       );
 
       mockExit.mockRestore();

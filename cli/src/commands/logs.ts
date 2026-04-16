@@ -1,5 +1,5 @@
-import { requireAgent, loadConfig } from "../lib/config.js";
-import { getTraces, type Trace } from "../lib/api.js";
+import { resolveAgentId, getTraces, type Trace } from "../lib/api.js";
+import { getGatewayUrl } from "../lib/config.js";
 import { fmt } from "../lib/format.js";
 
 export interface LogsOptions {
@@ -8,22 +8,22 @@ export interface LogsOptions {
 }
 
 export async function logsCommand(options: LogsOptions = {}): Promise<void> {
-  const agent = await requireAgent(options.agentName);
-  const config = loadConfig()!;
+  const agentId = await resolveAgentId(options.agentName);
+  const gatewayUrl = getGatewayUrl();
 
   const limit = options.limit || 10;
 
   console.log("\nFetching traces...\n");
 
   try {
-    const traces = await getTraces(agent.agentId, limit);
+    const traces = await getTraces(agentId, limit);
 
     if (traces.length === 0) {
       console.log(fmt.header("No traces found"));
       console.log("\nStart using Claude to generate traces.\n");
       console.log("Make sure ANTHROPIC_BASE_URL is set correctly:\n");
       console.log(
-        `  export ANTHROPIC_BASE_URL="${config.gateway || "https://gateway.mnemon.ai"}/v1/proxy/${agent.agentId}"\n`
+        `  export ANTHROPIC_BASE_URL="${gatewayUrl}/v1/proxy/${agentId}"\n`
       );
       return;
     }
@@ -34,8 +34,8 @@ export async function logsCommand(options: LogsOptions = {}): Promise<void> {
       displayTrace(trace);
     }
 
-    console.log(`\nView more: smoltbot logs --limit ${limit + 10}`);
-    console.log(`Dashboard: https://mnemon.ai/dashboard/${agent.agentId}\n`);
+    console.log(`\nView more: mnemom logs --limit ${limit + 10}`);
+    console.log(`Dashboard: https://mnemon.ai/dashboard/${agentId}\n`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
 

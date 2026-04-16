@@ -1,15 +1,9 @@
-import { configExists, getAuthInfo, clearAuthTokens } from "../lib/config.js";
+import { getAuthInfo, clearAuthTokens } from "../lib/auth.js";
 import { loginWithBrowser, loginWithPassword } from "../lib/auth.js";
 import { fmt } from "../lib/format.js";
 import { askInput } from "../lib/prompt.js";
 
 export async function loginCommand(options: { noBrowser?: boolean } = {}): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("smoltbot is not initialized") + "\n");
-    console.log("Run `smoltbot init` to get started.\n");
-    process.exit(1);
-  }
-
   try {
     let tokens;
     if (options.noBrowser) {
@@ -51,7 +45,7 @@ export async function whoamiCommand(): Promise<void> {
   const auth = getAuthInfo();
 
   if (!auth) {
-    console.log("\nNot logged in. Run `smoltbot login` to authenticate.\n");
+    console.log("\nNot logged in. Run `mnemom login` to authenticate.\n");
     return;
   }
 

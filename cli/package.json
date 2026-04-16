@@ -1,7 +1,7 @@
 {
   "name": "@mnemom/mnemom",
-  "version": "0.7.2",
-  "description": "Transparent AI agent tracing - AAP compliant",
+  "version": "0.8.0",
+  "description": "Transparent AI agent tracing",
   "type": "module",
   "bin": {
     "mnemom": "./dist/index.js",

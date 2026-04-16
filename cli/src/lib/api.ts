@@ -142,7 +142,7 @@ export async function listAgents(): Promise<AgentListItem[]> {
   const response = await fetch(url, { headers: await authHeaders() });
   if (!response.ok) {
     if (response.status === 401) {
-      throw new Error("Not authenticated. Run `smoltbot login` or set MNEMOM_API_KEY.");
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
     }
     const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
     throw new Error(err.message || `Failed to list agents: ${response.status}`);
@@ -363,4 +363,165 @@ export async function testPolicyHistorical(
   }
 
   return response.json() as Promise<any>;
+}
+
+// ============================================================================
+// Unified Card API (UC-4+)
+// ============================================================================
+
+/**
+ * Fetch the canonical alignment card as YAML (or JSON fallback).
+ * Returns the raw response body as a string.
+ */
+export async function getAlignmentCard(
+  agentId: string,
+  format: "yaml" | "json" = "yaml",
+): Promise<{ body: string; contentType: string }> {
+  const accept = format === "yaml" ? "text/yaml" : "application/json";
+  const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/alignment-card`);
+  const response = await fetch(url, {
+    headers: { Accept: accept, ...(await authHeaders()) },
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      return { body: "", contentType: "" };
+    }
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `Failed to fetch alignment card: ${response.status}`);
+  }
+
+  const ct = response.headers.get("content-type") ?? "";
+  const body = await response.text();
+  return { body, contentType: ct };
+}
+
+/**
+ * Publish (create or update) an alignment card.
+ * Accepts YAML or JSON body; set contentType accordingly.
+ */
+export async function putAlignmentCard(
+  agentId: string,
+  body: string,
+  contentType: "text/yaml" | "application/json" = "text/yaml",
+): Promise<{ card_id: string; composed: boolean }> {
+  const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/alignment-card`);
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": contentType, ...(await authHeaders()) },
+    body: sanitizeForHttp(body),
+  });
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `Failed to publish alignment card: ${response.status}`);
+  }
+
+  return response.json() as Promise<{ card_id: string; composed: boolean }>;
+}
+
+/**
+ * Fetch the canonical protection card as YAML (or JSON fallback).
+ */
+export async function getProtectionCard(
+  agentId: string,
+  format: "yaml" | "json" = "yaml",
+): Promise<{ body: string; contentType: string }> {
+  const accept = format === "yaml" ? "text/yaml" : "application/json";
+  const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/protection-card`);
+  const response = await fetch(url, {
+    headers: { Accept: accept, ...(await authHeaders()) },
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      return { body: "", contentType: "" };
+    }
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `Failed to fetch protection card: ${response.status}`);
+  }
+
+  const ct = response.headers.get("content-type") ?? "";
+  const body = await response.text();
+  return { body, contentType: ct };
+}
+
+/**
+ * Publish (create or update) a protection card.
+ */
+export async function putProtectionCard(
+  agentId: string,
+  body: string,
+  contentType: "text/yaml" | "application/json" = "text/yaml",
+): Promise<{ card_id: string; composed: boolean }> {
+  const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/protection-card`);
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": contentType, ...(await authHeaders()) },
+    body: sanitizeForHttp(body),
+  });
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `Failed to publish protection card: ${response.status}`);
+  }
+
+  return response.json() as Promise<{ card_id: string; composed: boolean }>;
+}
+
+// ============================================================================
+// Agent Resolution (server-side, no local config)
+// ============================================================================
+
+/**
+ * Resolve an agent name or ID to a server agent ID.
+ *
+ * Resolution order:
+ *  1. Explicit agentName parameter (--agent flag)
+ *  2. MNEMOM_AGENT environment variable
+ *
+ * If the value looks like an agent ID (smolt-* or mnm-*), uses it directly.
+ * Otherwise resolves the name from the authenticated user's agent list.
+ */
+export async function resolveAgentId(agentName?: string): Promise<string> {
+  const name = agentName ?? process.env.MNEMOM_AGENT;
+
+  if (!name) {
+    console.error("\nAgent required. Use --agent <name> or set MNEMOM_AGENT.\n");
+    console.error("List your agents with: mnemom agents\n");
+    process.exit(1);
+  }
+
+  // If it looks like an agent ID, use directly (no server call needed)
+  if (/^(smolt-[0-9a-f]{8}|mnm-[0-9a-f-]{36})$/.test(name)) {
+    return name;
+  }
+
+  // Resolve name from server (requires auth)
+  try {
+    const agent = await getAgentByName(name);
+    if (agent) return agent.id;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("Not authenticated")) {
+      console.error(`\nNot authenticated. Run \`mnemom login\` first.\n`);
+      process.exit(1);
+    }
+  }
+
+  console.error(`\nAgent not found: ${name}`);
+  console.error("List your agents with: mnemom agents\n");
+  process.exit(1);
 }
