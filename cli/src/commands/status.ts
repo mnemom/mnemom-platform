@@ -1,10 +1,10 @@
-import { configExists, loadConfig, requireAgent, type AgentConfig } from "../lib/config.js";
-import { getAgent, getIntegrity, getTraces, API_BASE } from "../lib/api.js";
+import { getGatewayUrl } from "../lib/config.js";
+import { resolveAgentId, getAgent, getIntegrity, getTraces } from "../lib/api.js";
+import { isLoggedIn, getAuthInfo } from "../lib/auth.js";
 import {
   detectOpenClaw,
   detectProviders,
   getCurrentModel,
-  getSmoltbotProvider,
   getSmoltbotConfiguredProviders,
   PROVIDER_CONFIG_KEYS,
   type Provider,
@@ -13,7 +13,6 @@ import { formatModelName, detectProvider } from "../lib/models.js";
 import { refreshModelCache } from "../lib/model-cache.js";
 import { fmt } from "../lib/format.js";
 
-const GATEWAY_URL = "https://gateway.mnemom.ai";
 const DASHBOARD_URL = "https://mnemom.ai";
 
 interface StatusCheckResult {
@@ -41,18 +40,19 @@ export async function statusCommand(agentName?: string): Promise<void> {
 
   const checks: StatusCheckResult[] = [];
 
-  // 1. Check mnemom config
-  const configCheck = checkSmoltbotConfig();
-  checks.push(configCheck);
+  // 1. Check auth status
+  const authCheck = await checkAuthStatus();
+  checks.push(authCheck);
 
-  if (configCheck.status === "error") {
+  if (authCheck.status === "error") {
     printChecks(checks);
-    console.log("\nRun `mnemom register <name>` to get started.\n");
+    console.log("\nRun `mnemom login` to authenticate.\n");
     process.exit(1);
   }
 
-  const config = loadConfig()!;
-  const agent = await requireAgent(agentName);
+  // Resolve agent ID from server
+  const agentId = await resolveAgentId(agentName);
+  const gatewayUrl = getGatewayUrl();
 
   // 2. Check OpenClaw configuration
   const openclawCheck = checkOpenClawConfig();
@@ -67,11 +67,11 @@ export async function statusCommand(agentName?: string): Promise<void> {
   checks.push(modelCheck);
 
   // 5. Test gateway connectivity
-  const gatewayCheck = await checkGatewayConnectivity();
+  const gatewayCheck = await checkGatewayConnectivity(gatewayUrl);
   checks.push(gatewayCheck);
 
   // 6. Test API connectivity
-  const apiCheck = await checkApiConnectivity(agent.agentId);
+  const apiCheck = await checkApiConnectivity(agentId);
   checks.push(apiCheck);
 
   // Print all checks
@@ -81,19 +81,9 @@ export async function statusCommand(agentName?: string): Promise<void> {
   console.log(fmt.section("Configuration"));
   console.log();
 
-  console.log(fmt.label("Agent ID: ", agent.agentId));
-  console.log(fmt.label("Gateway:  ", config.gateway || GATEWAY_URL));
-  console.log(fmt.label("Dashboard:", ` ${DASHBOARD_URL}/agents/${agent.agentId}`));
-
-  if (config.mnemomApiKey) {
-    console.log(`Mnemom Key: [CONFIGURED] (billing enabled)`);
-  } else {
-    console.log(`Mnemom Key: Not configured (free tier)`);
-  }
-
-  if (agent.openclawConfigured) {
-    console.log(`Configured: ${agent.configuredAt || "yes"}`);
-  }
+  console.log(fmt.label("Agent ID: ", agentId));
+  console.log(fmt.label("Gateway:  ", gatewayUrl));
+  console.log(fmt.label("Dashboard:", ` ${DASHBOARD_URL}/agents/${agentId}`));
 
   // Show current model info
   const { fullPath, provider, modelId } = getCurrentModel();
@@ -119,7 +109,7 @@ export async function statusCommand(agentName?: string): Promise<void> {
 
   // Show trace summary if available
   if (apiCheck.status === "ok") {
-    await showTraceSummary(agent.agentId);
+    await showTraceSummary(agentId);
   }
 
   // Show overall status
@@ -141,31 +131,31 @@ export async function statusCommand(agentName?: string): Promise<void> {
   refreshModelCache().catch(() => {});
 }
 
-function checkSmoltbotConfig(): StatusCheckResult {
-  if (!configExists()) {
+async function checkAuthStatus(): Promise<StatusCheckResult> {
+  const loggedIn = await isLoggedIn();
+  if (!loggedIn) {
     return {
-      name: "Mnemom Config",
+      name: "Authentication",
       status: "error",
-      message: "Not initialized",
-      details: "Run `mnemom register <name>` to configure",
+      message: "Not authenticated",
+      details: "Run `mnemom login` or set MNEMOM_API_KEY",
     };
   }
 
-  const config = loadConfig();
-  if (!config) {
+  const auth = getAuthInfo();
+  if (auth) {
     return {
-      name: "Mnemom Config",
-      status: "error",
-      message: "Config file corrupted",
-      details: "Delete ~/.mnemom/config.json and run `mnemom register <name>`",
+      name: "Authentication",
+      status: "ok",
+      message: `Logged in as ${auth.email}`,
     };
   }
 
-  const defaultAgent = config.agents[config.defaultAgent];
+  // API key auth (no email available)
   return {
-    name: "Mnemom Config",
+    name: "Authentication",
     status: "ok",
-    message: `Agent ID: ${defaultAgent?.agentId ?? "unknown"}`,
+    message: "Authenticated via API key",
   };
 }
 
@@ -304,9 +294,9 @@ function showProviderSummary(): void {
   }
 }
 
-async function checkGatewayConnectivity(): Promise<StatusCheckResult> {
+async function checkGatewayConnectivity(gatewayUrl: string): Promise<StatusCheckResult> {
   try {
-    const response = await fetch(`${GATEWAY_URL}/health`, {
+    const response = await fetch(`${gatewayUrl}/health`, {
       signal: AbortSignal.timeout(5000),
     });
 

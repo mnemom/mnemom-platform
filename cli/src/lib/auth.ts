@@ -1,7 +1,98 @@
+/**
+ * Auth credential management.
+ *
+ * Stores auth tokens in ~/.mnemom/auth.json (UC-9: no more config.json).
+ * License JWTs are stored alongside auth tokens.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as http from "node:http";
 import * as crypto from "node:crypto";
 import { exec } from "node:child_process";
-import { getApiUrl, getWebsiteUrl, getAuthInfo, saveAuthTokens, loadConfig, envWithDeprecation, type AuthTokens } from "./config.js";
+import { getApiUrl, getWebsiteUrl, MNEMOM_DIR } from "./config.js";
+
+// ============================================================================
+// Auth Store (persisted to ~/.mnemom/auth.json)
+// ============================================================================
+
+const AUTH_FILE = path.join(MNEMOM_DIR, "auth.json");
+
+export interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;  // unix seconds
+  userId: string;
+  email: string;
+}
+
+export interface AuthStore {
+  auth?: AuthTokens;
+  licenseJwt?: string;
+}
+
+function loadAuthStore(): AuthStore | null {
+  try {
+    if (!fs.existsSync(AUTH_FILE)) return null;
+    const content = fs.readFileSync(AUTH_FILE, "utf-8");
+    return JSON.parse(content) as AuthStore;
+  } catch {
+    return null;
+  }
+}
+
+function saveAuthStore(store: AuthStore): void {
+  if (!fs.existsSync(MNEMOM_DIR)) {
+    fs.mkdirSync(MNEMOM_DIR, { recursive: true });
+  }
+  const resolvedPath = path.resolve(AUTH_FILE);
+  const sanitized = JSON.parse(JSON.stringify(store)) as AuthStore;
+  const tmpFile = `${resolvedPath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, JSON.stringify(sanitized, null, 2));
+  fs.renameSync(tmpFile, resolvedPath);
+}
+
+// ============================================================================
+// Auth token helpers
+// ============================================================================
+
+export function saveAuthTokens(tokens: AuthTokens): void {
+  const store = loadAuthStore() ?? {};
+  store.auth = tokens;
+  saveAuthStore(store);
+}
+
+export function clearAuthTokens(): void {
+  const store = loadAuthStore();
+  if (!store) return;
+  delete store.auth;
+  saveAuthStore(store);
+}
+
+export function getAuthInfo(): AuthTokens | null {
+  return loadAuthStore()?.auth ?? null;
+}
+
+// ============================================================================
+// License JWT helpers
+// ============================================================================
+
+export function saveLicenseJwt(jwt: string): void {
+  const store = loadAuthStore() ?? {};
+  store.licenseJwt = jwt;
+  saveAuthStore(store);
+}
+
+export function clearLicenseJwt(): void {
+  const store = loadAuthStore();
+  if (!store) return;
+  delete store.licenseJwt;
+  saveAuthStore(store);
+}
+
+export function getLicenseJwt(): string | null {
+  return loadAuthStore()?.licenseJwt ?? null;
+}
 
 // ============================================================================
 // Auth Credential Types
@@ -21,15 +112,13 @@ function sanitizeForHttp(data: string): string {
  * Get a valid access token, or null if not authenticated.
  *
  * Resolution order:
- *  1. MNEMOM_TOKEN env var (preferred) or SMOLTBOT_TOKEN (deprecated)
- *  2. Stored token from config (auto-refreshes if expired)
+ *  1. MNEMOM_TOKEN environment variable (CI / non-interactive)
+ *  2. Stored token from auth store (auto-refreshes if expired)
  */
 export async function getAccessToken(): Promise<string | null> {
-  // 1. Env var override (CI / non-interactive)
-  const envToken = envWithDeprecation("MNEMOM_TOKEN", "SMOLTBOT_TOKEN");
+  const envToken = process.env.MNEMOM_TOKEN;
   if (envToken) return envToken;
 
-  // 2. Stored token
   const auth = getAuthInfo();
   if (!auth) return null;
 
@@ -39,7 +128,7 @@ export async function getAccessToken(): Promise<string | null> {
     return auth.accessToken;
   }
 
-  // 3. Auto-refresh
+  // Auto-refresh
   const refreshed = await refreshAccessToken(auth.refreshToken);
   if (refreshed) return refreshed.accessToken;
 
@@ -59,18 +148,10 @@ export async function requireAccessToken(): Promise<string> {
 }
 
 /**
- * Get the Mnemom API key from env var or config.
- *
- * Resolution order:
- *  1. MNEMOM_API_KEY environment variable
- *  2. Stored mnemomApiKey from config
+ * Get the Mnemom API key from env var.
  */
 export function getMnemomApiKey(): string | null {
-  const envKey = process.env.MNEMOM_API_KEY;
-  if (envKey) return envKey;
-
-  const config = loadConfig();
-  return config?.mnemomApiKey ?? null;
+  return process.env.MNEMOM_API_KEY ?? null;
 }
 
 /**
@@ -78,7 +159,7 @@ export function getMnemomApiKey(): string | null {
  *
  * Resolution order:
  *  1. JWT (MNEMOM_TOKEN env or stored token with auto-refresh)
- *  2. API key (MNEMOM_API_KEY env or config mnemomApiKey)
+ *  2. API key (MNEMOM_API_KEY env)
  *  3. None
  */
 export async function resolveAuth(): Promise<AuthCredential> {
@@ -104,14 +185,17 @@ export async function requireAuth(): Promise<AuthCredential & { type: "jwt" | "a
 }
 
 /**
- * Authenticate via browser-based login flow.
- *
- * 1. Start a local HTTP server on a random port
- * 2. Generate a random `state` nonce for CSRF protection
- * 3. Open the browser to the API's CLI login page
- * 4. Wait for the login page to POST tokens back to localhost
- * 5. Verify state, store tokens, and close the server
+ * Check if the user is logged in (has any credential).
  */
+export async function isLoggedIn(): Promise<boolean> {
+  const cred = await resolveAuth();
+  return cred.type !== "none";
+}
+
+// ============================================================================
+// Browser login flow
+// ============================================================================
+
 export async function loginWithBrowser(): Promise<AuthTokens> {
   const state = crypto.randomBytes(16).toString("hex");
 
@@ -133,10 +217,6 @@ export async function loginWithBrowser(): Promise<AuthTokens> {
   }
 }
 
-/**
- * Start a local HTTP server that listens for the auth callback POST.
- * Returns the assigned port, a promise that resolves with tokens, and a close function.
- */
 async function startCallbackServer(expectedState: string): Promise<{
   port: number;
   tokenPromise: Promise<AuthTokens>;
@@ -150,7 +230,6 @@ async function startCallbackServer(expectedState: string): Promise<{
   });
 
   const server = http.createServer((req, res) => {
-    // Handle CORS preflight for the POST from the browser page
     if (req.method === "OPTIONS") {
       res.writeHead(200, {
         "Access-Control-Allow-Origin": "*",
@@ -170,7 +249,6 @@ async function startCallbackServer(expectedState: string): Promise<{
     let body = "";
     req.on("data", (chunk: Buffer) => {
       body += chunk.toString();
-      // Limit body size to prevent abuse
       if (body.length > 1_000_000) {
         req.destroy();
         rejectTokens(new Error("Callback body too large"));
@@ -193,7 +271,7 @@ async function startCallbackServer(expectedState: string): Promise<{
             "Content-Type": "text/html",
             "Access-Control-Allow-Origin": "*",
           });
-          res.end("<html><body><h2>Authentication failed</h2><p>State mismatch. Please try again.</p></body></html>");
+          res.end("<html><body><h2>Authentication failed</h2><p>State mismatch.</p></body></html>");
           rejectTokens(new Error("State mismatch — possible CSRF attack"));
           return;
         }
@@ -227,14 +305,12 @@ async function startCallbackServer(expectedState: string): Promise<{
     });
   });
 
-  // Listen on port 0, wait for the server to be ready before reading the address
   const port = await new Promise<number>((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       resolve((server.address() as { port: number }).port);
     });
   });
 
-  // Auto-timeout after 5 minutes
   const timeout = setTimeout(() => {
     rejectTokens(new Error("Login timed out. Please try again."));
     server.close();
@@ -250,9 +326,6 @@ async function startCallbackServer(expectedState: string): Promise<{
   };
 }
 
-/**
- * Open a URL in the user's default browser.
- */
 function openBrowser(url: string): void {
   const cmd =
     process.platform === "darwin"
@@ -260,17 +333,16 @@ function openBrowser(url: string): void {
       : process.platform === "win32"
         ? "start"
         : "xdg-open";
-
   exec(`${cmd} ${JSON.stringify(url)}`);
 }
 
-/**
- * Authenticate with email + password via the API auth proxy.
- * Used by --no-browser fallback.
- */
+// ============================================================================
+// Password login
+// ============================================================================
+
 export async function loginWithPassword(
   email: string,
-  password: string
+  password: string,
 ): Promise<AuthTokens> {
   const url = `${getApiUrl()}/v1/auth/login`;
   const res = await fetch(url, {
@@ -303,12 +375,12 @@ export async function loginWithPassword(
   return tokens;
 }
 
-/**
- * Refresh an expired access token.
- * Returns new tokens on success, null on failure.
- */
+// ============================================================================
+// Token refresh
+// ============================================================================
+
 async function refreshAccessToken(
-  refreshToken: string
+  refreshToken: string,
 ): Promise<AuthTokens | null> {
   if (!refreshToken || typeof refreshToken !== "string") {
     return null;
@@ -329,7 +401,6 @@ async function refreshAccessToken(
       expires_in: number;
     };
 
-    // Preserve existing user info from stored auth
     const existing = getAuthInfo();
     const tokens: AuthTokens = {
       accessToken: data.access_token,

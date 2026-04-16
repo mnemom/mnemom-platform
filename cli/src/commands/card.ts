@@ -3,10 +3,10 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import yaml from "js-yaml";
-import { configExists, requireAgent } from "../lib/config.js";
 import {
   getAlignmentCard,
   putAlignmentCard,
+  resolveAgentId,
 } from "../lib/api.js";
 import { requireAuth } from "../lib/auth.js";
 import { fmt } from "../lib/format.js";
@@ -202,18 +202,12 @@ export const validateCardJson = (raw: string) => validateUnifiedCard(JSON.parse(
 // ============================================================================
 
 export async function cardShowCommand(agentName?: string): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
-    console.log("Run `mnemom register <name>` to get started.\n");
-    process.exit(1);
-  }
-
-  const agent = await requireAgent(agentName);
+  const agentId = await resolveAgentId(agentName);
 
   console.log("\nFetching alignment card...\n");
 
   try {
-    const { body, contentType } = await getAlignmentCard(agent.agentId);
+    const { body, contentType } = await getAlignmentCard(agentId);
 
     if (!body) {
       console.log(fmt.warn("No alignment card found"));
@@ -242,13 +236,7 @@ export async function cardShowCommand(agentName?: string): Promise<void> {
 }
 
 export async function cardPublishCommand(file: string, agentName?: string): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
-    console.log("Run `mnemom register <name>` to get started.\n");
-    process.exit(1);
-  }
-
-  const agent = await requireAgent(agentName);
+  const agentId = await resolveAgentId(agentName);
 
   // Resolve file path
   const filePath = path.resolve(file);
@@ -294,7 +282,7 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
   // Confirm with user
   if (isInteractive()) {
     const confirm = await askYesNo(
-      `Publish this alignment card for agent ${agent.agentId}?`,
+      `Publish this alignment card for agent ${agentId}?`,
       false,
     );
     if (!confirm) {
@@ -308,7 +296,7 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
     console.log("\nPublishing alignment card...");
     const contentType = parsed!.format === "yaml" ? "text/yaml" as const : "application/json" as const;
     const body = parsed!.format === "yaml" ? parsed!.raw : JSON.stringify(parsed!.parsed);
-    const result = await putAlignmentCard(agent.agentId, body, contentType);
+    const result = await putAlignmentCard(agentId, body, contentType);
     console.log(fmt.success("Alignment card published!"));
     console.log(fmt.label("  Card ID:", ` ${result.card_id}`));
     if (result.composed) {
@@ -371,18 +359,12 @@ export async function cardValidateCommand(file: string): Promise<void> {
 }
 
 export async function cardEditCommand(agentName?: string): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
-    console.log("Run `mnemom register <name>` to get started.\n");
-    process.exit(1);
-  }
-
-  const agent = await requireAgent(agentName);
+  const agentId = await resolveAgentId(agentName);
   await requireAuth();
 
   // Fetch current card as YAML
   console.log("\nFetching current alignment card...\n");
-  const { body: original } = await getAlignmentCard(agent.agentId);
+  const { body: original } = await getAlignmentCard(agentId);
 
   if (!original) {
     console.log(fmt.warn("No alignment card found. Creating a template..."));
@@ -396,7 +378,7 @@ export async function cardEditCommand(agentName?: string): Promise<void> {
 
   // Write to temp file
   const tmpDir = os.tmpdir();
-  const tmpFile = path.join(tmpDir, `mnemom-card-${agent.agentId}.yaml`);
+  const tmpFile = path.join(tmpDir, `mnemom-card-${agentId}.yaml`);
   fs.writeFileSync(tmpFile, cardYaml);
 
   // Open in editor
@@ -455,7 +437,7 @@ export async function cardEditCommand(agentName?: string): Promise<void> {
 
   try {
     console.log("\nPublishing alignment card...");
-    const putResult = await putAlignmentCard(agent.agentId, edited, "text/yaml");
+    const putResult = await putAlignmentCard(agentId, edited, "text/yaml");
     console.log(fmt.success("Alignment card published!"));
     console.log(fmt.label("  Card ID:", ` ${putResult.card_id}`) + "\n");
   } catch (error) {

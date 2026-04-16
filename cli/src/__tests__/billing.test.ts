@@ -1,47 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// Use vi.hoisted to ensure mocks are set up before module imports
-const mockHomedir = vi.hoisted(() => vi.fn(() => "/home/testuser"));
-const mockRandomBytes = vi.hoisted(() =>
-  vi.fn(() => Buffer.from("deadbeef", "hex"))
-);
-const mockCreateHash = vi.hoisted(() =>
-  vi.fn(() => ({
-    update: vi.fn().mockReturnThis(),
-    digest: vi.fn(() => "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"),
-  }))
-);
 const mockIsInteractive = vi.hoisted(() => vi.fn(() => false));
-const mockAskInput = vi.hoisted(() => vi.fn());
 
-// Mock the node modules before importing the modules under test
-vi.mock("node:fs");
-vi.mock("node:os", () => ({
-  homedir: mockHomedir,
-}));
-vi.mock("node:crypto", () => ({
-  randomBytes: mockRandomBytes,
-  createHash: mockCreateHash,
-}));
 vi.mock("../lib/prompt.js", () => ({
   isInteractive: mockIsInteractive,
-  askInput: mockAskInput,
+  askInput: vi.fn(),
   askYesNo: vi.fn(),
   askMultiSelect: vi.fn(),
   askSelect: vi.fn(),
 }));
-
-// Import fs after mocking (for type-safe mock access)
-import * as fs from "node:fs";
-
-// Import module under test after mocking
-import {
-  configExists,
-  loadConfig,
-  saveConfig,
-  CONFIG_DIR,
-  CONFIG_FILE,
-} from "../lib/config.js";
 
 describe("billing", () => {
   beforeEach(() => {
@@ -53,130 +20,7 @@ describe("billing", () => {
   });
 
   // ==========================================================================
-  // 1. Config mnemomApiKey persistence
-  // ==========================================================================
-
-  describe("Config mnemomApiKey persistence", () => {
-    it("should save config with mnemomApiKey and load it back", () => {
-      const config = {
-        version: 2 as const,
-        defaultAgent: "default",
-        gateway: "https://gateway.mnemom.ai",
-        mnemomApiKey: "mnm_test_key_12345",
-        agents: {
-          default: { agentId: "smolt-abc12345" },
-        },
-      };
-
-      vi.mocked(fs.existsSync).mockReturnValue(true);
-      vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
-
-      saveConfig(config);
-
-      const writtenContent = vi.mocked(fs.writeFileSync).mock.calls[0][1];
-      const parsedConfig = JSON.parse(writtenContent as string);
-
-      expect(parsedConfig.mnemomApiKey).toBe("mnm_test_key_12345");
-    });
-
-    it("should load config that contains mnemomApiKey", () => {
-      const mockConfig = {
-        version: 2,
-        defaultAgent: "default",
-        gateway: "https://gateway.mnemom.ai",
-        mnemomApiKey: "mnm_saved_key_67890",
-        agents: {
-          default: { agentId: "smolt-abc12345" },
-        },
-      };
-
-      vi.mocked(fs.existsSync).mockReturnValue(true);
-      vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(mockConfig));
-
-      const result = loadConfig();
-
-      expect(result).not.toBeNull();
-      expect(result!.mnemomApiKey).toBe("mnm_saved_key_67890");
-    });
-
-    it("should load config without mnemomApiKey (free tier)", () => {
-      const mockConfig = {
-        version: 2,
-        defaultAgent: "default",
-        gateway: "https://gateway.mnemom.ai",
-        agents: {
-          default: { agentId: "smolt-abc12345" },
-        },
-      };
-
-      vi.mocked(fs.existsSync).mockReturnValue(true);
-      vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(mockConfig));
-
-      const result = loadConfig();
-
-      expect(result).not.toBeNull();
-      expect(result!.mnemomApiKey).toBeUndefined();
-    });
-
-    it("should preserve mnemomApiKey alongside other optional fields", () => {
-      const config = {
-        version: 2 as const,
-        defaultAgent: "default",
-        gateway: "https://gateway.mnemom.ai",
-        mnemomApiKey: "mnm_full_config_key",
-        agents: {
-          default: {
-            agentId: "smolt-abc12345",
-            openclawConfigured: true,
-            providers: ["anthropic", "openai"],
-            configuredAt: "2026-01-15T00:00:00.000Z",
-          },
-        },
-      };
-
-      vi.mocked(fs.existsSync).mockReturnValue(true);
-      vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
-
-      saveConfig(config);
-
-      const writtenContent = vi.mocked(fs.writeFileSync).mock.calls[0][1];
-      const parsedConfig = JSON.parse(writtenContent as string);
-
-      expect(parsedConfig.agents.default.agentId).toBe("smolt-abc12345");
-      expect(parsedConfig.mnemomApiKey).toBe("mnm_full_config_key");
-      expect(parsedConfig.agents.default.providers).toEqual(["anthropic", "openai"]);
-      expect(parsedConfig.agents.default.configuredAt).toBe("2026-01-15T00:00:00.000Z");
-    });
-
-    it("should write mnemomApiKey as formatted JSON to correct path", () => {
-      const config = {
-        version: 2 as const,
-        defaultAgent: "default",
-        gateway: "https://gateway.mnemom.ai",
-        mnemomApiKey: "mnm_path_check",
-        agents: {
-          default: { agentId: "smolt-test1234" },
-        },
-      };
-
-      vi.mocked(fs.existsSync).mockReturnValue(true);
-      vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
-
-      saveConfig(config);
-
-      expect(fs.writeFileSync).toHaveBeenCalledWith(
-        expect.stringContaining("config.json"),
-        JSON.stringify(config, null, 2)
-      );
-      expect(fs.renameSync).toHaveBeenCalledWith(
-        expect.stringContaining(".tmp"),
-        CONFIG_FILE
-      );
-    });
-  });
-
-  // ==========================================================================
-  // 2. promptMnemomApiKey in non-interactive mode
+  // 1. promptMnemomApiKey in non-interactive mode
   // ==========================================================================
 
   describe("promptMnemomApiKey non-interactive env var detection", () => {
@@ -191,9 +35,6 @@ describe("billing", () => {
     });
 
     it("should detect MNEMOM_API_KEY env var with mnm_ prefix in non-interactive mode", () => {
-      // In the init command's promptMnemomApiKey, when !isInteractive():
-      //   const envKey = process.env.MNEMOM_API_KEY || "";
-      //   if (envKey && envKey.startsWith("mnm_")) { return envKey; }
       mockIsInteractive.mockReturnValue(false);
       process.env.MNEMOM_API_KEY = "mnm_env_key_abc123";
 
@@ -245,7 +86,7 @@ describe("billing", () => {
   });
 
   // ==========================================================================
-  // 3. promptMnemomApiKey validation (mnm_ prefix)
+  // 2. promptMnemomApiKey validation (mnm_ prefix)
   // ==========================================================================
 
   describe("promptMnemomApiKey validation", () => {
@@ -279,8 +120,6 @@ describe("billing", () => {
     });
 
     it("should return existing config key when user enters empty input", () => {
-      // Simulates: user presses Enter without typing => askInput returns ""
-      // promptMnemomApiKey then returns existingConfig?.mnemomApiKey
       const existingConfig = {
         agentId: "smolt-abc12345",
         mnemomApiKey: "mnm_previously_saved",
@@ -288,14 +127,12 @@ describe("billing", () => {
 
       const userInput = ""; // empty = skip
       expect(!userInput).toBe(true);
-      // When skipped, falls through to return existingConfig?.mnemomApiKey
       expect(existingConfig.mnemomApiKey).toBe("mnm_previously_saved");
     });
 
     it("should return undefined when no existing key and user skips", () => {
       const existingConfig: { agentId: string; mnemomApiKey?: string } = {
         agentId: "smolt-abc12345",
-        // no mnemomApiKey
       };
 
       const userInput = "";
@@ -311,7 +148,7 @@ describe("billing", () => {
   });
 
   // ==========================================================================
-  // 4. SDK snippet generation — includes x-mnemom-api-key header when key present
+  // 3. SDK snippet generation — includes x-mnemom-api-key header when key present
   // ==========================================================================
 
   describe("SDK snippet generation with mnemomApiKey", () => {
@@ -328,7 +165,6 @@ describe("billing", () => {
       const provider = "anthropic" as const;
       const baseUrl = GATEWAY_BASE_URLS[provider];
 
-      // Reproduces the logic from showStandaloneSuccess
       const lines: string[] = [];
       if (mnemomApiKey) {
         lines.push(`client = Anthropic(`);
@@ -404,7 +240,6 @@ describe("billing", () => {
       const provider = "gemini" as const;
       const baseUrl = GATEWAY_BASE_URLS[provider];
 
-      // Gemini uses a different display format (REST, not SDK)
       const lines: string[] = [];
       lines.push(`POST ${baseUrl}/v1beta/models/{model}:generateContent`);
       if (mnemomApiKey) {
@@ -420,7 +255,6 @@ describe("billing", () => {
     it("should include MNEMOM_API_KEY export instruction when key is present", () => {
       const mnemomApiKey = "mnm_export_test";
 
-      // showStandaloneSuccess outputs: export MNEMOM_API_KEY=<key>
       const exportLine = mnemomApiKey
         ? `export MNEMOM_API_KEY=${mnemomApiKey}`
         : null;
@@ -431,7 +265,7 @@ describe("billing", () => {
   });
 
   // ==========================================================================
-  // 5. SDK snippet generation — omits header when no key
+  // 4. SDK snippet generation — omits header when no key
   // ==========================================================================
 
   describe("SDK snippet generation without mnemomApiKey", () => {
@@ -554,7 +388,7 @@ describe("billing", () => {
   });
 
   // ==========================================================================
-  // 6. Status command billing display
+  // 5. Status command billing display
   // ==========================================================================
 
   describe("Status command billing display", () => {
@@ -565,7 +399,6 @@ describe("billing", () => {
       expect(prefix).toBe("mnm_abcd");
       expect(prefix.length).toBe(8);
 
-      // The status command displays: `${prefix}... (billing enabled)`
       const displayLine = `Mnemom Key: ${prefix}... (billing enabled)`;
       expect(displayLine).toBe("Mnemom Key: mnm_abcd... (billing enabled)");
       expect(displayLine).not.toContain("efghijklmnop");
@@ -577,7 +410,6 @@ describe("billing", () => {
         mnemomApiKey: "mnm_billing_active_key",
       };
 
-      // Reproduces logic from statusCommand lines 88-93
       let displayLine: string;
       if (config.mnemomApiKey) {
         const prefix = config.mnemomApiKey.slice(0, 8);
@@ -594,7 +426,6 @@ describe("billing", () => {
     it("should display 'free tier' label when mnemomApiKey is absent", () => {
       const config = {
         agentId: "smolt-abc12345",
-        // no mnemomApiKey
       } as { agentId: string; mnemomApiKey?: string };
 
       let displayLine: string;
@@ -625,11 +456,9 @@ describe("billing", () => {
     });
 
     it("should handle minimum-length mnm_ key for masking", () => {
-      // Shortest valid key: "mnm_X" (5 chars)
       const shortKey = "mnm_X";
       const prefix = shortKey.slice(0, 8);
 
-      // slice(0, 8) on a 5-char string returns the full string
       expect(prefix).toBe("mnm_X");
       expect(prefix.length).toBe(5);
 
@@ -638,56 +467,11 @@ describe("billing", () => {
     });
 
     it("should show existing key prefix in init prompt", () => {
-      // In promptMnemomApiKey: `Existing key: ${prefix}...`
       const existingKey = "mnm_existing_key_value_12345";
       const prefix = existingKey.slice(0, 8);
 
       const promptLine = `Existing key: ${prefix}...`;
       expect(promptLine).toBe("Existing key: mnm_exis...");
-    });
-
-    it("should correctly distinguish billing states in config round-trip", () => {
-      // Save config with key, load, check display
-      const configWithKey = {
-        version: 2 as const,
-        defaultAgent: "default",
-        gateway: "https://gateway.mnemom.ai",
-        mnemomApiKey: "mnm_roundtrip_key",
-        agents: { default: { agentId: "smolt-billing01" } },
-      };
-      const configWithoutKey = {
-        version: 2 as const,
-        defaultAgent: "default",
-        gateway: "https://gateway.mnemom.ai",
-        agents: { default: { agentId: "smolt-freetier1" } },
-      };
-
-      vi.mocked(fs.existsSync).mockReturnValue(true);
-      vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
-
-      // Save with key
-      saveConfig(configWithKey);
-      const writtenWithKey = JSON.parse(
-        vi.mocked(fs.writeFileSync).mock.calls[0][1] as string
-      );
-
-      // Save without key
-      saveConfig(configWithoutKey);
-      const writtenWithoutKey = JSON.parse(
-        vi.mocked(fs.writeFileSync).mock.calls[1][1] as string
-      );
-
-      // Simulate status display logic for each
-      const displayWithKey = writtenWithKey.mnemomApiKey
-        ? `${writtenWithKey.mnemomApiKey.slice(0, 8)}... (billing enabled)`
-        : "Not configured (free tier)";
-
-      const displayWithoutKey = writtenWithoutKey.mnemomApiKey
-        ? `${writtenWithoutKey.mnemomApiKey.slice(0, 8)}... (billing enabled)`
-        : "Not configured (free tier)";
-
-      expect(displayWithKey).toBe("mnm_roun... (billing enabled)");
-      expect(displayWithoutKey).toBe("Not configured (free tier)");
     });
   });
 });

@@ -3,10 +3,10 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import yaml from "js-yaml";
-import { configExists, requireAgent } from "../lib/config.js";
 import {
   getProtectionCard,
   putProtectionCard,
+  resolveAgentId,
 } from "../lib/api.js";
 import { requireAuth } from "../lib/auth.js";
 import { fmt } from "../lib/format.js";
@@ -115,18 +115,12 @@ function parseProtectionFile(filePath: string): { parsed: Record<string, unknown
 // ============================================================================
 
 export async function protectionShowCommand(agentName?: string): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
-    console.log("Run `mnemom register <name>` to get started.\n");
-    process.exit(1);
-  }
-
-  const agent = await requireAgent(agentName);
+  const agentId = await resolveAgentId(agentName);
 
   console.log("\nFetching protection card...\n");
 
   try {
-    const { body, contentType } = await getProtectionCard(agent.agentId);
+    const { body, contentType } = await getProtectionCard(agentId);
 
     if (!body) {
       console.log(fmt.warn("No protection card found"));
@@ -153,13 +147,7 @@ export async function protectionShowCommand(agentName?: string): Promise<void> {
 }
 
 export async function protectionPublishCommand(file: string, agentName?: string): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
-    console.log("Run `mnemom register <name>` to get started.\n");
-    process.exit(1);
-  }
-
-  const agent = await requireAgent(agentName);
+  const agentId = await resolveAgentId(agentName);
 
   const filePath = path.resolve(file);
   if (!fs.existsSync(filePath)) {
@@ -201,7 +189,7 @@ export async function protectionPublishCommand(file: string, agentName?: string)
 
   if (isInteractive()) {
     const confirm = await askYesNo(
-      `Publish this protection card for agent ${agent.agentId}?`,
+      `Publish this protection card for agent ${agentId}?`,
       false,
     );
     if (!confirm) {
@@ -214,7 +202,7 @@ export async function protectionPublishCommand(file: string, agentName?: string)
     console.log("\nPublishing protection card...");
     const contentType = parsed!.format === "yaml" ? "text/yaml" as const : "application/json" as const;
     const body = parsed!.format === "yaml" ? parsed!.raw : JSON.stringify(parsed!.parsed);
-    const result = await putProtectionCard(agent.agentId, body, contentType);
+    const result = await putProtectionCard(agentId, body, contentType);
     console.log(fmt.success("Protection card published!"));
     console.log(fmt.label("  Card ID:", ` ${result.card_id}`));
     if (result.composed) {
@@ -274,17 +262,11 @@ export async function protectionValidateCommand(file: string): Promise<void> {
 }
 
 export async function protectionEditCommand(agentName?: string): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
-    console.log("Run `mnemom register <name>` to get started.\n");
-    process.exit(1);
-  }
-
-  const agent = await requireAgent(agentName);
+  const agentId = await resolveAgentId(agentName);
   await requireAuth();
 
   console.log("\nFetching current protection card...\n");
-  const { body: original } = await getProtectionCard(agent.agentId);
+  const { body: original } = await getProtectionCard(agentId);
 
   if (!original) {
     console.log(fmt.warn("No protection card found. Creating a template..."));
@@ -298,7 +280,7 @@ export async function protectionEditCommand(agentName?: string): Promise<void> {
   }, { lineWidth: 120, noRefs: true });
 
   const tmpDir = os.tmpdir();
-  const tmpFile = path.join(tmpDir, `mnemom-protection-${agent.agentId}.yaml`);
+  const tmpFile = path.join(tmpDir, `mnemom-protection-${agentId}.yaml`);
   fs.writeFileSync(tmpFile, cardYaml);
 
   const editor = process.env.EDITOR || process.env.VISUAL || "vi";
@@ -353,7 +335,7 @@ export async function protectionEditCommand(agentName?: string): Promise<void> {
 
   try {
     console.log("\nPublishing protection card...");
-    const putResult = await putProtectionCard(agent.agentId, edited, "text/yaml");
+    const putResult = await putProtectionCard(agentId, edited, "text/yaml");
     console.log(fmt.success("Protection card published!"));
     console.log(fmt.label("  Card ID:", ` ${putResult.card_id}`) + "\n");
   } catch (error) {

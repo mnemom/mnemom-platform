@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { program } from "commander";
-import { initCommand } from "./commands/init.js";
 import { statusCommand } from "./commands/status.js";
 import { integrityCommand } from "./commands/integrity.js";
 import { logsCommand } from "./commands/logs.js";
@@ -16,32 +15,14 @@ import {
   policyEvaluateCommand,
 } from "./commands/policy.js";
 import { protectionShowCommand, protectionPublishCommand, protectionValidateCommand, protectionEditCommand } from "./commands/protection.js";
-import { registerCommand } from "./commands/register.js";
-import { agentsListCommand, agentsRemoveCommand, agentsAddCommand, agentsDefaultCommand, agentsRekeyCommand, agentsCheckBindingCommand } from "./commands/agents.js";
+import { agentsListCommand } from "./commands/agents.js";
 import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
-import { makeMigrateConfigCommand } from "./commands/migrate-config.js";
 
 program
   .name("mnemom")
   .description("Transparent AI agent tracing")
   .version("0.8.0")
   .option("--agent <name>", "Select agent by name (or set MNEMOM_AGENT)");
-
-program
-  .command("init")
-  .description("(removed) Use `mnemom register <name>` instead")
-  .option("-y, --yes", "Skip confirmation prompts")
-  .option("-f, --force", "Force reconfiguration")
-  .option("--openclaw", "Configure using OpenClaw")
-  .option("--standalone", "Configure standalone")
-  .action(async (options) => {
-    try {
-      await initCommand(options);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
 
 program
   .command("status")
@@ -324,93 +305,11 @@ policyCmd
 // ============================================================================
 
 program
-  .command("register <name>")
-  .description("Register a new named agent")
-  .option("--openclaw", "Configure using OpenClaw")
-  .option("--standalone", "Configure standalone mode")
-  .option("--set-default", "Set as default agent")
-  .action(async (name: string, options) => {
-    try {
-      await registerCommand(name, {
-        openclaw: options.openclaw,
-        standalone: options.standalone,
-        setDefault: options.setDefault,
-      });
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-const agentsCmd = program
   .command("agents")
-  .description("List and manage registered agents");
-
-agentsCmd
+  .description("List agents in your account")
   .action(async () => {
     try {
       await agentsListCommand();
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-agentsCmd
-  .command("remove <name>")
-  .description("Remove a registered agent")
-  .action(async (name: string) => {
-    try {
-      await agentsRemoveCommand(name);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-agentsCmd
-  .command("add <name-or-id>")
-  .description("Register an existing API agent in local config")
-  .option("--alias <alias>", "Local alias name (default: agent's API name)")
-  .action(async (nameOrId: string, options: { alias?: string }) => {
-    try {
-      await agentsAddCommand(nameOrId, options.alias);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-agentsCmd
-  .command("default <name>")
-  .description("Set the default agent")
-  .action(async (name: string) => {
-    try {
-      await agentsDefaultCommand(name);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-agentsCmd
-  .command("rekey [name]")
-  .description("Re-bind an agent to a new provider API key (key hashed locally, never transmitted)")
-  .action(async (name?: string) => {
-    try {
-      await agentsRekeyCommand(name);
-    } catch (error) {
-      console.error("Error:", error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-agentsCmd
-  .command("check-binding [name]")
-  .description("Verify that a provider API key is bound to an agent (key hashed locally, never transmitted)")
-  .action(async (name?: string) => {
-    try {
-      await agentsCheckBindingCommand(name);
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
@@ -457,7 +356,5 @@ program
       process.exit(1);
     }
   });
-
-program.addCommand(makeMigrateConfigCommand());
 
 program.parse();

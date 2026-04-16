@@ -1,15 +1,9 @@
-import { configExists, getAuthInfo, clearAuthTokens } from "../lib/config.js";
+import { getAuthInfo, clearAuthTokens } from "../lib/auth.js";
 import { loginWithBrowser, loginWithPassword } from "../lib/auth.js";
 import { fmt } from "../lib/format.js";
 import { askInput } from "../lib/prompt.js";
 
 export async function loginCommand(options: { noBrowser?: boolean } = {}): Promise<void> {
-  if (!configExists()) {
-    console.log("\n" + fmt.error("mnemom is not configured") + "\n");
-    console.log("Run `mnemom register <name>` to get started.\n");
-    process.exit(1);
-  }
-
   try {
     let tokens;
     if (options.noBrowser) {

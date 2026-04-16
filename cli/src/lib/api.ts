@@ -480,3 +480,48 @@ export async function putProtectionCard(
 
   return response.json() as Promise<{ card_id: string; composed: boolean }>;
 }
+
+// ============================================================================
+// Agent Resolution (server-side, no local config)
+// ============================================================================
+
+/**
+ * Resolve an agent name or ID to a server agent ID.
+ *
+ * Resolution order:
+ *  1. Explicit agentName parameter (--agent flag)
+ *  2. MNEMOM_AGENT environment variable
+ *
+ * If the value looks like an agent ID (smolt-* or mnm-*), uses it directly.
+ * Otherwise resolves the name from the authenticated user's agent list.
+ */
+export async function resolveAgentId(agentName?: string): Promise<string> {
+  const name = agentName ?? process.env.MNEMOM_AGENT;
+
+  if (!name) {
+    console.error("\nAgent required. Use --agent <name> or set MNEMOM_AGENT.\n");
+    console.error("List your agents with: mnemom agents\n");
+    process.exit(1);
+  }
+
+  // If it looks like an agent ID, use directly (no server call needed)
+  if (/^(smolt-[0-9a-f]{8}|mnm-[0-9a-f-]{36})$/.test(name)) {
+    return name;
+  }
+
+  // Resolve name from server (requires auth)
+  try {
+    const agent = await getAgentByName(name);
+    if (agent) return agent.id;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("Not authenticated")) {
+      console.error(`\nNot authenticated. Run \`mnemom login\` first.\n`);
+      process.exit(1);
+    }
+  }
+
+  console.error(`\nAgent not found: ${name}`);
+  console.error("List your agents with: mnemom agents\n");
+  process.exit(1);
+}
