@@ -28,7 +28,7 @@ jobs:
       gateway: ${{ steps.filter.outputs.gateway }}
       observer: ${{ steps.filter.outputs.observer }}
       cli: ${{ steps.filter.outputs.cli }}
-      fault_lines: ${{ steps.filter.outputs.fault_lines }}
+      team_coherence: ${{ steps.filter.outputs.team_coherence }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
@@ -44,8 +44,8 @@ jobs:
             cli:
               - 'cli/**'
               - 'shared/**'
-            fault_lines:
-              - 'shared/fault-lines/**'
+            team_coherence:
+              - 'shared/team-coherence/**'
 
   # ============================================================
   # Per-workspace typecheck jobs
@@ -217,12 +217,12 @@ jobs:
         working-directory: observer
         run: npx vitest run --exclude '**/aip-integration.test.ts'
 
-  fault-lines-test:
+  team-coherence-test:
     permissions:
       contents: read
-    name: Fault-Lines Test
+    name: Team Coherence Test
     needs: changes
-    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.fault_lines == 'true')
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.team_coherence == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -231,19 +231,19 @@ jobs:
           node-version: "20"
 
       - name: Install
-        working-directory: shared/fault-lines
+        working-directory: shared/team-coherence
         run: npm install
 
       - name: Typecheck
-        working-directory: shared/fault-lines
+        working-directory: shared/team-coherence
         run: npm run typecheck
 
       - name: Build
-        working-directory: shared/fault-lines
+        working-directory: shared/team-coherence
         run: npm run build
 
       - name: Test
-        working-directory: shared/fault-lines
+        working-directory: shared/team-coherence
         run: npm test
 
   # ============================================================
@@ -269,13 +269,13 @@ jobs:
 
   test:
     name: Test
-    needs: [cli-test, gateway-test, observer-test, fault-lines-test]
+    needs: [cli-test, gateway-test, observer-test, team-coherence-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check test results
         run: |
-          results=("${{ needs.cli-test.result }}" "${{ needs.gateway-test.result }}" "${{ needs.observer-test.result }}" "${{ needs.fault-lines-test.result }}")
+          results=("${{ needs.cli-test.result }}" "${{ needs.gateway-test.result }}" "${{ needs.observer-test.result }}" "${{ needs.team-coherence-test.result }}")
           for r in "${results[@]}"; do
             if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
               echo "Test failed: $r"
