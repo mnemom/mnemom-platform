@@ -28,6 +28,7 @@ jobs:
       gateway: ${{ steps.filter.outputs.gateway }}
       observer: ${{ steps.filter.outputs.observer }}
       cli: ${{ steps.filter.outputs.cli }}
+      fault_lines: ${{ steps.filter.outputs.fault_lines }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
@@ -43,6 +44,8 @@ jobs:
             cli:
               - 'cli/**'
               - 'shared/**'
+            fault_lines:
+              - 'shared/fault-lines/**'
 
   # ============================================================
   # Per-workspace typecheck jobs
@@ -214,6 +217,35 @@ jobs:
         working-directory: observer
         run: npx vitest run --exclude '**/aip-integration.test.ts'
 
+  fault-lines-test:
+    permissions:
+      contents: read
+    name: Fault-Lines Test
+    needs: changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.fault_lines == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: "20"
+
+      - name: Install
+        working-directory: shared/fault-lines
+        run: npm install
+
+      - name: Typecheck
+        working-directory: shared/fault-lines
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: shared/fault-lines
+        run: npm run build
+
+      - name: Test
+        working-directory: shared/fault-lines
+        run: npm test
+
   # ============================================================
   # Roll-up jobs — branch protection requires these names
   # ============================================================
@@ -237,13 +269,13 @@ jobs:
 
   test:
     name: Test
-    needs: [cli-test, gateway-test, observer-test]
+    needs: [cli-test, gateway-test, observer-test, fault-lines-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check test results
         run: |
-          results=("${{ needs.cli-test.result }}" "${{ needs.gateway-test.result }}" "${{ needs.observer-test.result }}")
+          results=("${{ needs.cli-test.result }}" "${{ needs.gateway-test.result }}" "${{ needs.observer-test.result }}" "${{ needs.fault-lines-test.result }}")
           for r in "${results[@]}"; do
             if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
               echo "Test failed: $r"

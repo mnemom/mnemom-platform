@@ -9,6 +9,7 @@ name: Publish
 #   - cli/                  → @mnemom/mnemom
 #   - shared/policy-engine/ → @mnemom/policy-engine
 #   - shared/safe-house/    → @mnemom/safe-house
+#   - shared/fault-lines/   → @mnemom/fault-lines (added UC-11b / ADR-025)
 #
 # Each target package's own `build` script handles building its sibling
 # dependencies (e.g., cli's build runs `npm run build --prefix
