@@ -26,7 +26,7 @@ export interface TeamCoherenceInput {
   };
   /** Unified-card integrity section. Optional. */
   integrity?: {
-    enforcement_mode?: "observe" | "warn" | "enforce";
+    enforcement_mode?: "observe" | "nudge" | "enforce";
   };
   /** Unified-card autonomy.forbidden_actions. Used as secondary signal. */
   forbidden_actions?: string[];
@@ -103,7 +103,7 @@ export interface TeamCoherenceResult {
   integrity_uniform: boolean | null;
   integrity_divergence: Array<{
     agent_id: string;
-    enforcement_mode: "observe" | "warn" | "enforce" | null;
+    enforcement_mode: "observe" | "nudge" | "enforce" | null;
   }>;
 
   // Outliers

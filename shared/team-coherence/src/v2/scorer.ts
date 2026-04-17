@@ -267,7 +267,7 @@ function computeIntegrityInvariant(cards: TeamCoherenceInput[]): {
   integrity_uniform: boolean | null;
   integrity_divergence: Array<{
     agent_id: string;
-    enforcement_mode: "observe" | "warn" | "enforce" | null;
+    enforcement_mode: "observe" | "nudge" | "enforce" | null;
   }>;
 } {
   const modes = cards.map((c) => c.integrity?.enforcement_mode ?? null);
@@ -282,7 +282,7 @@ function computeIntegrityInvariant(cards: TeamCoherenceInput[]): {
   const modal = modeOf(modes as string[]);
   const divergence: Array<{
     agent_id: string;
-    enforcement_mode: "observe" | "warn" | "enforce" | null;
+    enforcement_mode: "observe" | "nudge" | "enforce" | null;
   }> = [];
   cards.forEach((c, i) => {
     if (modes[i] === modal) return;
