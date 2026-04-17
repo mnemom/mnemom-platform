@@ -10,6 +10,11 @@ name = "mnemom-observer"
 # can exceed 10ms bundled CPU on bulk log processing. Standard plan provides 30s CPU.
 usage_model = "standard"
 
+# Opt in to workers_trace_events Logpush (ADR-026 Tier 3). Observer cron
+# failures and decryption errors surface in mnemom-worker-logs R2 for
+# debugging; the observer itself is the Tier 2 consumer, not emitter.
+logpush = true
+
 [env.production.triggers]
 crons = ["* * * * *"]
 
@@ -32,6 +37,9 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
 name = "mnemom-observer-staging"
+
+# See ADR-026 — opt in to workers_trace_events for Tier 3.
+logpush = true
 
 [env.staging.triggers]
 crons = ["*/5 * * * *"]
