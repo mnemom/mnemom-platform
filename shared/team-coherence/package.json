@@ -1,11 +1,11 @@
 {
-  "name": "@mnemom/fault-lines",
+  "name": "@mnemom/team-coherence",
   "version": "0.1.0",
-  "description": "Team coherence analysis for Mnemom — fault line extraction, risk forecasting, policy recommendation, and dimensional coherence scoring (v2)",
+  "description": "Dimensional team coherence scoring for Mnemom agent fleets — v2 scorer (honest, evidence-based) + AAP baseline re-exports. See ADR-025.",
   "repository": {
     "type": "git",
     "url": "https://github.com/mnemom/mnemom-platform",
-    "directory": "shared/fault-lines"
+    "directory": "shared/team-coherence"
   },
   "type": "module",
   "main": "./dist/index.js",
