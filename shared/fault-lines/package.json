@@ -1,0 +1,45 @@
+{
+  "name": "@mnemom/fault-lines",
+  "version": "0.1.0",
+  "description": "Team coherence analysis for Mnemom — fault line extraction, risk forecasting, policy recommendation, and dimensional coherence scoring (v2)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mnemom/mnemom-platform",
+    "directory": "shared/fault-lines"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./v2": {
+      "types": "./dist/v2/index.d.ts",
+      "default": "./dist/v2/index.js"
+    },
+    "./baseline": {
+      "types": "./dist/baseline/index.d.ts",
+      "default": "./dist/baseline/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest --run",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "vitest": "^4.1.4"
+  },
+  "dependencies": {
+    "@mnemom/agent-alignment-protocol": "^1.0.0"
+  }
+}
