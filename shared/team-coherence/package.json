@@ -1,6 +1,6 @@
 {
   "name": "@mnemom/team-coherence",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Dimensional team coherence scoring for Mnemom agent fleets — v2 scorer (honest, evidence-based) + AAP baseline re-exports. See ADR-025.",
   "repository": {
     "type": "git",
