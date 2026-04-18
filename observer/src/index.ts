@@ -410,7 +410,11 @@ async function processPollingBatch(
 ): Promise<ProcessingStats> {
   const stats: ProcessingStats = { processed: 0, skipped: 0, errors: 0, logs_fetched: 0 };
   const safetyLimit = parseInt(env.OBSERVER_MAX_LOGS ?? '5000', 10);
-  const batchSize = 100;
+  // CF AI Gateway `/logs` endpoint enforces per_page ≤ 50 (tightened some time after
+  // Step 2 shipped; before this change, cron ticks returned HTTP 400 from CF and never
+  // fetched any logs). Keep at 50 — the pagination loop below already handles multiple
+  // batches per tick, bounded by OBSERVER_MAX_LOGS.
+  const batchSize = 50;
   let lastBatchSize = batchSize; // initialize to batchSize to enter the loop
 
   try {
@@ -791,7 +795,10 @@ async function processLog(
 /**
  * Fetch logs from Cloudflare AI Gateway
  */
-async function fetchLogs(env: Env, limit: number = 100): Promise<GatewayLog[]> {
+async function fetchLogs(env: Env, limit: number = 50): Promise<GatewayLog[]> {
+  // CF caps per_page at 50 on the /logs endpoint. Requesting more returns 400
+  // and observer cron ticks fail. Callers pass batchSize (50) from the
+  // pagination loop; this default matches so ad-hoc callers don't regress.
   const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai-gateway/gateways/${env.GATEWAY_ID}/logs?per_page=${limit}&order_by=created_at&order_by_direction=asc&meta_info=true`;
 
   const response = await fetch(url, {

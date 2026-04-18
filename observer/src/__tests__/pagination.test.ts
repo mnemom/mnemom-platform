@@ -52,7 +52,8 @@ async function paginationLoop(
   safetyLimit: number
 ): Promise<{ stats: ProcessingStats; hitSafetyLimit: boolean }> {
   const stats: ProcessingStats = { processed: 0, skipped: 0, errors: 0, logs_fetched: 0 };
-  const batchSize = 100;
+  // Matches processPollingBatch — CF AI Gateway /logs enforces per_page ≤ 50.
+  const batchSize = 50;
   let lastBatchSize = batchSize;
 
   do {
@@ -129,7 +130,7 @@ describe('observer pagination loop', () => {
   });
 
   it('multi-batch (3 full + 1 partial) — fetches all four pages', async () => {
-    const batches = [makeLogs(100, 0), makeLogs(100, 100), makeLogs(100, 200), makeLogs(40, 300)];
+    const batches = [makeLogs(50, 0), makeLogs(50, 50), makeLogs(50, 100), makeLogs(20, 150)];
     const { fetchPage, callCount } = makePager(batches);
     const { stats, hitSafetyLimit } = await paginationLoop(
       fetchPage,
@@ -138,7 +139,7 @@ describe('observer pagination loop', () => {
     );
 
     expect(callCount()).toBe(4);
-    expect(stats.logs_fetched).toBe(340);
+    expect(stats.logs_fetched).toBe(170);
     expect(hitSafetyLimit).toBe(false);
   });
 
@@ -156,33 +157,33 @@ describe('observer pagination loop', () => {
   });
 
   it('safety limit hit — stops mid-stream and sets hitSafetyLimit', async () => {
-    // Each call returns 100 logs (infinite source); safetyLimit = 200
+    // Each call returns 50 logs (infinite source); safetyLimit = 100 → stops after 2 batches.
     let calls = 0;
     const fetchPage = async (_batchSize: number): Promise<GatewayLog[]> => {
       calls++;
-      return makeLogs(100, (calls - 1) * 100);
+      return makeLogs(50, (calls - 1) * 50);
     };
     const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    const { stats, hitSafetyLimit } = await paginationLoop(fetchPage, async () => false, 200);
+    const { stats, hitSafetyLimit } = await paginationLoop(fetchPage, async () => false, 100);
 
-    expect(stats.logs_fetched).toBe(200);
+    expect(stats.logs_fetched).toBe(100);
     expect(hitSafetyLimit).toBe(true);
-    expect(calls).toBe(2); // fetched 2 batches of 100 = 200, then stopped
+    expect(calls).toBe(2); // fetched 2 batches of 50 = 100, then stopped
 
     consoleSpy.mockRestore();
   });
 
   it('exactly one full batch equals safety limit — warns and stops cleanly', async () => {
-    // safetyLimit = 100, one batch of 100 — should stop after 1 fetch
-    const { fetchPage, callCount } = makePager([makeLogs(100), makeLogs(50)]); // second batch never reached
+    // safetyLimit = 50, one batch of 50 — should stop after 1 fetch.
+    const { fetchPage, callCount } = makePager([makeLogs(50), makeLogs(25)]); // second batch never reached
     const { stats, hitSafetyLimit } = await paginationLoop(
       fetchPage,
       async () => false,
-      100
+      50
     );
 
-    expect(stats.logs_fetched).toBe(100);
+    expect(stats.logs_fetched).toBe(50);
     expect(hitSafetyLimit).toBe(true);
     expect(callCount()).toBe(1); // safety limit hit after first batch
   });
@@ -207,9 +208,9 @@ describe('observer pagination loop', () => {
     expect(stats.errors).toBe(1);
   });
 
-  it('does not increment page — each fetch call receives the same batchSize=100', async () => {
+  it('does not increment page — each fetch call receives the same batchSize=50', async () => {
     const receivedSizes: number[] = [];
-    const { fetchPage } = makePager([makeLogs(100), makeLogs(50)]);
+    const { fetchPage } = makePager([makeLogs(50), makeLogs(25)]);
     const wrappedFetch = async (batchSize: number): Promise<GatewayLog[]> => {
       receivedSizes.push(batchSize);
       return fetchPage(batchSize);
@@ -217,7 +218,7 @@ describe('observer pagination loop', () => {
 
     await paginationLoop(wrappedFetch, async () => false, 5000);
 
-    // Both calls must use batchSize=100 (no page increment)
-    expect(receivedSizes).toEqual([100, 100]);
+    // Both calls must use batchSize=50 (no page increment; CF caps per_page at 50)
+    expect(receivedSizes).toEqual([50, 50]);
   });
 });
