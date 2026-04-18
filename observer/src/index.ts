@@ -190,6 +190,25 @@ export default {
   ): Promise<void> {
     console.log('[observer] Scheduled trigger started');
 
+    // BetterStack heartbeat — emitted immediately on cron entry, BEFORE the
+    // main processing block. Intent: prove the cron scheduler fired AND the
+    // Worker reached the handler. If processAllLogs later exhausts CPU budget
+    // or throws, the heartbeat has already been queued via waitUntil.
+    // Positioned here (not at the end of the try block) because prod ticks
+    // routinely process thousands of logs per invocation and occasionally
+    // exceed CF's per-invocation time budget (Outcome: unknown), which would
+    // silently skip a trailing heartbeat. Fire-and-forget; a failed POST logs
+    // a warning but never affects cron operation.
+    if (env.BETTERSTACK_HEARTBEAT_URL) {
+      ctx.waitUntil(
+        fetch(env.BETTERSTACK_HEARTBEAT_URL, { method: 'POST' }).catch((err) => {
+          console.warn(
+            `[observer] heartbeat post failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        })
+      );
+    }
+
     const otelExporter = createOTelExporter(env);
 
     try {
@@ -249,21 +268,6 @@ export default {
       // Flush OTel spans for all processed logs in one batch
       if (otelExporter) {
         ctx.waitUntil(otelExporter.flush());
-      }
-
-      // BetterStack heartbeat — emitted only on successful tick completion.
-      // Fire-and-forget; a failed POST never affects observer operation.
-      // Positioned inside the try block + before the catch so a throw from
-      // processAllLogs suppresses the heartbeat → BS grace window expires →
-      // incident fires. This is the one alert that proves cron liveness.
-      if (env.BETTERSTACK_HEARTBEAT_URL) {
-        ctx.waitUntil(
-          fetch(env.BETTERSTACK_HEARTBEAT_URL, { method: 'POST' }).catch((err) => {
-            console.warn(
-              `[observer] heartbeat post failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          })
-        );
       }
     } catch (error) {
       console.error('[observer] Fatal error in scheduled handler:', error);
