@@ -112,7 +112,7 @@ export function mapCanonicalToSafeHouseConfig(card: Record<string, unknown>): Sa
 
 interface KVEnv {
   SUPABASE_URL: string;
-  SUPABASE_KEY: string;
+  SUPABASE_SECRET_KEY: string;
   BILLING_CACHE?: KVNamespace;
 }
 
@@ -140,8 +140,8 @@ export async function fetchCanonicalAlignmentCard(
   url.searchParams.set('select', 'card_json,needs_recompose');
   const resp = await fetch(url.toString(), {
     headers: {
-      apikey: env.SUPABASE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      apikey: env.SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
     },
   });
   if (!resp.ok) return null;
@@ -178,8 +178,8 @@ export async function fetchCanonicalProtectionCard(
   url.searchParams.set('select', 'card_json,needs_recompose');
   const resp = await fetch(url.toString(), {
     headers: {
-      apikey: env.SUPABASE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      apikey: env.SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
     },
   });
   if (!resp.ok) return null;
