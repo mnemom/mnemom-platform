@@ -43,6 +43,9 @@ import {
 import { createCircuitBreaker, checkAndReset, recordSuccess, recordFailure } from './circuit-breaker';
 import { computeBandHashes, deserializeMinHash } from '@mnemom/safe-house';
 import { fetchR2Batch } from './r2-ingest';
+import type { ObserverQueueMessage } from './queue-types';
+import { enqueueR2Records, enqueuePollingLogs } from './queue-producer';
+import { handleQueueBatch } from './queue-consumer';
 
 const AAP_VERSION = '1.0';
 const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
@@ -128,6 +131,15 @@ interface Env {
   // tick; missing posts within the BS grace window trigger a paging incident.
   // Set per-env (prod period=60s, staging period=300s). Absence = no-op.
   BETTERSTACK_HEARTBEAT_URL?: string;
+  // Queue fan-out (Step 50, ADR-010). OBSERVER_PROCESSING_MODE selects the
+  // scheduled()-tick pipeline:
+  //   "direct" (default) — cron ingests and processes records in-invocation
+  //   "queue"             — cron only enqueues; consumer runs elsewhere
+  // OBSERVER_QUEUE is the producer binding (declared in wrangler.toml
+  // [[queues.producers]]). The consumer binding is declared separately via
+  // [[queues.consumers]] and routes into the queue() handler on this Worker.
+  OBSERVER_PROCESSING_MODE?: string;
+  OBSERVER_QUEUE?: Queue<ObserverQueueMessage>;
 }
 
 interface GatewayLog {
@@ -180,6 +192,33 @@ interface ProcessingStats {
 // ============================================================================
 
 export default {
+  /**
+   * Queue consumer — ADR-010. Receives a batch of ObserverQueueMessage
+   * items and drives each through processLog with the appropriate prefetched
+   * body payload (re-fetched/decrypted from R2 or re-fetched from CF polling).
+   *
+   * Active only when [[queues.consumers]] routes this Worker to the observer
+   * queue. The direct-mode path (OBSERVER_PROCESSING_MODE="direct") does not
+   * enqueue, so the consumer sees empty traffic in that mode.
+   */
+  async queue(
+    batch: MessageBatch<ObserverQueueMessage>,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    const otelExporter = createOTelExporter(env);
+    await handleQueueBatch(
+      batch,
+      env as unknown as Parameters<typeof handleQueueBatch>[1],
+      ctx,
+      (log, innerEnv, innerCtx, options) =>
+        processLog(log as unknown as GatewayLog, innerEnv as unknown as Env, innerCtx, otelExporter, options),
+    );
+    if (otelExporter) {
+      ctx.waitUntil(otelExporter.flush());
+    }
+  },
+
   /**
    * Cron trigger - runs every minute to process new logs
    */
@@ -399,6 +438,16 @@ async function processAllLogs(
   ctx: ExecutionContext,
   otelExporter?: WorkersOTelExporter | null
 ): Promise<ProcessingStats> {
+  // Step 50 / ADR-010 — OBSERVER_PROCESSING_MODE="queue" flips the scheduled
+  // tick into a producer: it only enqueues reference messages and returns
+  // fast. The queue() handler on this same Worker consumes the messages in
+  // parallel invocations. Default ("direct") preserves the pre-step-50
+  // behavior where the cron invocation also runs the per-record pipeline.
+  if (env.OBSERVER_PROCESSING_MODE === 'queue') {
+    const stats = await runAsProducer(env);
+    emitTickSummary(env, stats, `queue-producer (${env.LOGPUSH_SOURCE === 'r2' ? 'r2' : 'polling'})`);
+    return stats;
+  }
   const source = env.LOGPUSH_SOURCE === 'r2' ? 'r2' : 'polling';
   if (source === 'r2') {
     try {
@@ -414,6 +463,48 @@ async function processAllLogs(
   }
   const stats = await processPollingBatch(env, ctx, otelExporter);
   emitTickSummary(env, stats, source === 'r2' ? 'polling (fallback)' : 'polling');
+  return stats;
+}
+
+/**
+ * Step 50 / ADR-010 producer path — enqueues reference messages for the
+ * queue consumer to process. No decrypt, no Anthropic call, no Supabase
+ * write happens here. Bounded by OBSERVER_MAX_R2_OBJECTS (R2 path) or the
+ * standard per_page cap (polling path).
+ *
+ * Returns ProcessingStats shaped to match the direct-mode output so the
+ * shared tick-summary + OTel span stays uniform across modes.
+ */
+async function runAsProducer(env: Env): Promise<ProcessingStats> {
+  const stats: ProcessingStats = { processed: 0, skipped: 0, errors: 0, logs_fetched: 0 };
+  const source = env.LOGPUSH_SOURCE === 'r2' ? 'r2' : 'polling';
+  try {
+    if (source === 'r2') {
+      const objectLimit = parseInt(env.OBSERVER_MAX_R2_OBJECTS ?? '200', 10);
+      const r2Stats = await enqueueR2Records(env, { maxObjects: objectLimit });
+      stats.logs_fetched = r2Stats.enqueued + r2Stats.skipped_foreign_gateway;
+      stats.processed = r2Stats.enqueued;
+      stats.errors = r2Stats.read_errors;
+      console.log(
+        `[observer/producer] r2: listed=${r2Stats.listed} enqueued=${r2Stats.enqueued} ` +
+        `skipped_foreign_gateway=${r2Stats.skipped_foreign_gateway} read_errors=${r2Stats.read_errors}`
+      );
+    } else {
+      const logs = await fetchLogs(env, 50);
+      const pStats = await enqueuePollingLogs(env, logs.map((l) => ({
+        id: l.id,
+        provider: l.provider,
+        model: l.model,
+        success: l.success,
+      })));
+      stats.logs_fetched = pStats.enqueued;
+      stats.processed = pStats.enqueued;
+      console.log(`[observer/producer] polling: enqueued=${pStats.enqueued}`);
+    }
+  } catch (error) {
+    console.error('[observer/producer] Fatal error while enqueueing:', error);
+    stats.errors++;
+  }
   return stats;
 }
 

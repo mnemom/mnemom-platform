@@ -26,6 +26,10 @@ OBSERVER_MAX_LOGS = "5000"
 # (idempotency) lands and staging has burned in. See runbook: scale/runbooks/observability-logpush.md.
 LOGPUSH_SOURCE = "polling"
 OBSERVER_MAX_R2_OBJECTS = "200"
+# scale/step-50 / ADR-010: "direct" (pre-step-50 behavior — scheduled() also processes)
+# or "queue" (scheduled() only enqueues; queue() handler processes). Default "direct"
+# at ship time; staging flips first, prod follows once Step 51 (idempotency) is live.
+OBSERVER_PROCESSING_MODE = "direct"
 
 [[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
@@ -36,6 +40,25 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 [[env.production.r2_buckets]]
 binding = "GATEWAY_LOGS_BUCKET"
 bucket_name = "mnemom-gateway-logs"
+
+# Queue producer — Step 50 / ADR-010. scheduled() handler enqueues messages
+# when OBSERVER_PROCESSING_MODE="queue". Queue resource provisioned via
+# mnemom-infra/queues.tf.
+[[env.production.queues.producers]]
+binding    = "OBSERVER_QUEUE"
+queue      = "mnemom-observer-records"
+
+# Queue consumer — Step 50 / ADR-010. Same Worker consumes the queue via
+# the queue() handler. Concurrency + retry posture chosen for ~1M records/day.
+# DLQ bound explicitly for Step 52 alerting.
+[[env.production.queues.consumers]]
+queue                 = "mnemom-observer-records"
+max_batch_size        = 10
+max_batch_timeout     = 10
+max_concurrency       = 5
+max_retries           = 5
+retry_delay           = 30
+dead_letter_queue     = "mnemom-observer-records-dlq"
 
 # Secrets (set via: wrangler secret put <NAME> --env production):
 # SUPABASE_URL (op://mnemom-urls/supabase-url/credential)
@@ -70,6 +93,9 @@ OBSERVER_MAX_LOGS = "5000"
 # PR on this var — see scale/runbooks/observability-logpush.md "Flipping observer to R2".
 LOGPUSH_SOURCE = "r2"
 OBSERVER_MAX_R2_OBJECTS = "200"
+# scale/step-50 / ADR-010: staging flips to "queue" first for soak-testing in a
+# follow-up PR after this merges. Default "direct" at ship time.
+OBSERVER_PROCESSING_MODE = "direct"
 
 [[env.staging.kv_namespaces]]
 binding = "BILLING_CACHE"
@@ -81,6 +107,21 @@ id = "2310e7878a364496b397b88540923c1f"
 [[env.staging.r2_buckets]]
 binding = "GATEWAY_LOGS_BUCKET"
 bucket_name = "mnemom-gateway-logs"
+
+# Queue producer + consumer (staging) — Step 50 / ADR-010. Lower concurrency
+# matches the lighter staging traffic; main queue + dedicated DLQ.
+[[env.staging.queues.producers]]
+binding    = "OBSERVER_QUEUE"
+queue      = "mnemom-observer-records-staging"
+
+[[env.staging.queues.consumers]]
+queue                 = "mnemom-observer-records-staging"
+max_batch_size        = 5
+max_batch_timeout     = 10
+max_concurrency       = 2
+max_retries           = 3
+retry_delay           = 30
+dead_letter_queue     = "mnemom-observer-records-staging-dlq"
 
 # Secrets (set via: wrangler secret put <NAME> --env staging):
 # SUPABASE_URL (op://mnemom-urls/supabase-staging-project-url/credential)
