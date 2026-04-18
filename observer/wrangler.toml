@@ -21,10 +21,21 @@ crons = ["* * * * *"]
 [env.production.vars]
 GATEWAY_ID = "mnemom"
 OBSERVER_MAX_LOGS = "5000"
+# scale/step-49: "polling" (CF AI Gateway REST) or "r2" (mnemom-gateway-logs via ADR-009).
+# Default "polling" preserves pre-step-49 behavior; flip to "r2" only after Step 51
+# (idempotency) lands and staging has burned in. See runbook: scale/runbooks/observability-logpush.md.
+LOGPUSH_SOURCE = "polling"
+OBSERVER_MAX_R2_OBJECTS = "200"
 
 [[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
 id = "d13bd450c5ab4a2c9766f2dc26ce513c"
+
+# R2 bucket binding for the Tier 2 audit stream (ADR-009, ADR-026). Observer
+# reads + deletes objects from `mnemom-gateway-logs` when LOGPUSH_SOURCE="r2".
+[[env.production.r2_buckets]]
+binding = "GATEWAY_LOGS_BUCKET"
+bucket_name = "mnemom-gateway-logs"
 
 # Secrets (set via: wrangler secret put <NAME> --env production):
 # SUPABASE_URL, SUPABASE_KEY
@@ -33,6 +44,8 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 # OTLP_ENDPOINT, OTLP_AUTH
 # STRIPE_SECRET_KEY, TRIGGER_SECRET
 # SLACK_WEBHOOK_URL (DLQ dead-letter alerts)
+# LOGPUSH_DECRYPT_PRIVATE_KEY (RSA-4096 PKCS#8 PEM; required when LOGPUSH_SOURCE="r2";
+#   source: op://mnemom-api-keys/logpush-decrypt-private-key/credential — scale/step-49)
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
@@ -47,10 +60,21 @@ crons = ["*/5 * * * *"]
 [env.staging.vars]
 GATEWAY_ID = "mnemom-staging"
 OBSERVER_MAX_LOGS = "5000"
+# scale/step-49: see comment in env.production.vars. Staging flips to "r2" first
+# for soak-test before prod.
+LOGPUSH_SOURCE = "polling"
+OBSERVER_MAX_R2_OBJECTS = "200"
 
 [[env.staging.kv_namespaces]]
 binding = "BILLING_CACHE"
 id = "2310e7878a364496b397b88540923c1f"
+
+# Shared R2 bucket across mnemom + mnemom-staging gateways. Observer filters records
+# by the plaintext `Gateway` field at ingest; per-gateway isolation enforced at
+# app layer, not at bucket layer.
+[[env.staging.r2_buckets]]
+binding = "GATEWAY_LOGS_BUCKET"
+bucket_name = "mnemom-gateway-logs"
 
 # Secrets (set via: wrangler secret put <NAME> --env staging):
 # SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
@@ -58,3 +82,5 @@ id = "2310e7878a364496b397b88540923c1f"
 # ANTHROPIC_API_KEY, ANALYSIS_API_KEY
 # OTLP_ENDPOINT, OTLP_AUTH
 # TRIGGER_SECRET
+# LOGPUSH_DECRYPT_PRIVATE_KEY (RSA-4096 PKCS#8 PEM; required when LOGPUSH_SOURCE="r2";
+#   source: op://mnemom-api-keys/logpush-decrypt-private-key/credential — scale/step-49)
