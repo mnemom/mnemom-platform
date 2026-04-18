@@ -33,7 +33,11 @@ binding = "BILLING_CACHE"
 id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 
 # Secrets (set via: wrangler secret put <NAME> --env production):
-# SUPABASE_URL, SUPABASE_KEY, CF_AI_GATEWAY_URL
+# SUPABASE_URL (op://mnemom-urls/supabase-url/credential)
+# SUPABASE_SECRET_KEY (modern "sb_secret_..." format, server-side role;
+#   op://mnemom-api-keys/supabase-production-secret-api-key/credential.
+#   Replaces legacy JWT SUPABASE_KEY.)
+# CF_AI_GATEWAY_URL
 # ANTHROPIC_API_KEY, CF_AIG_TOKEN
 # OTLP_ENDPOINT, OTLP_AUTH
 # MNEMOM_ANALYZE_URL, MNEMOM_API_KEY, MNEMOM_LICENSE_JWT
@@ -67,7 +71,8 @@ binding = "BILLING_CACHE"
 id = "2310e7878a364496b397b88540923c1f"
 
 # Secrets (set via: wrangler secret put <NAME> --env staging):
-# SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
+# SUPABASE_URL (op://mnemom-urls/supabase-staging-project-url/credential)
+# SUPABASE_SECRET_KEY (op://mnemom-api-keys/supabase-staging-secret-api-key/credential)
 # CF_AI_GATEWAY_URL (mnemom-staging gateway)
 # ANTHROPIC_API_KEY, CF_AIG_TOKEN
 # OTLP_ENDPOINT, OTLP_AUTH

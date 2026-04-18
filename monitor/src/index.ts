@@ -1,7 +1,7 @@
 interface Env {
   STATUSPAGE_API_KEY: string;
   SUPABASE_URL: string;
-  SUPABASE_KEY: string;
+  SUPABASE_SECRET_KEY: string;
   MONITOR_SECRET: string;
   // CF AI Gateway monitoring (Step 42)
   CLOUDFLARE_API_TOKEN?: string;
@@ -62,8 +62,8 @@ async function checkDatabase(env: Env): Promise<Status> {
   try {
     const res = await fetch(`${env.SUPABASE_URL}/rest/v1/agents?select=id&limit=1`, {
       headers: {
-        'apikey': env.SUPABASE_KEY,
-        'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+        'apikey': env.SUPABASE_SECRET_KEY,
+        'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}`,
       },
       signal: AbortSignal.timeout(10000),
     });
@@ -85,14 +85,14 @@ async function checkObserver(env: Env): Promise<Status> {
       fetch(
         `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?select=timestamp&order=timestamp.desc&limit=1`,
         {
-          headers: { 'apikey': env.SUPABASE_KEY, 'Authorization': `Bearer ${env.SUPABASE_KEY}` },
+          headers: { 'apikey': env.SUPABASE_SECRET_KEY, 'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}` },
           signal: AbortSignal.timeout(10000),
         },
       ),
       fetch(
         `${env.SUPABASE_URL}/rest/v1/traces?select=timestamp&order=timestamp.desc&limit=1`,
         {
-          headers: { 'apikey': env.SUPABASE_KEY, 'Authorization': `Bearer ${env.SUPABASE_KEY}` },
+          headers: { 'apikey': env.SUPABASE_SECRET_KEY, 'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}` },
           signal: AbortSignal.timeout(10000),
         },
       ),
@@ -200,7 +200,7 @@ async function checkAuth(env: Env): Promise<Status> {
   try {
     // Supabase Auth health check
     const res = await fetch(`${env.SUPABASE_URL}/auth/v1/health`, {
-      headers: { 'apikey': env.SUPABASE_KEY },
+      headers: { 'apikey': env.SUPABASE_SECRET_KEY },
       signal: AbortSignal.timeout(10000),
     });
     const ms = Date.now() - start;

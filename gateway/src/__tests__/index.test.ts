@@ -36,7 +36,7 @@ vi.stubGlobal('fetch', mockFetch);
 function createTestEnv(overrides?: Partial<Env>): Env {
   return {
     SUPABASE_URL: 'https://test.supabase.co',
-    SUPABASE_KEY: 'test-supabase-key',
+    SUPABASE_SECRET_KEY: 'test-supabase-key',
     CF_AI_GATEWAY_URL: 'https://gateway.ai.cloudflare.com/v1/test',
     CF_AIG_TOKEN: 'test-aig-token',
     GATEWAY_VERSION: '2.0.0',
@@ -285,8 +285,8 @@ describe('getOrCreateAgent', () => {
       expect.stringContaining(env.SUPABASE_URL),
       expect.objectContaining({
         headers: expect.objectContaining({
-          'apikey': env.SUPABASE_KEY,
-          'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+          'apikey': env.SUPABASE_SECRET_KEY,
+          'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
           'Prefer': 'return=representation',
         }),
@@ -424,8 +424,8 @@ describe('updateKeyPrefix', () => {
       expect.objectContaining({
         method: 'PATCH',
         headers: expect.objectContaining({
-          'apikey': env.SUPABASE_KEY,
-          'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+          'apikey': env.SUPABASE_SECRET_KEY,
+          'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
         }),
         body: JSON.stringify({ key_prefix: 'sk-ant-api03-ver' }),
@@ -1751,8 +1751,8 @@ describe('submitMeteringEvent', () => {
     await submitMeteringEvent(agentId, checkpointId, source, env);
 
     const headers = mockFetch.mock.calls[0][1].headers;
-    expect(headers.apikey).toBe(env.SUPABASE_KEY);
-    expect(headers.Authorization).toBe(`Bearer ${env.SUPABASE_KEY}`);
+    expect(headers.apikey).toBe(env.SUPABASE_SECRET_KEY);
+    expect(headers.Authorization).toBe(`Bearer ${env.SUPABASE_SECRET_KEY}`);
     expect(headers['Content-Type']).toBe('application/json');
   });
 });

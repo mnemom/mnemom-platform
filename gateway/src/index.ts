@@ -164,7 +164,7 @@ type GatewayProvider = 'anthropic' | 'openai' | 'gemini';
 
 export interface Env {
   SUPABASE_URL: string;
-  SUPABASE_KEY: string;
+  SUPABASE_SECRET_KEY: string;
   CF_AI_GATEWAY_URL: string;
   CF_AIG_TOKEN: string;  // AI Gateway authentication token
   GATEWAY_VERSION: string;
@@ -370,8 +370,8 @@ export async function resolveQuotaContext(
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ p_agent_id: agentId }),
@@ -694,8 +694,8 @@ export async function getOrCreateAgent(
   keyPrefix?: string
 ): Promise<{ agent: Agent; isNew: boolean }> {
   const headers = {
-    'apikey': env.SUPABASE_KEY,
-    'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+    'apikey': env.SUPABASE_SECRET_KEY,
+    'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}`,
     'Content-Type': 'application/json',
     'Prefer': 'return=representation',
   };
@@ -781,8 +781,8 @@ export async function ensureAlignmentCard(
   env: Env
 ): Promise<void> {
   const headers = {
-    'apikey': env.SUPABASE_KEY,
-    'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+    'apikey': env.SUPABASE_SECRET_KEY,
+    'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}`,
     'Content-Type': 'application/json',
     'Prefer': 'resolution=ignore-duplicates,return=minimal',
   };
@@ -850,8 +850,8 @@ export async function ensureAlignmentCard(
  */
 export async function updateLastSeen(agentId: string, env: Env): Promise<void> {
   const headers = {
-    'apikey': env.SUPABASE_KEY,
-    'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+    'apikey': env.SUPABASE_SECRET_KEY,
+    'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}`,
     'Content-Type': 'application/json',
   };
 
@@ -873,8 +873,8 @@ export async function updateLastSeen(agentId: string, env: Env): Promise<void> {
 
 export async function updateKeyPrefix(agentId: string, keyPrefix: string, env: Env): Promise<void> {
   const headers = {
-    'apikey': env.SUPABASE_KEY,
-    'Authorization': `Bearer ${env.SUPABASE_KEY}`,
+    'apikey': env.SUPABASE_SECRET_KEY,
+    'Authorization': `Bearer ${env.SUPABASE_SECRET_KEY}`,
     'Content-Type': 'application/json',
   };
   try {
@@ -1071,8 +1071,8 @@ async function fetchRecentCheckpoints(
       `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&order=timestamp.desc&limit=10`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -1119,8 +1119,8 @@ async function fetchPrevChainHash(
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -1151,8 +1151,8 @@ async function fetchMerkleTreeLeaves(
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ p_agent_id: agentId }),
@@ -1184,8 +1184,8 @@ function upsertMerkleTree(
     {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -1216,8 +1216,8 @@ async function storeCheckpoint(
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
           Prefer: 'resolution=merge-duplicates,return=minimal',
         },
@@ -1343,8 +1343,8 @@ async function requestProof(
     const res = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -1414,8 +1414,8 @@ async function deferProof(
     const res = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/verdict_proofs`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -1454,8 +1454,8 @@ export async function submitMeteringEvent(
     const rpcResponse = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_billing_account_for_agent`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ p_agent_id: agentId }),
@@ -1476,8 +1476,8 @@ export async function submitMeteringEvent(
     const insertResponse = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/metering_events`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -1589,8 +1589,8 @@ async function injectPendingNudges(
       `${env.SUPABASE_URL}/rest/v1/enforcement_nudges?agent_id=eq.${agentId}&status=eq.pending&created_at=gte.${fourHoursAgo}&order=created_at.asc&limit=5`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -1646,8 +1646,8 @@ async function createPendingNudge(
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
           Prefer: 'return=minimal',
         },
@@ -1792,8 +1792,8 @@ async function checkAutoContainment(
       `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=auto_containment_threshold,containment_status`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -1813,8 +1813,8 @@ async function checkAutoContainment(
       `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&order=created_at.desc&limit=${threshold + 5}&select=verdict`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -1845,8 +1845,8 @@ async function checkAutoContainment(
     await supabaseFetch(updateUrl.toString(), {
       method: 'PATCH',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -1863,8 +1863,8 @@ async function checkAutoContainment(
     await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/agent_containment_log`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -1933,8 +1933,8 @@ async function countSessionViolations(
       `${env.SUPABASE_URL}/rest/v1/integrity_checkpoints?agent_id=eq.${agentId}&session_id=eq.${sessionId}&verdict=eq.boundary_violation&select=checkpoint_id`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           Prefer: 'count=exact',
         },
       }
@@ -2340,8 +2340,8 @@ async function markNudgesDelivered(
         {
           method: 'PATCH',
           headers: {
-            apikey: env.SUPABASE_KEY,
-            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            apikey: env.SUPABASE_SECRET_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
             'Content-Type': 'application/json',
             Prefer: 'return=minimal',
           },
@@ -2533,8 +2533,8 @@ async function deliverWebhooks(
       `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?agent_id=eq.${checkpoint.agent_id}&select=*`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -2627,8 +2627,8 @@ async function deliverWebhooks(
         await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
           method: 'POST',
           headers: {
-            apikey: env.SUPABASE_KEY,
-            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            apikey: env.SUPABASE_SECRET_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
             'Content-Type': 'application/json',
             Prefer: 'return=minimal',
           },
@@ -2657,8 +2657,8 @@ async function deliverWebhooks(
             {
               method: 'PATCH',
               headers: {
-                apikey: env.SUPABASE_KEY,
-                Authorization: `Bearer ${env.SUPABASE_KEY}`,
+                apikey: env.SUPABASE_SECRET_KEY,
+                Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
                 'Content-Type': 'application/json',
               },
               body: JSON.stringify({
@@ -2697,8 +2697,8 @@ async function deliverSHWebhooks(
       `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?agent_id=eq.${agentId}&select=*`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -2781,8 +2781,8 @@ async function deliverSHWebhooks(
       supabaseFetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
           Prefer: 'return=minimal',
         },
@@ -3039,8 +3039,8 @@ async function fetchPolicyForAgent(
     const response = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_policy_for_agent`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ p_agent_id: lookupId }),
@@ -3092,8 +3092,8 @@ async function fetchPolicyByAgentName(
 } | null> {
   try {
     const headers = {
-      apikey: env.SUPABASE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      apikey: env.SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
       'Content-Type': 'application/json',
     };
 
@@ -3167,8 +3167,8 @@ async function fetchTransactionGuardrails(
     const response = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_transaction_guardrails`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ p_transaction_id: transactionId, p_agent_id: agentId }),
@@ -3221,8 +3221,8 @@ async function submitGatewayPolicyEvaluation(
     const response = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/policy_evaluations`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -3278,8 +3278,8 @@ async function applyGracePeriod(
       `${env.SUPABASE_URL}/rest/v1/tool_first_seen?agent_id=eq.${agentId}&tool_name=in.(${toolFilter})`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -3336,8 +3336,8 @@ async function applyGracePeriod(
       await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/tool_first_seen`, {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
           Prefer: 'return=minimal,resolution=ignore-duplicates',
         },
@@ -3388,8 +3388,8 @@ async function fetchSHConfig(agentId: string, env: Env): Promise<SafeHouseConfig
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ p_agent_id: agentId }),
@@ -3416,8 +3416,8 @@ async function fetchSHThreatPatterns(env: Env): Promise<SafeHouseThreatPattern[]
       `${env.SUPABASE_URL}/rest/v1/sh_threat_patterns?label=eq.malicious&is_active=eq.true&select=id,threat_type,label,content,minhash,pattern_family&order=created_at.desc&limit=500`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -3484,8 +3484,8 @@ async function fetchSHContextFamilies(
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ p_surface: surface, p_industry: industry ?? null }),
@@ -3784,8 +3784,8 @@ async function logSHEvaluation(
     await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/sh_evaluations`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -3817,8 +3817,8 @@ async function incrementSHUsage(agentId: string, env: Env): Promise<void> {
     await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/increment_sh_usage`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ p_agent_id: agentId, p_period_start: today }),
@@ -3849,8 +3849,8 @@ async function logCBDEvaluation(
     await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/sh_exit_evaluations`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -3979,8 +3979,8 @@ async function fetchAgentCanaries(agentId: string, env: Env): Promise<string[]> 
       `${env.SUPABASE_URL}/rest/v1/sh_canaries?agent_id=eq.${agentId}&triggered=eq.false&select=canary_value`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
       }
     );
@@ -4011,8 +4011,8 @@ async function markCanaryTriggered(agentId: string, canaryValue: string, env: En
       {
         method: 'PATCH',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
           Prefer: 'return=minimal',
         },
@@ -4037,8 +4037,8 @@ async function writePreemptiveNudge(
     await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/enforcement_nudges`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -4092,8 +4092,8 @@ async function logQuarantinedMessage(
     await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/quarantined_messages`, {
       method: 'POST',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -4374,8 +4374,8 @@ export async function handleProviderProxy(
           {
             method: 'POST',
             headers: {
-              apikey: env.SUPABASE_KEY,
-              Authorization: `Bearer ${env.SUPABASE_KEY}`,
+              apikey: env.SUPABASE_SECRET_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({ p_key_hash: mnemomKeyHash }),
