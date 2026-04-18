@@ -25,7 +25,7 @@ import type { AlignmentCard } from '@mnemom/agent-alignment-protocol';
 /** Minimal env matching the observer's Env interface */
 const mockEnv = {
   SUPABASE_URL: 'https://mock.supabase.co',
-  SUPABASE_KEY: 'mock-service-key',
+  SUPABASE_SECRET_KEY: 'mock-service-key',
   ANTHROPIC_API_KEY: 'mock-anthropic-key',
   ANALYSIS_API_KEY: 'mock-analysis-key',
   CF_AI_GATEWAY_URL: 'https://mock-gateway.ai',
@@ -680,8 +680,8 @@ describe('Checkpoint Submission', () => {
       {
         method: 'POST',
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
           'Content-Type': 'application/json',
           Prefer: 'resolution=merge-duplicates,return=minimal',
         },

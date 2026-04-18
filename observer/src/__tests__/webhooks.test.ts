@@ -24,7 +24,7 @@ interface Env {
   CF_API_TOKEN: string;
   GATEWAY_ID: string;
   SUPABASE_URL: string;
-  SUPABASE_KEY: string;
+  SUPABASE_SECRET_KEY: string;
   ANTHROPIC_API_KEY: string;
   TRIGGER_SECRET: string;
   SLACK_WEBHOOK_URL?: string;
@@ -113,8 +113,8 @@ async function deliverAAPWebhooks(
       `${env.SUPABASE_URL}/rest/v1/aip_webhook_registrations?agent_id=eq.${trace.agent_id}&select=*`,
       {
         headers: {
-          apikey: env.SUPABASE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_KEY}`,
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         },
         signal: controller.signal,
       }
@@ -235,8 +235,8 @@ async function deliverAAPWebhooks(
         await fetch(`${env.SUPABASE_URL}/rest/v1/aip_webhook_deliveries`, {
           method: 'POST',
           headers: {
-            apikey: env.SUPABASE_KEY,
-            Authorization: `Bearer ${env.SUPABASE_KEY}`,
+            apikey: env.SUPABASE_SECRET_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
             'Content-Type': 'application/json',
             Prefer: 'return=minimal',
           },
@@ -255,8 +255,8 @@ async function deliverAAPWebhooks(
             {
               method: 'PATCH',
               headers: {
-                apikey: env.SUPABASE_KEY,
-                Authorization: `Bearer ${env.SUPABASE_KEY}`,
+                apikey: env.SUPABASE_SECRET_KEY,
+                Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
                 'Content-Type': 'application/json',
               },
               body: JSON.stringify({
@@ -341,7 +341,7 @@ function createMockEnv(): Env {
     CF_API_TOKEN: 'test-token',
     GATEWAY_ID: 'test-gateway',
     SUPABASE_URL: 'https://test.supabase.co',
-    SUPABASE_KEY: 'test-key',
+    SUPABASE_SECRET_KEY: 'test-key',
     ANTHROPIC_API_KEY: 'test-anthropic',
     TRIGGER_SECRET: 'test-secret',
   };
@@ -728,8 +728,8 @@ async function patchDelivery(
     {
       method: 'PATCH',
       headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -779,8 +779,8 @@ async function retryDLQWebhooks(env: Env): Promise<void> {
 
   const response = await fetch(queryUrl, {
     headers: {
-      apikey: env.SUPABASE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      apikey: env.SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
     },
   });
 

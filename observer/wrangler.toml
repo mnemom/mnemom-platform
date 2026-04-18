@@ -38,7 +38,10 @@ binding = "GATEWAY_LOGS_BUCKET"
 bucket_name = "mnemom-gateway-logs"
 
 # Secrets (set via: wrangler secret put <NAME> --env production):
-# SUPABASE_URL, SUPABASE_KEY
+# SUPABASE_URL (op://mnemom-urls/supabase-url/credential)
+# SUPABASE_SECRET_KEY (modern "sb_secret_..." format, bypass-RLS server-side role;
+#   op://mnemom-api-keys/supabase-production-secret-api-key/credential. Replaces
+#   the legacy JWT SUPABASE_KEY — do not re-introduce the legacy name.)
 # CF_ACCOUNT_ID, CF_API_TOKEN, CF_AI_GATEWAY_URL
 # ANTHROPIC_API_KEY, ANALYSIS_API_KEY
 # OTLP_ENDPOINT, OTLP_AUTH
@@ -78,7 +81,9 @@ binding = "GATEWAY_LOGS_BUCKET"
 bucket_name = "mnemom-gateway-logs"
 
 # Secrets (set via: wrangler secret put <NAME> --env staging):
-# SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
+# SUPABASE_URL (op://mnemom-urls/supabase-staging-project-url/credential)
+# SUPABASE_SECRET_KEY (modern "sb_secret_..." format;
+#   op://mnemom-api-keys/supabase-staging-secret-api-key/credential)
 # CF_ACCOUNT_ID, CF_API_TOKEN, CF_AI_GATEWAY_URL (mnemom-staging)
 # ANTHROPIC_API_KEY, ANALYSIS_API_KEY
 # OTLP_ENDPOINT, OTLP_AUTH
