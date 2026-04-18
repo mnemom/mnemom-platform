@@ -38,7 +38,7 @@ function makeKV() {
 function makeEnv(withKV: boolean) {
   return {
     SUPABASE_URL,
-    SUPABASE_KEY: 'test-key',
+    SUPABASE_SECRET_KEY: 'test-key',
     BILLING_CACHE: withKV ? makeKV() : undefined,
   } as any;
 }
