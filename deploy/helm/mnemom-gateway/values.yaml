@@ -108,7 +108,7 @@ secrets:
   # -- Inline secret values (only used when existingSecret is empty)
   values:
     SUPABASE_URL: ""
-    SUPABASE_KEY: ""
+    SUPABASE_SECRET_KEY: ""
     ANTHROPIC_API_KEY: ""
     MNEMOM_LICENSE_JWT: ""
     DATABASE_URL: ""

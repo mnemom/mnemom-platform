@@ -19,7 +19,7 @@ import { AI_GATEWAY_SENTINEL } from './fetch-interceptor.js';
 
 export interface GatewayEnv {
   SUPABASE_URL: string;
-  SUPABASE_KEY: string;
+  SUPABASE_SECRET_KEY: string;
   CF_AI_GATEWAY_URL: string;
   CF_AIG_TOKEN: string;
   GATEWAY_VERSION: string;
@@ -46,7 +46,7 @@ export interface ObserverEnv {
   CF_AI_GATEWAY_URL?: string;
   GATEWAY_ID: string;
   SUPABASE_URL: string;
-  SUPABASE_KEY: string;
+  SUPABASE_SECRET_KEY: string;
   ANTHROPIC_API_KEY: string;
   ANALYSIS_API_KEY?: string;
   OTLP_ENDPOINT?: string;
@@ -60,7 +60,7 @@ export interface ObserverEnv {
 
 export interface ApiEnv {
   SUPABASE_URL: string;
-  SUPABASE_KEY: string;
+  SUPABASE_SECRET_KEY: string;
   SUPABASE_JWT_SECRET: string;
   MNEMOM_PUBLISH_KEY: string;
   STRIPE_SECRET_KEY: string;
@@ -103,11 +103,11 @@ function env(key: string, fallback?: string): string {
 // ---------------------------------------------------------------------------
 
 export function buildGatewayEnv(kv?: KVNamespace): GatewayEnv {
-  requireEnv(['SUPABASE_URL', 'SUPABASE_KEY', 'ANTHROPIC_API_KEY']);
+  requireEnv(['SUPABASE_URL', 'SUPABASE_SECRET_KEY', 'ANTHROPIC_API_KEY']);
 
   return {
     SUPABASE_URL: env('SUPABASE_URL'),
-    SUPABASE_KEY: env('SUPABASE_KEY'),
+    SUPABASE_SECRET_KEY: env('SUPABASE_SECRET_KEY'),
     CF_AI_GATEWAY_URL: AI_GATEWAY_SENTINEL,
     CF_AIG_TOKEN: env('CF_AIG_TOKEN', 'self-hosted'),
     GATEWAY_VERSION: env('GATEWAY_VERSION', '1.0.0-selfhosted'),
@@ -126,7 +126,7 @@ export function buildGatewayEnv(kv?: KVNamespace): GatewayEnv {
 }
 
 export function buildObserverEnv(): ObserverEnv {
-  requireEnv(['SUPABASE_URL', 'SUPABASE_KEY', 'ANTHROPIC_API_KEY']);
+  requireEnv(['SUPABASE_URL', 'SUPABASE_SECRET_KEY', 'ANTHROPIC_API_KEY']);
 
   return {
     // Self-hosted: no CF account — set to empty; CF API calls fail gracefully
@@ -135,7 +135,7 @@ export function buildObserverEnv(): ObserverEnv {
     CF_AI_GATEWAY_URL: process.env.CF_AI_GATEWAY_URL,
     GATEWAY_ID: env('GATEWAY_ID', 'self-hosted'),
     SUPABASE_URL: env('SUPABASE_URL'),
-    SUPABASE_KEY: env('SUPABASE_KEY'),
+    SUPABASE_SECRET_KEY: env('SUPABASE_SECRET_KEY'),
     ANTHROPIC_API_KEY: env('ANTHROPIC_API_KEY'),
     ANALYSIS_API_KEY: process.env.ANALYSIS_API_KEY,
     OTLP_ENDPOINT: process.env.OTLP_ENDPOINT,
@@ -147,14 +147,14 @@ export function buildObserverEnv(): ObserverEnv {
 export function buildApiEnv(kv?: KVNamespace): ApiEnv {
   requireEnv([
     'SUPABASE_URL',
-    'SUPABASE_KEY',
+    'SUPABASE_SECRET_KEY',
     'SUPABASE_JWT_SECRET',
     'ANTHROPIC_API_KEY',
   ]);
 
   return {
     SUPABASE_URL: env('SUPABASE_URL'),
-    SUPABASE_KEY: env('SUPABASE_KEY'),
+    SUPABASE_SECRET_KEY: env('SUPABASE_SECRET_KEY'),
     SUPABASE_JWT_SECRET: env('SUPABASE_JWT_SECRET'),
     MNEMOM_PUBLISH_KEY: env('MNEMOM_PUBLISH_KEY', ''),
     STRIPE_SECRET_KEY: env('STRIPE_SECRET_KEY', ''),

@@ -59,7 +59,7 @@ services:
     environment:
       MNEMOM_ROLE: gateway
       SUPABASE_URL: http://postgres:5432
-      SUPABASE_KEY: ${SUPABASE_KEY}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY}
       REDIS_URL: redis://redis:6379
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       MNEMOM_LICENSE_JWT: ${MNEMOM_LICENSE_JWT}
@@ -90,7 +90,7 @@ services:
     environment:
       MNEMOM_ROLE: scheduler
       SUPABASE_URL: http://postgres:5432
-      SUPABASE_KEY: ${SUPABASE_KEY}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY}
       REDIS_URL: redis://redis:6379
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       MNEMOM_LICENSE_JWT: ${MNEMOM_LICENSE_JWT}
