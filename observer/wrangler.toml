@@ -33,9 +33,18 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 
 # R2 bucket binding for the Tier 2 audit stream (ADR-009, ADR-026). Observer
 # reads + deletes objects from `mnemom-gateway-logs` when LOGPUSH_SOURCE="r2".
-[[env.production.r2_buckets]]
-binding = "GATEWAY_LOGS_BUCKET"
-bucket_name = "mnemom-gateway-logs"
+#
+# Temporarily commented out pending a deploy-token permission expansion —
+# `wrangler deploy` validates R2 bindings against the CF account, and the
+# CI token in mnemom/deploy does not yet have "Workers R2 Storage: Read"
+# scope. See deploy run #806 (2026-04-18) for context. Re-enable in the
+# follow-up PR that flips LOGPUSH_SOURCE="r2" once the token scope lands.
+# With no binding, fetchR2Batch() throws "GATEWAY_LOGS_BUCKET binding is
+# not configured" and the observer auto-falls-through to polling on every
+# tick — safe for staging and production.
+# [[env.production.r2_buckets]]
+# binding = "GATEWAY_LOGS_BUCKET"
+# bucket_name = "mnemom-gateway-logs"
 
 # Secrets (set via: wrangler secret put <NAME> --env production):
 # SUPABASE_URL, SUPABASE_KEY
@@ -72,9 +81,11 @@ id = "2310e7878a364496b397b88540923c1f"
 # Shared R2 bucket across mnemom + mnemom-staging gateways. Observer filters records
 # by the plaintext `Gateway` field at ingest; per-gateway isolation enforced at
 # app layer, not at bucket layer.
-[[env.staging.r2_buckets]]
-binding = "GATEWAY_LOGS_BUCKET"
-bucket_name = "mnemom-gateway-logs"
+#
+# Temporarily commented out — see note under [env.production.r2_buckets] above.
+# [[env.staging.r2_buckets]]
+# binding = "GATEWAY_LOGS_BUCKET"
+# bucket_name = "mnemom-gateway-logs"
 
 # Secrets (set via: wrangler secret put <NAME> --env staging):
 # SUPABASE_URL (staging project), SUPABASE_KEY (staging project)
