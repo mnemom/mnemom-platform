@@ -60,9 +60,10 @@ crons = ["*/5 * * * *"]
 [env.staging.vars]
 GATEWAY_ID = "mnemom-staging"
 OBSERVER_MAX_LOGS = "5000"
-# scale/step-49: see comment in env.production.vars. Staging flips to "r2" first
-# for soak-test before prod.
-LOGPUSH_SOURCE = "polling"
+# scale/step-49.5 (2026-04-18): staging flipped to R2 for soak-test. Production
+# stays on "polling" until Step 51 (idempotency) ships. Rolling back is a one-line
+# PR on this var — see scale/runbooks/observability-logpush.md "Flipping observer to R2".
+LOGPUSH_SOURCE = "r2"
 OBSERVER_MAX_R2_OBJECTS = "200"
 
 [[env.staging.kv_namespaces]]
