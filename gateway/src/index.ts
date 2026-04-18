@@ -44,7 +44,6 @@ import {
   generateCertificateId,
 } from './attestation';
 import { readStreamToText, parseSSEEvents } from './sse-parser';
-import { mergeOrgAndAgentCard } from './card-merge';
 import {
   mapUnifiedCardToAAP,
   mapCanonicalToSafeHouseConfig,
@@ -1011,6 +1010,14 @@ function mapCardToAIP(cardJson: Record<string, any>): AIPAlignmentCard {
 
 /**
  * Fetch alignment card, conscience values, and enforcement mode for an agent.
+ *
+ * Reads the canonical pre-composed card from `canonical_agent_cards`. The
+ * UC-6 transitional fallback to legacy `alignment_cards` + `agents` dormant
+ * columns + per-request org-template merge was removed in the 2026-04-17+
+ * hardening pass after the 7-day zero-fallback observation window closed.
+ * Missing canonical rows are now a hard error — the composition pipeline
+ * (handleComposeAgent / recompose_pending) is responsible for keeping every
+ * active agent's canonical row current.
  */
 async function fetchAlignmentData(
   agentId: string,
@@ -1020,9 +1027,6 @@ async function fetchAlignmentData(
   conscienceValues: ConscienceValue[] | null;
   enforcementMode: string;
 }> {
-  // UC-6: prefer the pre-composed canonical alignment card written by the
-  // composition engine. Emits a structured card_source log so UC-14 can
-  // verify the fallback rate decays to zero.
   try {
     const canonical = await fetchCanonicalAlignmentCard(agentId, env);
     if (canonical) {
@@ -1038,196 +1042,19 @@ async function fetchAlignmentData(
         enforcementMode: integrityPayload?.enforcement_mode ?? 'observe',
       };
     }
-    console.log(JSON.stringify({
-      event: 'card_read', card_source: 'canonical_miss_fallback', agent_id: agentId,
+    // Canonical row missing — log loudly so the composition pipeline gets
+    // a nudge, but don't fall back to the pre-UC columns (which no longer
+    // exist post-migration-129). Return the fail-open defaults.
+    console.error(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_missing', agent_id: agentId,
     }));
+    return { card: null, conscienceValues: null, enforcementMode: 'observe' };
   } catch (err) {
-    console.log(JSON.stringify({
-      event: 'card_read', card_source: 'canonical_error_fallback', agent_id: agentId,
+    console.error(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_error', agent_id: agentId,
       error: err instanceof Error ? err.message : String(err),
     }));
-  }
-
-  try {
-    const supabaseHeaders = {
-      apikey: env.SUPABASE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_KEY}`,
-    };
-
-    // Fetch card + conscience values, enforcement mode, org conscience values, and org card template in parallel
-    const [cardResponse, agentResponse, orgCvResult, orgCardTemplateResult] = await Promise.all([
-      supabaseFetch(
-        `${env.SUPABASE_URL}/rest/v1/alignment_cards?agent_id=eq.${agentId}&is_active=eq.true&limit=1`,
-        { headers: supabaseHeaders }
-      ),
-      supabaseFetch(
-        `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=aip_enforcement_mode,org_card_exempt&limit=1`,
-        { headers: supabaseHeaders }
-      ),
-      fetchOrgConscienceValuesForGateway(agentId, env),
-      fetchOrgCardTemplateForAgent(agentId, env),
-    ]);
-
-    // Parse card data
-    let card: Record<string, any> | null = null;
-    let perAgentValues: ConscienceValue[] | null = null;
-    if (cardResponse.ok) {
-      const cards = (await cardResponse.json()) as Array<{
-        card_json: Record<string, any>;
-        conscience_values?: ConscienceValue[];
-      }>;
-      if (cards.length > 0) {
-        card = cards[0].card_json || null;
-        perAgentValues = cards[0].conscience_values || null;
-      }
-    } else {
-      console.warn(`[gateway/aip] Failed to fetch card for ${agentId}: ${cardResponse.status}`);
-    }
-
-    // Parse enforcement mode and org card exemption from agents table
-    let enforcementMode = 'observe';
-    let orgCardExempt = false;
-    if (agentResponse.ok) {
-      const agents = (await agentResponse.json()) as Array<{
-        aip_enforcement_mode?: string;
-        org_card_exempt?: boolean;
-      }>;
-      if (agents.length > 0) {
-        enforcementMode = agents[0].aip_enforcement_mode || 'observe';
-        orgCardExempt = agents[0].org_card_exempt === true;
-      }
-    }
-
-    // Phase 3c: Merge org card template with agent card to produce canonical card
-    const orgCardTemplate = (orgCardTemplateResult?.card_template_enabled
-      ? orgCardTemplateResult.card_template
-      : null) ?? null;
-    card = mergeOrgAndAgentCard(orgCardTemplate, card, orgCardExempt);
-
-    // Layered conscience values resolution:
-    // 1. Base: defaults (augment) or empty (replace)
-    // 2. Org layer: custom org values (always applied)
-    // 3. Agent layer: per-agent values from alignment card (additive)
-    let conscienceValues: ConscienceValue[] | null = null;
-    if (orgCvResult && orgCvResult.enabled && orgCvResult.values && orgCvResult.values.length > 0) {
-      if (orgCvResult.mode === 'replace') {
-        conscienceValues = orgCvResult.values.map((v: any) => ({ id: v.name, content: v.description, type: v.type }));
-      } else {
-        // augment: defaults + org values
-        conscienceValues = [
-          ...DEFAULT_CONSCIENCE_VALUES,
-          ...orgCvResult.values.map((v: any) => ({ id: v.name, content: v.description, type: v.type })),
-        ];
-      }
-      // Per-agent values are additive on top of org layer
-      if (perAgentValues && perAgentValues.length > 0) {
-        conscienceValues = [...conscienceValues, ...perAgentValues];
-      }
-    } else if (perAgentValues && perAgentValues.length > 0) {
-      // No org values, but per-agent values exist — use them with defaults
-      conscienceValues = perAgentValues;
-    }
-
-    return { card, conscienceValues, enforcementMode };
-  } catch (error) {
-    console.error(`[gateway/aip] Error fetching alignment data for ${agentId}:`, error);
     return { card: null, conscienceValues: null, enforcementMode: 'observe' };
-  }
-}
-
-/**
- * Fetch org-level conscience values for an agent.
- * Uses KV cache (30-min TTL) → Supabase RPC. Fail-open: returns null on error.
- */
-async function fetchOrgConscienceValuesForGateway(
-  agentId: string,
-  env: Env
-): Promise<{ enabled: boolean; mode?: string; values?: Array<{ name: string; description: string; type: string }> } | null> {
-  const cacheKey = `org-cv:agent:${agentId}`;
-  try {
-    // Check KV cache first
-    if (env.BILLING_CACHE) {
-      const cached = await env.BILLING_CACHE.get(cacheKey);
-      if (cached) {
-        return JSON.parse(cached);
-      }
-    }
-
-    // Call RPC
-    const response = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_org_conscience_values_for_agent`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ p_agent_id: agentId }),
-    });
-
-    if (!response.ok) {
-      console.warn(`[gateway/cv] RPC failed for ${agentId}: ${response.status}`);
-      return { enabled: false };
-    }
-
-    const result = await response.json() as Record<string, unknown>;
-
-    // Cache for 30 minutes
-    if (env.BILLING_CACHE) {
-      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 1800 }).catch(() => {});
-    }
-
-    return result as any;
-  } catch (error) {
-    console.warn('[gateway/cv] fetchOrgConscienceValues failed (fail-open):', error);
-    return { enabled: false };
-  }
-}
-
-/**
- * Fetch org card template for an agent (Phase 3c).
- * Uses KV cache (30-min TTL) → Supabase RPC. Fail-open: returns null on error.
- */
-async function fetchOrgCardTemplateForAgent(
-  agentId: string,
-  env: Env
-): Promise<{ card_template_enabled: boolean; card_template?: Record<string, any> } | null> {
-  const cacheKey = `org-card-tpl:agent:${agentId}`;
-  try {
-    // Check KV cache first
-    if (env.BILLING_CACHE) {
-      const cached = await env.BILLING_CACHE.get(cacheKey);
-      if (cached) {
-        return JSON.parse(cached);
-      }
-    }
-
-    // Call RPC
-    const response = await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_org_card_template_for_agent`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ p_agent_id: agentId }),
-    });
-
-    if (!response.ok) {
-      console.warn(`[gateway/card-tpl] RPC failed for ${agentId}: ${response.status}`);
-      return { card_template_enabled: false };
-    }
-
-    const result = await response.json() as Record<string, unknown>;
-
-    // Cache for 30 minutes
-    if (env.BILLING_CACHE) {
-      await env.BILLING_CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 1800 }).catch(() => {});
-    }
-
-    return result as any;
-  } catch (error) {
-    console.warn('[gateway/card-tpl] fetchOrgCardTemplate failed (fail-open):', error);
-    return { card_template_enabled: false };
   }
 }
 

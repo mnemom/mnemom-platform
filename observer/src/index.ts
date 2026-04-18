@@ -28,7 +28,6 @@ import {
 } from '@mnemom/agent-alignment-protocol';
 
 import { createWorkersExporter, type WorkersOTelExporter } from '@mnemom/aip-otel-exporter/workers';
-import { mergeOrgAndAgentCard } from './card-merge';
 import { mapUnifiedCardToAAP, fetchCanonicalAlignmentCard } from './card-mappers';
 // Note: fetchCanonicalAlignmentCardRaw returns the unified-shape card without
 // mapping — used by the policy-eval block, which needs the unified capabilities
@@ -1601,17 +1600,20 @@ async function analyzeWithHaiku(
 // ============================================================================
 
 /**
- * Fetch the active alignment card for an agent, merged with org card template (Phase 3c).
- * If the agent's org has a card template enabled (and the agent is not exempt),
- * the org template is merged as a base layer under the agent card.
+ * Fetch the active alignment card for an agent.
+ *
+ * Reads the canonical pre-composed card from `canonical_agent_cards`. The
+ * UC-7 transitional fallback to legacy `alignment_cards` + `agents` dormant
+ * columns + per-request org-template merge was removed in the 2026-04-17+
+ * hardening pass after the 7-day zero-fallback observation window closed.
+ * Missing canonical rows are now a hard error — the composition pipeline
+ * (handleComposeAgent / recompose_pending) keeps every active agent's
+ * canonical row current.
  */
 async function fetchCard(
   agentId: string,
   env: Env
 ): Promise<AlignmentCard | null> {
-  // UC-7: prefer the pre-composed canonical alignment card. Emits a
-  // structured card_source log so UC-14 can verify the fallback rate
-  // decays to zero.
   try {
     const canonical = await fetchCanonicalAlignmentCard(agentId, env);
     if (canonical) {
@@ -1620,93 +1622,19 @@ async function fetchCard(
       }));
       return mapUnifiedCardToAAP(canonical) as unknown as AlignmentCard;
     }
-    console.log(JSON.stringify({
-      event: 'card_read', card_source: 'canonical_miss_fallback', agent_id: agentId,
+    // Canonical row missing — log loudly so the composition pipeline gets
+    // a nudge, but don't fall back to the pre-UC columns (which no longer
+    // exist post-migration-129).
+    console.error(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_missing', agent_id: agentId,
     }));
+    return null;
   } catch (err) {
-    console.log(JSON.stringify({
-      event: 'card_read', card_source: 'canonical_error_fallback', agent_id: agentId,
+    console.error(JSON.stringify({
+      event: 'card_read', card_source: 'canonical_error', agent_id: agentId,
       error: err instanceof Error ? err.message : String(err),
     }));
-  }
-
-  try {
-    const supabaseHeaders = {
-      apikey: env.SUPABASE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_KEY}`,
-    };
-
-    // Fetch card, agent exemption status, and org card template in parallel
-    const [cardResponse, agentResponse, orgCardTemplateResult] = await Promise.all([
-      observerSupabaseFetch(
-        `${env.SUPABASE_URL}/rest/v1/alignment_cards?agent_id=eq.${agentId}&is_active=eq.true&limit=1`,
-        { headers: supabaseHeaders }
-      ),
-      observerSupabaseFetch(
-        `${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=org_card_exempt&limit=1`,
-        { headers: supabaseHeaders }
-      ),
-      fetchOrgCardTemplateForObserver(agentId, env),
-    ]);
-
-    // Parse agent card
-    let agentCard: AlignmentCard | null = null;
-    if (cardResponse.ok) {
-      const cards = (await cardResponse.json()) as Array<{ card_json: AlignmentCard }>;
-      agentCard = cards[0]?.card_json || null;
-    } else {
-      console.warn(`[observer] Failed to fetch card for ${agentId}: ${cardResponse.status}`);
-    }
-
-    // Parse agent exemption status
-    let orgCardExempt = false;
-    if (agentResponse.ok) {
-      const agents = (await agentResponse.json()) as Array<{ org_card_exempt?: boolean }>;
-      if (agents.length > 0) {
-        orgCardExempt = agents[0].org_card_exempt === true;
-      }
-    }
-
-    // Phase 3c: Merge org card template with agent card
-    const orgCardTemplate = (orgCardTemplateResult?.card_template_enabled
-      ? orgCardTemplateResult.card_template
-      : null) ?? null;
-
-    return mergeOrgAndAgentCard(orgCardTemplate, agentCard as Record<string, any> | null, orgCardExempt) as AlignmentCard | null;
-  } catch (error) {
-    console.error(`[observer] Error fetching card for ${agentId}:`, error);
     return null;
-  }
-}
-
-/**
- * Fetch org card template for an agent (Phase 3c).
- * Uses Supabase RPC. Fail-open: returns null on error.
- */
-async function fetchOrgCardTemplateForObserver(
-  agentId: string,
-  env: Env
-): Promise<{ card_template_enabled: boolean; card_template?: Record<string, any> } | null> {
-  try {
-    const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/rpc/get_org_card_template_for_agent`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ p_agent_id: agentId }),
-    });
-
-    if (!response.ok) {
-      console.warn(`[observer/card-tpl] RPC failed for ${agentId}: ${response.status}`);
-      return { card_template_enabled: false };
-    }
-
-    return (await response.json()) as any;
-  } catch (error) {
-    console.warn('[observer/card-tpl] fetchOrgCardTemplate failed (fail-open):', error);
-    return { card_template_enabled: false };
   }
 }
 
