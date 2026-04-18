@@ -124,6 +124,10 @@ interface Env {
   // Cap on R2 objects fetched per tick. Each object holds one record in practice;
   // OBSERVER_MAX_LOGS still bounds total records processed across both sources.
   OBSERVER_MAX_R2_OBJECTS?: string;
+  // BetterStack heartbeat URL. Observer POSTs here after every successful cron
+  // tick; missing posts within the BS grace window trigger a paging incident.
+  // Set per-env (prod period=60s, staging period=300s). Absence = no-op.
+  BETTERSTACK_HEARTBEAT_URL?: string;
 }
 
 interface GatewayLog {
@@ -245,6 +249,21 @@ export default {
       // Flush OTel spans for all processed logs in one batch
       if (otelExporter) {
         ctx.waitUntil(otelExporter.flush());
+      }
+
+      // BetterStack heartbeat — emitted only on successful tick completion.
+      // Fire-and-forget; a failed POST never affects observer operation.
+      // Positioned inside the try block + before the catch so a throw from
+      // processAllLogs suppresses the heartbeat → BS grace window expires →
+      // incident fires. This is the one alert that proves cron liveness.
+      if (env.BETTERSTACK_HEARTBEAT_URL) {
+        ctx.waitUntil(
+          fetch(env.BETTERSTACK_HEARTBEAT_URL, { method: 'POST' }).catch((err) => {
+            console.warn(
+              `[observer] heartbeat post failed: ${err instanceof Error ? err.message : String(err)}`
+            );
+          })
+        );
       }
     } catch (error) {
       console.error('[observer] Fatal error in scheduled handler:', error);

@@ -49,6 +49,8 @@ bucket_name = "mnemom-gateway-logs"
 # SLACK_WEBHOOK_URL (DLQ dead-letter alerts)
 # LOGPUSH_DECRYPT_PRIVATE_KEY (RSA-4096 PKCS#8 PEM; required when LOGPUSH_SOURCE="r2";
 #   source: op://mnemom-api-keys/logpush-decrypt-private-key/credential — scale/step-49)
+# BETTERSTACK_HEARTBEAT_URL (BS heartbeat URL for cron liveness; period=60s, grace=120s;
+#   source: op://mnemom-api-keys/betterstack-heartbeat-observer-production/credential)
 
 # ─── Staging ──────────────────────────────────────────────────────────────────
 [env.staging]
@@ -90,3 +92,5 @@ bucket_name = "mnemom-gateway-logs"
 # TRIGGER_SECRET
 # LOGPUSH_DECRYPT_PRIVATE_KEY (RSA-4096 PKCS#8 PEM; required when LOGPUSH_SOURCE="r2";
 #   source: op://mnemom-api-keys/logpush-decrypt-private-key/credential — scale/step-49)
+# BETTERSTACK_HEARTBEAT_URL (BS heartbeat URL for cron liveness; period=300s, grace=600s;
+#   source: op://mnemom-api-keys/betterstack-heartbeat-observer-staging/credential)
