@@ -43,6 +43,7 @@ import {
 } from '@mnemom/policy-engine';
 import { createCircuitBreaker, checkAndReset, recordSuccess, recordFailure } from './circuit-breaker';
 import { computeBandHashes, deserializeMinHash } from '@mnemom/safe-house';
+import { fetchR2Batch } from './r2-ingest';
 
 const AAP_VERSION = '1.0';
 const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
@@ -114,6 +115,16 @@ interface Env {
   OBSERVER_MAX_LOGS?: string; // Max logs per cron tick; default "5000"; parsed as int
   BILLING_CACHE?: KVNamespace; // Shared KV namespace with gateway — used for LSH index
   SLACK_WEBHOOK_URL?: string; // Slack incoming webhook for DLQ dead-letter alerts
+  // R2-based log ingestion (ADR-009, ADR-026, scale/step-49).
+  // LOGPUSH_SOURCE="r2" reads from GATEWAY_LOGS_BUCKET first; any failure or empty
+  // list falls through to the CF AI Gateway REST polling path on the same tick.
+  // Default "polling" preserves pre-step-49 behavior.
+  LOGPUSH_SOURCE?: string;
+  GATEWAY_LOGS_BUCKET?: R2Bucket;
+  LOGPUSH_DECRYPT_PRIVATE_KEY?: string;
+  // Cap on R2 objects fetched per tick. Each object holds one record in practice;
+  // OBSERVER_MAX_LOGS still bounds total records processed across both sources.
+  OBSERVER_MAX_R2_OBJECTS?: string;
 }
 
 interface GatewayLog {
@@ -350,7 +361,42 @@ function createOTelExporter(env: Env) {
 // ============================================================================
 
 /**
- * Process all pending logs from the AI Gateway.
+ * Process all pending logs per cron tick.
+ *
+ * Sources (ADR-009, ADR-026):
+ *   - "r2"      — read from R2 bucket `mnemom-gateway-logs` (dataset `ai_gateway_events`,
+ *                 per-field encrypted). Primary source once Logpush is flipped on.
+ *   - "polling" — read from CF AI Gateway REST API (existing path). Default and fallback.
+ *
+ * Selection is via env.LOGPUSH_SOURCE. On any failure in the R2 path (list/read/decrypt
+ * throws, or zero usable records after a successful list), falls through to the polling
+ * path on the same tick so no cron tick is silently empty.
+ */
+async function processAllLogs(
+  env: Env,
+  ctx: ExecutionContext,
+  otelExporter?: WorkersOTelExporter | null
+): Promise<ProcessingStats> {
+  const source = env.LOGPUSH_SOURCE === 'r2' ? 'r2' : 'polling';
+  if (source === 'r2') {
+    try {
+      const r2Stats = await processR2Batch(env, ctx, otelExporter);
+      if (r2Stats.logs_fetched > 0) {
+        emitTickSummary(env, r2Stats, 'r2');
+        return r2Stats;
+      }
+      console.log('[observer] R2 source empty this tick — falling through to polling');
+    } catch (error) {
+      console.warn(`[observer] R2 source failed — falling through to polling: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const stats = await processPollingBatch(env, ctx, otelExporter);
+  emitTickSummary(env, stats, source === 'r2' ? 'polling (fallback)' : 'polling');
+  return stats;
+}
+
+/**
+ * Poll CF AI Gateway REST API for pending logs.
  *
  * Fetches logs in batches until the queue is exhausted or the per-tick safety
  * limit (OBSERVER_MAX_LOGS, default 5000) is hit. Each processed/skipped log
@@ -358,7 +404,7 @@ function createOTelExporter(env: Env) {
  * Because deletions advance the queue, we always fetch page 1 — incrementing
  * the page number would skip logs that shifted into lower positions after deletion.
  */
-async function processAllLogs(
+async function processPollingBatch(
   env: Env,
   ctx: ExecutionContext,
   otelExporter?: WorkersOTelExporter | null
@@ -399,10 +445,19 @@ async function processAllLogs(
     throw error;
   }
 
-  // Structured tick summary for dashboards / alerting
+  return stats;
+}
+
+/**
+ * Emit the structured per-tick summary (console + OTel). Shared between the
+ * polling and R2 paths so dashboards see a consistent shape regardless of source.
+ */
+function emitTickSummary(env: Env, stats: ProcessingStats, source: string): void {
+  const safetyLimit = parseInt(env.OBSERVER_MAX_LOGS ?? '5000', 10);
   const backlog_estimate = stats.logs_fetched >= safetyLimit ? `>=${safetyLimit}` : 0;
   console.log(
     JSON.stringify({
+      source,
       logs_fetched: stats.logs_fetched,
       logs_processed: stats.processed,
       logs_errored: stats.errors,
@@ -415,7 +470,6 @@ async function processAllLogs(
     console.warn(`[observer] Hit safety limit (${safetyLimit} logs) — observer may be behind`);
   }
 
-  // Emit tick health metrics to OTel (Step 41) — direct OTLP push, no SDK
   if (env.OTLP_ENDPOINT) {
     const traceId = crypto.randomUUID().replace(/-/g, '');
     const spanId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
@@ -436,6 +490,7 @@ async function processAllLogs(
               traceId, spanId, name: 'observer.cron_tick', kind: 1,
               startTimeUnixNano: nowNs, endTimeUnixNano: endNs,
               attributes: [
+                { key: 'observer.source', value: { stringValue: source } },
                 { key: 'observer.logs_fetched', value: { intValue: String(stats.logs_fetched) } },
                 { key: 'observer.logs_processed', value: { intValue: String(stats.processed) } },
                 { key: 'observer.logs_errored', value: { intValue: String(stats.errors) } },
@@ -447,8 +502,97 @@ async function processAllLogs(
       }),
     }).catch(() => {}); // fire-and-forget
   }
+}
+
+/**
+ * Drive the observer pipeline from R2 (primary source under ADR-009 / ADR-026).
+ *
+ * For each R2 object in the batch we run each decoded record through processLog
+ * with `prefetched` set, accumulating a per-object success tally. An object is
+ * deleted only if every record in it is fully processed (created a trace or
+ * was explicitly skipped). On any thrown error mid-object we leave the object
+ * in R2 for the next tick. Until Step 51 adds trace-level idempotency this
+ * retry can produce duplicate traces for the already-succeeded records in the
+ * object — documented in the PR description as the tradeoff.
+ *
+ * Safety limit (OBSERVER_MAX_R2_OBJECTS, default 200) caps listed objects per
+ * tick. OBSERVER_MAX_LOGS still bounds total records to match polling behavior.
+ */
+async function processR2Batch(
+  env: Env,
+  ctx: ExecutionContext,
+  otelExporter?: WorkersOTelExporter | null
+): Promise<ProcessingStats> {
+  const stats: ProcessingStats = { processed: 0, skipped: 0, errors: 0, logs_fetched: 0 };
+  const recordLimit = parseInt(env.OBSERVER_MAX_LOGS ?? '5000', 10);
+  const objectLimit = parseInt(env.OBSERVER_MAX_R2_OBJECTS ?? '200', 10);
+
+  const batch = await fetchR2Batch(env, { maxObjects: objectLimit });
+  stats.logs_fetched = batch.totalRecords;
+
+  console.log(
+    `[observer/r2] Listed ${batch.listedKeys} objects, ${batch.totalRecords} usable records (gateway=${env.GATEWAY_ID})`
+  );
+
+  if (batch.totalRecords === 0) {
+    return stats;
+  }
+
+  let recordsProcessedThisTick = 0;
+  for (const obj of batch.objects) {
+    if (recordsProcessedThisTick >= recordLimit) {
+      console.warn(`[observer/r2] Record safety limit reached (${recordLimit}); ${batch.objects.length - batch.objects.indexOf(obj)} objects deferred to next tick`);
+      break;
+    }
+    let allRecordsOK = true;
+    for (const rec of obj.records) {
+      if (recordsProcessedThisTick >= recordLimit) {
+        allRecordsOK = false; // leave the object for next tick
+        break;
+      }
+      try {
+        const wasProcessed = await processLog(
+          rec.log as unknown as GatewayLog,
+          env,
+          ctx,
+          otelExporter,
+          { prefetched: { bodies: rec.bodies } },
+        );
+        if (wasProcessed) stats.processed++;
+        else stats.skipped++;
+      } catch (error) {
+        console.error(`[observer/r2] Failed to process record ${rec.log.id} from ${obj.key}:`, error);
+        stats.errors++;
+        allRecordsOK = false;
+      } finally {
+        recordsProcessedThisTick++;
+      }
+    }
+    if (allRecordsOK && env.GATEWAY_LOGS_BUCKET) {
+      try {
+        await env.GATEWAY_LOGS_BUCKET.delete(obj.key);
+      } catch (err) {
+        console.warn(`[observer/r2] Failed to delete R2 object ${obj.key} (will be reaped by 7d lifecycle): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else if (!allRecordsOK) {
+      console.warn(`[observer/r2] Leaving ${obj.key} in R2 after partial failure; will retry next tick`);
+    }
+  }
 
   return stats;
+}
+
+/**
+ * Options controlling `processLog` behavior when the log came from R2 rather
+ * than a CF AI Gateway REST poll. When `prefetched` is set:
+ *   - fetchLogBodies() is skipped (bodies already decrypted by r2-ingest).
+ *   - deleteLog() (CF REST delete) is skipped — the R2 caller handles the
+ *     per-R2-object delete after all records in that object are processed.
+ */
+interface ProcessLogOptions {
+  prefetched?: {
+    bodies: { request: string; response: string };
+  };
 }
 
 /**
@@ -459,8 +603,10 @@ async function processLog(
   log: GatewayLog,
   env: Env,
   ctx: ExecutionContext,
-  otelExporter?: WorkersOTelExporter | null
+  otelExporter?: WorkersOTelExporter | null,
+  options: ProcessLogOptions = {}
 ): Promise<boolean> {
+  const isR2Sourced = options.prefetched != null;
   // Extract metadata from log. CF AI Gateway returns the cf-aig-metadata
   // header value as a JSON string in the metadata field.
   let metadata: GatewayMetadata | undefined;
@@ -493,14 +639,14 @@ async function processLog(
   // Validate this is a mnemom request by checking for agent_id
   if (!metadata?.agent_id) {
     console.log(`[observer] Skipping ${log.id}: no mnemom metadata and no checkpoint fallback`);
-    await deleteLog(log.id, env);
+    if (!isR2Sourced) await deleteLog(log.id, env);
     return false;
   }
 
   // Skip failed API calls (e.g. 401 from invalid keys) — not behavioral events
   if (!log.success) {
     console.log(`[observer] Skipping ${log.id}: upstream API error (success=false)`);
-    await deleteLog(log.id, env);
+    if (!isR2Sourced) await deleteLog(log.id, env);
     return false;
   }
 
@@ -508,8 +654,11 @@ async function processLog(
 
   console.log(`[observer] Processing log ${log.id} for agent ${agent_id}`);
 
-  // Fetch full request + response bodies
-  const bodies = await fetchLogBodies(log.id, env);
+  // Fetch full request + response bodies (skipped when sourced from R2 — the
+  // encrypted fields were already decrypted by r2-ingest into options.prefetched).
+  const bodies = options.prefetched
+    ? { ...options.prefetched.bodies }
+    : await fetchLogBodies(log.id, env);
 
   // CF AI Gateway stores streamed responses with content flattened to a string
   // and raw SSE events in streamed_data[]. Reconstruct SSE format so the AIP
@@ -624,8 +773,12 @@ async function processLog(
   // Deliver AAP webhooks (runs in background)
   ctx.waitUntil(deliverAAPWebhooks(trace, verification, policyResult, env));
 
-  // Delete processed log for privacy
-  await deleteLog(log.id, env);
+  // Delete processed log for privacy. For R2-sourced logs, the caller deletes
+  // the whole R2 object after every record in it has been processed — we
+  // cannot delete a single record from an NDJSON file.
+  if (!isR2Sourced) {
+    await deleteLog(log.id, env);
+  }
 
   console.log(`[observer] Created trace ${trace.trace_id} for agent ${agent_id}`);
 
