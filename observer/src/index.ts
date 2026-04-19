@@ -771,6 +771,19 @@ async function processLog(
 
   console.log(`[observer] Processing log ${log.id} for agent ${agent_id}`);
 
+  // Step 51 / ADR-010 — idempotency pre-check. CF Queue is at-least-once;
+  // producer may re-enqueue the same R2 record before lifecycle reap, and
+  // consumer retries can duplicate. Short-circuit if we've already processed
+  // this log id — saves the Anthropic call + verify + submit. The DB UNIQUE
+  // index in migration 132 is the correctness guard; this is the cost-saving
+  // optimization. Skip is not "processed": returns false so stats.skipped
+  // increments and the caller acks (queue) or deletes (polling) without retry.
+  if (await traceExistsForLogId(log.id, env)) {
+    console.log(`[observer] Skipping ${log.id}: trace already exists (idempotency hit)`);
+    if (!isR2Sourced) await deleteLog(log.id, env);
+    return false;
+  }
+
   // Fetch full request + response bodies (skipped when sourced from R2 — the
   // encrypted fields were already decrypted by r2-ingest into options.prefetched).
   const bodies = options.prefetched
@@ -1768,8 +1781,10 @@ async function submitTrace(
   log: GatewayLog,
   env: Env
 ): Promise<void> {
-  // Map APTrace to database schema
-  // Note: APTrace doesn't have outcome/verification - we store those separately
+  // Map APTrace to database schema.
+  // Step 51 / ADR-010: gateway_log_id is the dedicated idempotency key (full
+  // log.id, not the 8-char trace_id suffix). Column + partial UNIQUE index
+  // landed in mnemom-api migration 132.
   const dbTrace = {
     trace_id: trace.trace_id,
     agent_id: trace.agent_id,
@@ -1793,10 +1808,20 @@ async function submitTrace(
 
     // Full trace for extensibility
     trace_json: trace,
+
+    // Idempotency key (Step 51). Redundant with trace_id at small scale but
+    // structurally better: full entropy, queryable, independent of any
+    // derivation change to trace_id.
+    gateway_log_id: log.id,
   };
 
-  // Use upsert with on_conflict to ensure idempotency
-  const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/traces?on_conflict=trace_id`, {
+  // Conflict target is the UNIQUE partial index on gateway_log_id (migration
+  // 132). On conflict, merge-duplicates treats the second insert as a
+  // successful no-op; a genuine write race between two consumer invocations
+  // therefore returns 201 with an empty body rather than 409 — processLog
+  // completes normally. trace_id's own PK constraint is the secondary guard
+  // (same log.id → same trace_id via the tr-{suffix} derivation).
+  const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/traces?on_conflict=gateway_log_id`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SECRET_KEY,
@@ -1810,6 +1835,43 @@ async function submitTrace(
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Failed to submit trace: ${response.status} - ${errorText}`);
+  }
+}
+
+/**
+ * Step 51 / ADR-010 — idempotency pre-check.
+ *
+ * Before the expensive downstream pipeline (Anthropic analyzeWithHaiku +
+ * verifyTrace + submitTrace), check whether a trace has already been written
+ * for this source log id. Short-circuits on duplicate and saves both the
+ * Anthropic API cost and the observer's CPU budget.
+ *
+ * The DB UNIQUE index (migration 132) is the correctness guarantee; this
+ * pre-check is the cost-savings optimization. Fail-open: on any query error,
+ * proceed with the pipeline (the index still catches a true duplicate at
+ * submitTrace time via merge-duplicates).
+ */
+async function traceExistsForLogId(
+  logId: string,
+  env: Env,
+): Promise<boolean> {
+  try {
+    const url = `${env.SUPABASE_URL}/rest/v1/traces?select=trace_id&gateway_log_id=eq.${encodeURIComponent(logId)}&limit=1`;
+    const response = await observerSupabaseFetch(url, {
+      method: 'GET',
+      headers: {
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+      },
+    });
+    if (!response.ok) return false; // fail-open
+    const rows = (await response.json()) as Array<{ trace_id: string }>;
+    return rows.length > 0;
+  } catch (err) {
+    console.warn(
+      `[observer] traceExistsForLogId failed (fail-open): ${err instanceof Error ? err.message : String(err)}`
+    );
+    return false;
   }
 }
 
