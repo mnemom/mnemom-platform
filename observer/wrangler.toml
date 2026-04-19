@@ -93,9 +93,11 @@ OBSERVER_MAX_LOGS = "5000"
 # PR on this var — see scale/runbooks/observability-logpush.md "Flipping observer to R2".
 LOGPUSH_SOURCE = "r2"
 OBSERVER_MAX_R2_OBJECTS = "200"
-# scale/step-50 / ADR-010: staging flips to "queue" first for soak-testing in a
-# follow-up PR after this merges. Default "direct" at ship time.
-OBSERVER_PROCESSING_MODE = "direct"
+# scale/step-50.5 (2026-04-19): staging flipped to queue fan-out. Producer
+# (scheduled) only enqueues; consumer (queue handler) runs the per-record
+# pipeline in parallel. Production stays on "direct" until Step 51
+# (idempotency) ships and staging has burned in.
+OBSERVER_PROCESSING_MODE = "queue"
 
 [[env.staging.kv_namespaces]]
 binding = "BILLING_CACHE"
