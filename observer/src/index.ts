@@ -46,6 +46,11 @@ import { fetchR2Batch } from './r2-ingest';
 import type { ObserverQueueMessage } from './queue-types';
 import { enqueueR2Records, enqueuePollingLogs } from './queue-producer';
 import { handleQueueBatch } from './queue-consumer';
+import {
+  emitBatchMetrics,
+  emitQueueDepthMetrics,
+  fetchQueueDepths,
+} from './metrics';
 
 const AAP_VERSION = '1.0';
 const AAP_WEBHOOK_RETRY_DELAYS_MS = [1000, 5000, 15000];
@@ -207,13 +212,17 @@ export default {
     ctx: ExecutionContext,
   ): Promise<void> {
     const otelExporter = createOTelExporter(env);
-    await handleQueueBatch(
+    const stats = await handleQueueBatch(
       batch,
       env as unknown as Parameters<typeof handleQueueBatch>[1],
       ctx,
       (log, innerEnv, innerCtx, options) =>
         processLog(log as unknown as GatewayLog, innerEnv as unknown as Env, innerCtx, otelExporter, options),
     );
+    // Step 52 — emit per-batch counters alongside the existing Tier 3 stats log.
+    // Fire-and-forget via waitUntil: the batch has already been acked by now,
+    // so metric emission failures don't risk message replay.
+    ctx.waitUntil(emitBatchMetrics(env, stats));
     if (otelExporter) {
       ctx.waitUntil(otelExporter.flush());
     }
@@ -307,6 +316,18 @@ export default {
       // Flush OTel spans for all processed logs in one batch
       if (otelExporter) {
         ctx.waitUntil(otelExporter.flush());
+      }
+
+      // Step 52 — queue-state gauges (queue_depth, consumer_lag_seconds) for
+      // main + DLQ. Only relevant when the observer is running in queue mode;
+      // direct mode has no backlog to measure. The fetch chain is defensive:
+      // a null return from fetchQueueDepths emits nothing that tick.
+      if (env.OBSERVER_PROCESSING_MODE === 'queue') {
+        ctx.waitUntil(
+          fetchQueueDepths(env).then((depths) => {
+            if (depths) return emitQueueDepthMetrics(env, depths);
+          }),
+        );
       }
     } catch (error) {
       console.error('[observer] Fatal error in scheduled handler:', error);
