@@ -18,3 +18,15 @@ export type {
 export type { L2Result, PreemptiveNudge } from './types.js';
 export { DEFAULT_SAFE_HOUSE_CONFIG } from './types.js';
 export { computeMinHash, estimateSimilarity, serializeMinHash, deserializeMinHash, isSimilarToPattern, computeBandHashes } from './fingerprint.js';
+export {
+  compileRecipeFromRpcRow, buildRecipeIndex,
+  CANONICAL_DOORS, CANONICAL_THREAT_TYPES, CANONICAL_VARIANT_CLASSES,
+  CANONICAL_SEVERITIES_P, CANONICAL_DETECTORS, CANONICAL_OPERATORS, RECIPE_SCOPES,
+} from './recipes.js';
+export type {
+  CanonicalDoor, CanonicalThreatType, CanonicalVariantClass,
+  CanonicalSeverity, CanonicalDetector, CanonicalOperator, RecipeScope,
+  RecipeRpcRow, RpcTier1, RpcTier1Condition, RpcTier2, RpcTier2Check, RpcParsedContent,
+  CompiledCondition, CompiledTier1, CompiledTier2, CompiledTier2Check,
+  CompiledRecipe, RecipeIndex,
+} from './recipes.js';
