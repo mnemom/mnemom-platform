@@ -4631,7 +4631,16 @@ export async function handleProviderProxy(
       // ====================================================================
       // Phase 0.5: Safe House — inbound threat screening
       // ====================================================================
-      if (shFeatureEnabled && (
+      // Passive modes (`observe`, `simulate`) dispatch Safe House regardless
+      // of the legacy `feature_flags.sh_enabled` kill-switch so telemetry +
+      // Phase 5 recipe shadow eval flow for every agent. Verdict-affecting
+      // modes (`enforce`, `enforce_sync`, `sovereign`) still require explicit
+      // `sh_enabled: true` — no agent gets surprise enforcement. Wider
+      // retirement of the kill-switch waits on an audit of enforce-mode
+      // agents.
+      const isPassiveMode = shConfig.mode === 'observe' || shConfig.mode === 'simulate';
+      const shDispatchEnabled = shFeatureEnabled || isPassiveMode;
+      if (shDispatchEnabled && (
         shConfig.mode === 'enforce' ||
         shConfig.mode === 'enforce_sync' ||
         shConfig.mode === 'sovereign' ||
