@@ -4244,6 +4244,57 @@ async function runObserveSH(
     }
 
     const { multiplied_score, session_multiplier } = applySessionMultiplier(finalScore, sessionState);
+
+    // Phase 5 Stage 5B: recipe tier1 shadow evaluation (observe branch).
+    // Mirrors the enforce branch at index.ts:4670+. Observe is already
+    // background work (runObserveSH runs inside ctx.waitUntil), so the eval
+    // runs inline here — no further ctx.waitUntil wrapping needed.
+    // Fail-open on every failure path.
+    const observeRecipeMode = (env.RECIPE_MODE ?? 'off') as RecipeMode;
+    if (observeRecipeMode === 'shadow') {
+      try {
+        const recipeIndex = await fetchActiveRecipes(env);
+        if (recipeIndex.all.length > 0) {
+          const canonicalScores: DetectorScores = buildDetectorScoresFromThreats(finalThreats);
+          if (sessionState) {
+            canonicalScores.session_tracker =
+              sessionState.session_threat_level === 'high' ? 0.85
+              : sessionState.session_threat_level === 'medium' ? 0.55
+              : 0.20;
+          }
+          if (typeof detectorScores.SemanticAnalyzer === 'number') {
+            canonicalScores.semantic_analyzer = detectorScores.SemanticAnalyzer;
+          }
+          const evalConfig: RecipeEvalConfig = {
+            mode: observeRecipeMode,
+            per_threat_type_cap: 5,
+            global_cap: 10,
+          };
+          const tier1Result = evaluateRecipesTier1(
+            canonicalScores,
+            content,
+            recipeIndex,
+            evalConfig,
+          );
+          const telemetry = serializeRecipeTelemetry(
+            tier1Result,
+            null,
+            recipeIndex,
+            observeRecipeMode,
+          );
+          console.log(JSON.stringify({
+            ...telemetry,
+            agent_id: agentId,
+            session_id: sessionId,
+            surface: 'user_message',
+            sh_mode: 'observe',
+          }));
+        }
+      } catch {
+        // Fail open — recipes are additive; failure must never affect the observe flow.
+      }
+    }
+
     const thresholds = config.thresholds;
     let verdict: SafeHouseVerdict = 'pass';
     if (multiplied_score >= thresholds.block) verdict = 'block';
@@ -4724,6 +4775,7 @@ export async function handleProviderProxy(
                     agent_id: agent.id,
                     session_id: sessionId,
                     surface: 'user_message',
+                    sh_mode: 'enforce',
                   }));
                 } catch {
                   // Fail open — recipes are additive; a failure must never affect the verdict path.
