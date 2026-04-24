@@ -62,6 +62,11 @@ workers_dev = true
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "false"
 SAFE_HOUSE_ENABLED = "true"
+# Phase 5 Stage 5B: Detection recipe tier1 evaluation in shadow mode.
+# Zero verdict impact — emits `sh_recipes` structured log per inbound
+# request in the Safe House enforce branch. Production stays `off` until
+# we've reviewed shadow telemetry per the correctness gate.
+RECIPE_MODE = "shadow"
 # Sovereign agent recommended Safe House config (set via /v1/agents/:id/cfd/config):
 # mode: enforce, screen_surfaces: all, thresholds: 0.5/0.70/0.85
 # Canaries: POST /v1/cfd/canaries for each primary tool credential
