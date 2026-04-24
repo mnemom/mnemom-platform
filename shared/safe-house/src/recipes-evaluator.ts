@@ -575,11 +575,44 @@ export function parseRecipeTier2Response(
     idx++;
   }
 
+  // Locate the `recipe_checks` array via indexOf + bracket matching rather
+  // than a regex — the regex form `"recipe_checks"\s*:\s*(\[[^\]]*\])` is
+  // a CodeQL js/polynomial-redos finding (ambiguous whitespace matching
+  // on uncontrolled LLM output). indexOf + counted walk is O(n).
+  const key = '"recipe_checks"';
+  const keyIdx = raw.indexOf(key);
+  if (keyIdx === -1) return [];
+  let i = keyIdx + key.length;
+  // skip optional whitespace + a single colon
+  while (i < raw.length && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\n' || raw[i] === '\r')) i++;
+  if (raw[i] !== ':') return [];
+  i++;
+  while (i < raw.length && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\n' || raw[i] === '\r')) i++;
+  if (raw[i] !== '[') return [];
+  // scan to the matching close bracket, respecting string literals but
+  // not nesting (recipe_checks entries are flat objects, not arrays)
+  const start = i;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let end = -1;
+  for (; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '[') depth++;
+    else if (ch === ']') {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+  if (end === -1) return [];
+
   let parsed: unknown;
   try {
-    const match = raw.match(/"recipe_checks"\s*:\s*(\[[^\]]*\])/);
-    if (!match) return [];
-    parsed = JSON.parse(match[1]);
+    parsed = JSON.parse(raw.slice(start, end + 1));
   } catch {
     for (const [id, c] of checkById) {
       results.push({
