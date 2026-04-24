@@ -77,6 +77,7 @@ import {
   preprocessForDetection,
   computeMinHash,
   computeBandHashes,
+  buildRecipeIndex,
   type SafeHouseConfig,
   type SafeHouseDecision,
   type SafeHouseVerdict,
@@ -86,6 +87,8 @@ import {
   type L1Result,
   type ThreatType,
   type ThreatDetection,
+  type RecipeIndex,
+  type RecipeRpcRow,
 } from '@mnemom/safe-house';
 
 // ── SemanticAnalyzer trigger helper ────────────────────────────────────────
@@ -3431,6 +3434,81 @@ async function fetchSHThreatPatterns(env: Env): Promise<SafeHouseThreatPattern[]
     return [];
   }
 }
+
+// ── Detection recipe index (Stage 5A — Phase 5) ────────────────────────
+//
+// Isolate-scope cache of the compiled recipe index. One build per cold
+// start; subsequent requests in the same isolate reuse the Promise. The
+// KV cache under `sh:active-recipes:v1` is the secondary layer (shared
+// across isolates) with a 5-minute TTL — matches fetchSHThreatPatterns.
+//
+// Stage 5A does NOT call this from the request path. It's exposed via
+// fetchActiveRecipes(env) for the Stage 5B tier1 evaluator to consume.
+
+let _recipeIndexPromise: Promise<RecipeIndex> | null = null;
+let _recipeIndexFetchedAt = 0;
+const RECIPE_INDEX_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Fetch + compile the active detection recipe index.
+ *
+ * Caching layers (outer to inner):
+ *   1. Isolate-local Promise (this variable) — single compile per cold start
+ *   2. BILLING_CACHE (KV) — `sh:active-recipes:v1`, 300s TTL, shared isolates
+ *   3. mnemom-api `/v1/internal/active-recipes` — authoritative RPC
+ *
+ * Returns an empty index on any failure (fail-open; Safe-House recipes are
+ * additive signals, never the only defense).
+ */
+async function fetchActiveRecipes(env: Env): Promise<RecipeIndex> {
+  const now = Date.now();
+  if (_recipeIndexPromise && now - _recipeIndexFetchedAt < RECIPE_INDEX_MAX_AGE_MS) {
+    return _recipeIndexPromise;
+  }
+  _recipeIndexFetchedAt = now;
+  _recipeIndexPromise = (async (): Promise<RecipeIndex> => {
+    const cacheKey = 'sh:active-recipes:v1';
+    try {
+      if (env.BILLING_CACHE) {
+        const cached = await env.BILLING_CACHE.get(cacheKey);
+        if (cached) {
+          const rows = JSON.parse(cached) as RecipeRpcRow[];
+          return buildRecipeIndex(rows, now);
+        }
+      }
+      const apiBase = env.MNEMOM_ANALYZE_URL
+        ? env.MNEMOM_ANALYZE_URL.replace('/v1/analyze', '')
+        : 'https://api.mnemom.ai';
+      const resp = await fetch(`${apiBase}/v1/internal/active-recipes`, {
+        method: 'GET',
+        headers: {
+          'X-Internal-Key': env.INTERNAL_API_KEY ?? '',
+        },
+      });
+      if (!resp.ok) return buildRecipeIndex([], now);
+      const body = (await resp.json()) as { recipes?: RecipeRpcRow[] };
+      const rows = Array.isArray(body.recipes) ? body.recipes : [];
+      if (env.BILLING_CACHE) {
+        await env.BILLING_CACHE
+          .put(cacheKey, JSON.stringify(rows), { expirationTtl: 300 })
+          .catch(() => {});
+      }
+      return buildRecipeIndex(rows, now);
+    } catch {
+      return buildRecipeIndex([], now);
+    }
+  })();
+  return _recipeIndexPromise;
+}
+
+/** Exported for unit testing — allows forcing a refetch in tests. */
+export function _resetRecipeIndexForTests(): void {
+  _recipeIndexPromise = null;
+  _recipeIndexFetchedAt = 0;
+}
+
+/** Exported for Stage 5B tier1 evaluator wiring. */
+export { fetchActiveRecipes };
 
 /**
  * Query the LSH inverted index in KV to find candidate patterns for a given normalized text.
