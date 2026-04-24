@@ -47,8 +47,8 @@ import type { ObserverQueueMessage } from './queue-types';
 import { enqueueR2Records, enqueuePollingLogs } from './queue-producer';
 import { handleQueueBatch } from './queue-consumer';
 import {
-  emitBatchMetrics,
-  emitQueueDepthMetrics,
+  emitQueueBatchSpan,
+  emitQueueBacklogSpans,
   fetchQueueDepths,
 } from './metrics';
 
@@ -219,10 +219,11 @@ export default {
       (log, innerEnv, innerCtx, options) =>
         processLog(log as unknown as GatewayLog, innerEnv as unknown as Env, innerCtx, otelExporter, options),
     );
-    // Step 52 — emit per-batch counters alongside the existing Tier 3 stats log.
-    // Fire-and-forget via waitUntil: the batch has already been acked by now,
-    // so metric emission failures don't risk message replay.
-    ctx.waitUntil(emitBatchMetrics(env, stats));
+    // Step 52 — emit per-batch span (+ one poison span per poison ack) alongside
+    // the existing Tier 3 stats log. Fire-and-forget via waitUntil: the batch has
+    // already been acked by now, so span emission failures don't risk replay.
+    // Spans flow through the supported /v1/traces path per ADR-032.
+    ctx.waitUntil(emitQueueBatchSpan(env, stats));
     if (otelExporter) {
       ctx.waitUntil(otelExporter.flush());
     }
@@ -318,14 +319,15 @@ export default {
         ctx.waitUntil(otelExporter.flush());
       }
 
-      // Step 52 — queue-state gauges (queue_depth, consumer_lag_seconds) for
-      // main + DLQ. Only relevant when the observer is running in queue mode;
-      // direct mode has no backlog to measure. The fetch chain is defensive:
-      // a null return from fetchQueueDepths emits nothing that tick.
+      // Step 52 — per-queue backlog spans (carry depth + age_seconds attrs)
+      // for main + DLQ. Only relevant when the observer is running in queue
+      // mode; direct mode has no backlog to measure. The fetch chain is
+      // defensive: a null return from fetchQueueDepths emits nothing that
+      // tick. Depth/lag alerts evaluate via TraceQL metrics (ADR-032).
       if (env.OBSERVER_PROCESSING_MODE === 'queue') {
         ctx.waitUntil(
           fetchQueueDepths(env).then((depths) => {
-            if (depths) return emitQueueDepthMetrics(env, depths);
+            if (depths) return emitQueueBacklogSpans(env, depths);
           }),
         );
       }
