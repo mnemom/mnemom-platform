@@ -27,6 +27,11 @@ workers_dev = true
 GATEWAY_VERSION = "2.0.0"
 BILLING_ENFORCEMENT_ENABLED = "true"
 SAFE_HOUSE_ENABLED = "true"   # Enables Safe House DB lookups; per-agent mode controlled via cfd_configs table
+# Phase 5 Stage 5B: Detection recipe tier1 evaluation in shadow mode.
+# Zero verdict impact — emits `sh_recipes` structured log per inbound
+# request in the Safe House enforce branch. Every failure path fails open.
+# Flip to "enforce" requires Stage 5D verdict-contribution work (not this PR).
+RECIPE_MODE = "shadow"
 
 [[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
