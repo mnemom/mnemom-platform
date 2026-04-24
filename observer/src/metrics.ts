@@ -1,32 +1,39 @@
 /**
- * Observer queue metrics — Step 52.
+ * Observer queue observability — Step 52, span-derived per ADR-032.
  *
- * Emits OTLP/HTTP JSON metric payloads to $OTLP_ENDPOINT/v1/metrics, mirroring
- * the fire-and-forget trace emitter in index.ts's emitTickSummary. Same
- * endpoint, same auth, same failure posture: unreachable backend is swallowed.
+ * Emits OTLP spans to $OTLP_ENDPOINT/v1/traces (the supported CF Workers path
+ * per Grafana Cloud support ticket #225229). Grafana's metrics-generator
+ * aggregates the spans into `traces_spanmetrics_*` series for RED-style
+ * alerting; gauge-style queries (queue depth, consumer lag) use Tempo TraceQL
+ * metrics at query time.
  *
- * Three surfaces:
+ * Replaces the direct /v1/metrics emission that shipped in Step 52's original
+ * cut — that path is not a supported CF Worker ingestion route on Grafana
+ * Cloud, so every metric POST over 72h was silently dropped.
  *
- *   1. emitBatchMetrics(env, stats)
- *      Called from the queue() handler after each MessageBatch. Emits delta
- *      counters for messages_processed, messages_failed, poison_acks,
- *      acks_on_missing, retries. Low-cardinality attributes: outcome, mode,
- *      gateway_id.
+ * Three span families:
  *
- *   2. emitQueueDepthMetrics(env, depths)
- *      Called from the scheduled() tick. Emits gauges for queue_depth and
- *      consumer_lag_seconds, tagged {queue="main"|"dlq"}. Feeds the P1 alert
- *      at queue_depth{queue="main"} > 50000.
+ *   observer.queue_batch     One span per MessageBatch. Integer counts are
+ *                            span attributes; dimensions (low-cardinality,
+ *                            suitable for spanmetrics labels) are env,
+ *                            mode, gateway_id. Status=error when
+ *                            stats.poison_acks > 0.
  *
- *   3. fetchQueueDepths(env)
- *      Hits the Cloudflare GraphQL Analytics API for queueBacklogAdaptiveGroups.
- *      Requires CF_API_TOKEN with Analytics:Read scope. Returns null on any
- *      fetch error — gauges simply don't publish that tick.
+ *   observer.queue_poison    One span per poison-acked message (emitted
+ *                            stats.poison_acks times per batch). Makes
+ *                            ObserverPoisonAckRate a direct spanmetrics
+ *                            call-rate alert. Dimensions: env, mode,
+ *                            gateway_id, reason=poison.
  *
- * Grafana Cloud provisioning gap (2026-04-20): the OTLP metrics endpoint at
- * Grafana's otlp-gateway is not yet provisioned for our tenant. Emissions
- * silently 4xx until that lands; no user impact. Once provisioned, metrics
- * flow without a redeploy.
+ *   observer.queue_backlog   One span per queue per scheduled() tick,
+ *                            carrying `depth` + `age_seconds` as numeric
+ *                            attributes. Depth/lag alerts evaluate via
+ *                            TraceQL metrics (max_over_time(span.depth)).
+ *                            Dimensions: env, queue, gateway_id.
+ *
+ * Fire-and-forget posture preserved: unreachable backend is swallowed, the
+ * batch has already been acked before emission. See ADR-032 for the pattern
+ * choice + migration triggers toward a collector tier (Option B).
  */
 
 import type { BatchStats } from './queue-consumer';
@@ -47,73 +54,179 @@ export interface QueueDepth {
 }
 
 // ============================================================================
-// Emitters
+// Span emitters
 // ============================================================================
 
 /**
- * Emit batch-level queue consumer counters. One emission per MessageBatch.
- * Safe to call with a zero-message batch — all counters end up at 0.
+ * Emit the per-batch `observer.queue_batch` span plus one `observer.queue_poison`
+ * span for each poison-acked message in the batch. Safe to call with a
+ * zero-message batch.
  */
-export async function emitBatchMetrics(
+export async function emitQueueBatchSpan(
   env: MetricsEnv,
   stats: BatchStats,
 ): Promise<void> {
   if (!env.OTLP_ENDPOINT) return;
 
   const mode = env.OBSERVER_PROCESSING_MODE ?? 'direct';
+  const env_ = envLabel(env);
   const gw = env.GATEWAY_ID;
-  const nowNs = timeUnixNano();
-  // Each batch call represents ~max_batch_timeout (10s) of accumulated deltas.
-  const startNs = startUnixNano(10_000);
 
-  const metrics = [
-    counter('observer.messages_processed', stats.processed, {
-      outcome: 'processed', mode, gateway_id: gw,
-    }, nowNs, startNs),
-    counter('observer.messages_processed', stats.skipped, {
-      outcome: 'skipped', mode, gateway_id: gw,
-    }, nowNs, startNs),
-    counter('observer.messages_processed', stats.acks_on_missing, {
-      outcome: 'ack_on_missing', mode, gateway_id: gw,
-    }, nowNs, startNs),
-    counter('observer.messages_failed', stats.poison_acks, {
-      reason: 'poison', mode, gateway_id: gw,
-    }, nowNs, startNs),
-    counter('observer.messages_failed', stats.retries, {
-      reason: 'retry', mode, gateway_id: gw,
-    }, nowNs, startNs),
-  ];
+  const spans: OtlpSpan[] = [buildBatchSpan(env_, mode, gw, stats)];
+  for (let i = 0; i < stats.poison_acks; i++) {
+    spans.push(buildPoisonSpan(env_, mode, gw));
+  }
 
-  await postMetrics(env, metrics, 'observer.queue.consumer');
+  await postSpans(env, spans);
 }
 
 /**
- * Emit queue-state gauges (depth + consumer lag) for one tick. Call from
- * scheduled() after fetchQueueDepths resolves. A null depths arg is a no-op
- * so callers can chain `fetchQueueDepths(env).then(d => d && emit(...))`.
+ * Emit queue-state backlog spans (one per queue) for the current tick.
+ * Called from scheduled() after fetchQueueDepths resolves. A null or empty
+ * depths arg is a no-op so the caller can chain
+ * `fetchQueueDepths(env).then(d => d && emit(...))` unchanged.
  */
-export async function emitQueueDepthMetrics(
+export async function emitQueueBacklogSpans(
   env: MetricsEnv,
   depths: QueueDepth[],
 ): Promise<void> {
   if (!env.OTLP_ENDPOINT || depths.length === 0) return;
 
+  const env_ = envLabel(env);
   const gw = env.GATEWAY_ID;
+
+  const spans = depths.map((d) => buildBacklogSpan(env_, gw, d));
+  await postSpans(env, spans);
+}
+
+// ============================================================================
+// Span builders
+// ============================================================================
+
+interface OtlpAttributeValue {
+  stringValue?: string;
+  intValue?: string;
+}
+interface OtlpAttribute {
+  key: string;
+  value: OtlpAttributeValue;
+}
+interface OtlpSpanStatus {
+  code: 0 | 1 | 2; // 0=UNSET, 1=OK, 2=ERROR
+}
+interface OtlpSpan {
+  traceId: string;
+  spanId: string;
+  name: string;
+  kind: 1; // INTERNAL
+  startTimeUnixNano: string;
+  endTimeUnixNano: string;
+  attributes: OtlpAttribute[];
+  status: OtlpSpanStatus;
+}
+
+function buildBatchSpan(
+  env_: string,
+  mode: string,
+  gatewayId: string,
+  stats: BatchStats,
+): OtlpSpan {
   const nowNs = timeUnixNano();
+  return {
+    traceId: hex32(),
+    spanId: hex16(),
+    name: 'observer.queue_batch',
+    kind: 1,
+    startTimeUnixNano: nowNs,
+    endTimeUnixNano: nowNs,
+    attributes: [
+      str('env', env_),
+      str('mode', mode),
+      str('gateway_id', gatewayId),
+      int('batch_size', stats.total),
+      int('processed', stats.processed),
+      int('skipped', stats.skipped),
+      int('acks_on_missing', stats.acks_on_missing),
+      int('poison_acks', stats.poison_acks),
+      int('retries', stats.retries),
+    ],
+    status: { code: stats.poison_acks > 0 ? 2 : 1 },
+  };
+}
 
-  const metrics: OtlpMetric[] = [];
-  for (const d of depths) {
-    metrics.push(
-      gauge('observer.queue_depth', d.backlogMessages, {
-        queue: d.queue, gateway_id: gw,
-      }, nowNs),
-      gauge('observer.consumer_lag_seconds', d.oldestMessageAgeSeconds, {
-        queue: d.queue, gateway_id: gw,
-      }, nowNs),
-    );
+function buildPoisonSpan(env_: string, mode: string, gatewayId: string): OtlpSpan {
+  const nowNs = timeUnixNano();
+  return {
+    traceId: hex32(),
+    spanId: hex16(),
+    name: 'observer.queue_poison',
+    kind: 1,
+    startTimeUnixNano: nowNs,
+    endTimeUnixNano: nowNs,
+    attributes: [
+      str('env', env_),
+      str('mode', mode),
+      str('gateway_id', gatewayId),
+      str('reason', 'poison'),
+    ],
+    status: { code: 2 },
+  };
+}
+
+function buildBacklogSpan(env_: string, gatewayId: string, d: QueueDepth): OtlpSpan {
+  const nowNs = timeUnixNano();
+  return {
+    traceId: hex32(),
+    spanId: hex16(),
+    name: 'observer.queue_backlog',
+    kind: 1,
+    startTimeUnixNano: nowNs,
+    endTimeUnixNano: nowNs,
+    attributes: [
+      str('env', env_),
+      str('queue', d.queue),
+      str('gateway_id', gatewayId),
+      int('depth', d.backlogMessages),
+      int('age_seconds', d.oldestMessageAgeSeconds),
+    ],
+    status: { code: 1 },
+  };
+}
+
+/**
+ * Exported for tests. Wraps a list of spans in the OTLP ResourceSpans envelope.
+ */
+export function buildOtlpSpansBody(spans: OtlpSpan[], scopeName: string): string {
+  return JSON.stringify({
+    resourceSpans: [{
+      resource: {
+        attributes: [
+          { key: 'service.name', value: { stringValue: 'mnemom-observer' } },
+        ],
+      },
+      scopeSpans: [{
+        scope: { name: scopeName },
+        spans,
+      }],
+    }],
+  });
+}
+
+async function postSpans(env: MetricsEnv, spans: OtlpSpan[]): Promise<void> {
+  const body = buildOtlpSpansBody(spans, 'observer.queue');
+  try {
+    await fetch(`${env.OTLP_ENDPOINT}/v1/traces`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(env.OTLP_AUTH ? { Authorization: env.OTLP_AUTH } : {}),
+      },
+      body,
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    // Swallowed — fire-and-forget matches emitTickSummary's posture.
   }
-
-  await postMetrics(env, metrics, 'observer.queue.state');
 }
 
 // ============================================================================
@@ -163,12 +276,6 @@ export async function fetchQueueDepths(env: MetricsEnv): Promise<QueueDepth[] | 
   ];
 }
 
-/**
- * List queues in the account and return a {name → id} map for the names we
- * care about. Returns null on fetch/parse failure. Not cached — one extra
- * HTTP round-trip per cron tick is trivial vs. the complexity of a TTLed
- * module-level cache.
- */
 async function resolveQueueIds(
   env: MetricsEnv,
   wantedNames: string[],
@@ -198,8 +305,7 @@ async function resolveQueueIds(
     return null;
   }
 
-  const idMap = extractQueueIdMap(body, wantedNames);
-  return idMap;
+  return extractQueueIdMap(body, wantedNames);
 }
 
 async function fetchBacklogGroups(
@@ -270,144 +376,33 @@ function labeledDepth(
 }
 
 // ============================================================================
-// OTLP payload builders
-// ============================================================================
-
-interface OtlpAttributeValue {
-  stringValue?: string;
-  intValue?: string;
-  doubleValue?: number;
-}
-interface OtlpAttribute {
-  key: string;
-  value: OtlpAttributeValue;
-}
-interface OtlpMetric {
-  name: string;
-  unit?: string;
-  sum?: {
-    dataPoints: OtlpNumberDataPoint[];
-    aggregationTemporality: 1 | 2; // 1=DELTA, 2=CUMULATIVE
-    isMonotonic: boolean;
-  };
-  gauge?: {
-    dataPoints: OtlpNumberDataPoint[];
-  };
-}
-interface OtlpNumberDataPoint {
-  attributes: OtlpAttribute[];
-  timeUnixNano: string;
-  startTimeUnixNano?: string;
-  asInt?: string;
-  asDouble?: number;
-}
-
-function counter(
-  name: string,
-  value: number,
-  attrs: Record<string, string>,
-  timeNs: string,
-  startNs: string,
-): OtlpMetric {
-  return {
-    name,
-    unit: '1',
-    sum: {
-      aggregationTemporality: 1, // DELTA — each emission is the per-batch delta
-      isMonotonic: true,
-      dataPoints: [{
-        attributes: toAttrs(attrs),
-        timeUnixNano: timeNs,
-        startTimeUnixNano: startNs,
-        asInt: String(Math.max(0, Math.floor(value))),
-      }],
-    },
-  };
-}
-
-function gauge(
-  name: string,
-  value: number,
-  attrs: Record<string, string>,
-  timeNs: string,
-): OtlpMetric {
-  return {
-    name,
-    unit: '1',
-    gauge: {
-      dataPoints: [{
-        attributes: toAttrs(attrs),
-        timeUnixNano: timeNs,
-        asInt: String(Math.max(0, Math.floor(value))),
-      }],
-    },
-  };
-}
-
-function toAttrs(attrs: Record<string, string>): OtlpAttribute[] {
-  return Object.entries(attrs).map(([key, value]) => ({
-    key, value: { stringValue: value },
-  }));
-}
-
-/**
- * Exported for tests. Builds the full OTLP/HTTP JSON body for a set of metrics
- * under a single scope name.
- */
-export function buildOtlpMetricsBody(
-  metrics: OtlpMetric[],
-  scopeName: string,
-): string {
-  return JSON.stringify({
-    resourceMetrics: [{
-      resource: {
-        attributes: [
-          { key: 'service.name', value: { stringValue: 'mnemom-observer' } },
-        ],
-      },
-      scopeMetrics: [{
-        scope: { name: scopeName },
-        metrics,
-      }],
-    }],
-  });
-}
-
-async function postMetrics(
-  env: MetricsEnv,
-  metrics: OtlpMetric[],
-  scopeName: string,
-): Promise<void> {
-  const body = buildOtlpMetricsBody(metrics, scopeName);
-  try {
-    await fetch(`${env.OTLP_ENDPOINT}/v1/metrics`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(env.OTLP_AUTH ? { Authorization: env.OTLP_AUTH } : {}),
-      },
-      body,
-      signal: AbortSignal.timeout(5_000),
-    });
-  } catch {
-    // Swallowed — matches the trace emitter's fire-and-forget posture.
-    // Tier 3 Worker logs capture the fetch failure if needed.
-  }
-}
-
-// ============================================================================
 // Helpers
 // ============================================================================
 
-function timeUnixNano(): string {
-  // Date.now() is ms — multiply by 1e6 for ns. Workers don't expose nanosecond
-  // resolution; the lossy conversion is fine for metrics (sub-ms buckets are
-  // never queried on these signals).
-  return String(Date.now() * 1_000_000);
+function envLabel(env: MetricsEnv): 'production' | 'staging' | 'unknown' {
+  if (env.GATEWAY_ID === 'mnemom') return 'production';
+  if (env.GATEWAY_ID === 'mnemom-staging') return 'staging';
+  return 'unknown';
 }
 
-function startUnixNano(deltaWindowMs: number): string {
-  return String((Date.now() - deltaWindowMs) * 1_000_000);
+function str(key: string, value: string): OtlpAttribute {
+  return { key, value: { stringValue: value } };
+}
+
+function int(key: string, value: number): OtlpAttribute {
+  return { key, value: { intValue: String(Math.max(0, Math.floor(value))) } };
+}
+
+function hex32(): string {
+  return crypto.randomUUID().replace(/-/g, '');
+}
+
+function hex16(): string {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+}
+
+function timeUnixNano(): string {
+  return String(Date.now() * 1_000_000);
 }
 
 function describe(err: unknown): string {

@@ -1,21 +1,22 @@
 /**
- * Tests for metrics.ts (Step 52).
+ * Tests for metrics.ts (Step 52, span-derived per ADR-032).
  *
  * Strategy: stub global fetch, drive the emitters through the happy path +
- * degraded paths, assert payload shape. Pure-function helpers (payload
- * builders, response parsers) are exercised directly so we don't need to
- * instantiate fetch at all.
+ * degraded paths, assert OTLP span payload shape. Pure-function helpers
+ * (payload builders, response parsers) are exercised directly so we don't
+ * need to instantiate fetch at all.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  emitBatchMetrics,
-  emitQueueDepthMetrics,
+  emitQueueBatchSpan,
+  emitQueueBacklogSpans,
   fetchQueueDepths,
-  buildOtlpMetricsBody,
+  buildOtlpSpansBody,
   extractBacklogGroups,
   extractQueueIdMap,
   type MetricsEnv,
+  type QueueDepth,
 } from '../metrics';
 import type { BatchStats } from '../queue-consumer';
 
@@ -49,20 +50,56 @@ const FETCH_OK = (body: unknown): Response =>
 const FETCH_FAIL = (status: number): Response =>
   new Response('error', { status });
 
-describe('buildOtlpMetricsBody', () => {
-  it('wraps metrics in resourceMetrics with service.name attribute', () => {
-    const json = buildOtlpMetricsBody([], 'scope.test');
-    const parsed = JSON.parse(json);
-    expect(parsed.resourceMetrics).toHaveLength(1);
-    const resourceAttrs = parsed.resourceMetrics[0].resource.attributes;
-    expect(resourceAttrs).toEqual([
+// ---------------------------------------------------------------------------
+// Narrow payload-shape types used only inside assertions.
+// ---------------------------------------------------------------------------
+
+interface OtlpAttr { key: string; value: { stringValue?: string; intValue?: string } }
+interface OtlpSpan {
+  name: string;
+  kind: number;
+  attributes: OtlpAttr[];
+  status: { code: number };
+  startTimeUnixNano: string;
+  endTimeUnixNano: string;
+  traceId: string;
+  spanId: string;
+}
+interface OtlpBody {
+  resourceSpans: Array<{
+    resource: { attributes: OtlpAttr[] };
+    scopeSpans: Array<{
+      scope: { name: string };
+      spans: OtlpSpan[];
+    }>;
+  }>;
+}
+
+function getSpans(init: RequestInit): OtlpSpan[] {
+  const body = JSON.parse(init.body as string) as OtlpBody;
+  return body.resourceSpans[0].scopeSpans[0].spans;
+}
+
+function attr(span: OtlpSpan, key: string): string | undefined {
+  const a = span.attributes.find((a) => a.key === key);
+  return a?.value.stringValue ?? a?.value.intValue;
+}
+
+// ===========================================================================
+
+describe('buildOtlpSpansBody', () => {
+  it('wraps spans in resourceSpans with service.name=mnemom-observer', () => {
+    const json = buildOtlpSpansBody([], 'scope.test');
+    const parsed = JSON.parse(json) as OtlpBody;
+    expect(parsed.resourceSpans).toHaveLength(1);
+    expect(parsed.resourceSpans[0].resource.attributes).toEqual([
       { key: 'service.name', value: { stringValue: 'mnemom-observer' } },
     ]);
-    expect(parsed.resourceMetrics[0].scopeMetrics[0].scope.name).toBe('scope.test');
+    expect(parsed.resourceSpans[0].scopeSpans[0].scope.name).toBe('scope.test');
   });
 });
 
-describe('emitBatchMetrics', () => {
+describe('emitQueueBatchSpan', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -72,56 +109,105 @@ describe('emitBatchMetrics', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it('no-ops when OTLP_ENDPOINT is unset', async () => {
-    await emitBatchMetrics(makeEnv({ OTLP_ENDPOINT: undefined }), makeStats());
+    await emitQueueBatchSpan(makeEnv({ OTLP_ENDPOINT: undefined }), makeStats());
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('POSTs to /v1/metrics with DELTA monotonic counters per outcome', async () => {
-    await emitBatchMetrics(makeEnv(), makeStats({
-      processed: 4, skipped: 2, acks_on_missing: 1, poison_acks: 1, retries: 0,
-    }));
+  it('POSTs to /v1/traces with one batch span + one poison span per poison_ack', async () => {
+    await emitQueueBatchSpan(
+      makeEnv(),
+      makeStats({ processed: 4, skipped: 2, acks_on_missing: 1, poison_acks: 2, retries: 0, total: 9 }),
+    );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('https://otlp.example/otlp/v1/metrics');
+    expect(url).toBe('https://otlp.example/otlp/v1/traces');
     expect((init as RequestInit).method).toBe('POST');
     expect((init as RequestInit).headers).toMatchObject({
       'Content-Type': 'application/json',
       Authorization: 'Basic abc',
     });
 
-    const body = JSON.parse((init as RequestInit).body as string);
-    const metrics = body.resourceMetrics[0].scopeMetrics[0].metrics;
+    const spans = getSpans(init as RequestInit);
+    expect(spans.map((s) => s.name)).toEqual([
+      'observer.queue_batch',
+      'observer.queue_poison',
+      'observer.queue_poison',
+    ]);
+  });
 
-    const processed = metrics.find((m: { name: string; sum?: { dataPoints: Array<{ attributes: Array<{ key: string; value: { stringValue?: string } }> }> } }) =>
-      m.name === 'observer.messages_processed' &&
-      m.sum?.dataPoints[0].attributes.find((a) => a.key === 'outcome')?.value.stringValue === 'processed',
+  it('batch span carries all integer counts + env/mode/gateway_id dimensions', async () => {
+    await emitQueueBatchSpan(
+      makeEnv(),
+      makeStats({ total: 10, processed: 7, skipped: 2, acks_on_missing: 1, poison_acks: 0, retries: 3 }),
     );
-    expect(processed?.sum?.aggregationTemporality).toBe(1); // DELTA
-    expect(processed?.sum?.isMonotonic).toBe(true);
-    expect(processed?.sum?.dataPoints[0].asInt).toBe('4');
 
-    const poison = metrics.find((m: { name: string; sum?: { dataPoints: Array<{ attributes: Array<{ key: string; value: { stringValue?: string } }> }> } }) =>
-      m.name === 'observer.messages_failed' &&
-      m.sum?.dataPoints[0].attributes.find((a) => a.key === 'reason')?.value.stringValue === 'poison',
+    const batch = getSpans(fetchMock.mock.calls[0][1] as RequestInit)[0];
+
+    // Low-cardinality dimensions — these become spanmetrics labels.
+    expect(attr(batch, 'env')).toBe('staging');
+    expect(attr(batch, 'mode')).toBe('queue');
+    expect(attr(batch, 'gateway_id')).toBe('mnemom-staging');
+
+    // High-cardinality integer counts — stored as span attrs for TraceQL queries.
+    expect(attr(batch, 'batch_size')).toBe('10');
+    expect(attr(batch, 'processed')).toBe('7');
+    expect(attr(batch, 'skipped')).toBe('2');
+    expect(attr(batch, 'acks_on_missing')).toBe('1');
+    expect(attr(batch, 'poison_acks')).toBe('0');
+    expect(attr(batch, 'retries')).toBe('3');
+
+    // status=OK when no poison acks.
+    expect(batch.status.code).toBe(1);
+  });
+
+  it('batch span status=ERROR when any poison ack', async () => {
+    await emitQueueBatchSpan(makeEnv(), makeStats({ poison_acks: 1 }));
+    const batch = getSpans(fetchMock.mock.calls[0][1] as RequestInit)[0];
+    expect(batch.status.code).toBe(2);
+  });
+
+  it('poison span carries reason=poison + mode + gateway_id dimensions', async () => {
+    await emitQueueBatchSpan(makeEnv(), makeStats({ poison_acks: 1 }));
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    const poison = spans.find((s) => s.name === 'observer.queue_poison')!;
+
+    expect(attr(poison, 'env')).toBe('staging');
+    expect(attr(poison, 'mode')).toBe('queue');
+    expect(attr(poison, 'gateway_id')).toBe('mnemom-staging');
+    expect(attr(poison, 'reason')).toBe('poison');
+    expect(poison.status.code).toBe(2);
+  });
+
+  it('env derived from GATEWAY_ID — production for "mnemom"', async () => {
+    await emitQueueBatchSpan(makeEnv({ GATEWAY_ID: 'mnemom' }), makeStats({ poison_acks: 0 }));
+    const batch = getSpans(fetchMock.mock.calls[0][1] as RequestInit)[0];
+    expect(attr(batch, 'env')).toBe('production');
+    expect(attr(batch, 'gateway_id')).toBe('mnemom');
+  });
+
+  it('env is "unknown" for unfamiliar GATEWAY_ID', async () => {
+    await emitQueueBatchSpan(makeEnv({ GATEWAY_ID: 'mystery' }), makeStats({ poison_acks: 0 }));
+    const batch = getSpans(fetchMock.mock.calls[0][1] as RequestInit)[0];
+    expect(attr(batch, 'env')).toBe('unknown');
+  });
+
+  it('mode defaults to "direct" if OBSERVER_PROCESSING_MODE unset', async () => {
+    await emitQueueBatchSpan(
+      makeEnv({ OBSERVER_PROCESSING_MODE: undefined }),
+      makeStats({ poison_acks: 0 }),
     );
-    expect(poison?.sum?.dataPoints[0].asInt).toBe('1');
-
-    // Every data point should carry gateway_id + mode attributes.
-    for (const m of metrics) {
-      const attrs = m.sum.dataPoints[0].attributes as Array<{ key: string; value: { stringValue: string } }>;
-      expect(attrs.find((a) => a.key === 'gateway_id')?.value.stringValue).toBe('mnemom-staging');
-      expect(attrs.find((a) => a.key === 'mode')?.value.stringValue).toBe('queue');
-    }
+    const batch = getSpans(fetchMock.mock.calls[0][1] as RequestInit)[0];
+    expect(attr(batch, 'mode')).toBe('direct');
   });
 
   it('swallows fetch failures', async () => {
     fetchMock.mockRejectedValueOnce(new Error('network unreachable'));
-    await expect(emitBatchMetrics(makeEnv(), makeStats())).resolves.toBeUndefined();
+    await expect(emitQueueBatchSpan(makeEnv(), makeStats())).resolves.toBeUndefined();
   });
 });
 
-describe('emitQueueDepthMetrics', () => {
+describe('emitQueueBacklogSpans', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -130,30 +216,38 @@ describe('emitQueueDepthMetrics', () => {
   });
   afterEach(() => vi.unstubAllGlobals());
 
-  it('emits two gauges per queue (depth + consumer_lag)', async () => {
-    await emitQueueDepthMetrics(makeEnv(), [
+  it('emits one observer.queue_backlog span per queue with depth + age_seconds attrs', async () => {
+    const depths: QueueDepth[] = [
       { queue: 'main', backlogMessages: 1234, oldestMessageAgeSeconds: 12 },
       { queue: 'dlq', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
-    ]);
+    ];
+    await emitQueueBacklogSpans(makeEnv(), depths);
 
-    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
-    const metrics = body.resourceMetrics[0].scopeMetrics[0].metrics;
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    expect(spans).toHaveLength(2);
+    expect(spans.every((s) => s.name === 'observer.queue_backlog')).toBe(true);
 
-    const depthMain = metrics.find((m: { name: string; gauge?: { dataPoints: Array<{ attributes: Array<{ key: string; value: { stringValue?: string } }>; asInt?: string }> } }) =>
-      m.name === 'observer.queue_depth' &&
-      m.gauge?.dataPoints[0].attributes.find((a) => a.key === 'queue')?.value.stringValue === 'main',
-    );
-    expect(depthMain?.gauge?.dataPoints[0].asInt).toBe('1234');
+    const main = spans.find((s) => attr(s, 'queue') === 'main')!;
+    expect(attr(main, 'depth')).toBe('1234');
+    expect(attr(main, 'age_seconds')).toBe('12');
+    expect(attr(main, 'gateway_id')).toBe('mnemom-staging');
+    expect(attr(main, 'env')).toBe('staging');
 
-    const lagDlq = metrics.find((m: { name: string; gauge?: { dataPoints: Array<{ attributes: Array<{ key: string; value: { stringValue?: string } }>; asInt?: string }> } }) =>
-      m.name === 'observer.consumer_lag_seconds' &&
-      m.gauge?.dataPoints[0].attributes.find((a) => a.key === 'queue')?.value.stringValue === 'dlq',
-    );
-    expect(lagDlq?.gauge?.dataPoints[0].asInt).toBe('0');
+    const dlq = spans.find((s) => attr(s, 'queue') === 'dlq')!;
+    expect(attr(dlq, 'depth')).toBe('0');
+    expect(attr(dlq, 'age_seconds')).toBe('0');
   });
 
   it('no-ops on empty array', async () => {
-    await emitQueueDepthMetrics(makeEnv(), []);
+    await emitQueueBacklogSpans(makeEnv(), []);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('no-ops when OTLP_ENDPOINT unset', async () => {
+    await emitQueueBacklogSpans(
+      makeEnv({ OTLP_ENDPOINT: undefined }),
+      [{ queue: 'main', backlogMessages: 1, oldestMessageAgeSeconds: 1 }],
+    );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
@@ -258,7 +352,6 @@ describe('fetchQueueDepths', () => {
       { queue: 'main', backlogMessages: 42, oldestMessageAgeSeconds: 3 },
       { queue: 'dlq', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
     ]);
-    // Listing → graphql, two calls.
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const firstUrl = fetchMock.mock.calls[0][0];
     expect(firstUrl).toContain('/accounts/acct-1/queues');
@@ -267,17 +360,14 @@ describe('fetchQueueDepths', () => {
   });
 
   it('returns zero-depth rows when queues are missing from listing', async () => {
-    // Listing returns an unrelated queue only — the observer queues don't exist yet.
     fetchMock.mockResolvedValueOnce(FETCH_OK({
       result: [{ queue_id: 'QELSE', queue_name: 'different' }],
     }));
-    // GraphQL still runs, returns empty groups (no queueIds to query).
     const r = await fetchQueueDepths(makeEnv());
     expect(r).toEqual([
       { queue: 'main', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
       { queue: 'dlq', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
     ]);
-    // Only one fetch call — graphql is skipped because there are no IDs to query.
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

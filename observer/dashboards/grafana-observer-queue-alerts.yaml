@@ -1,89 +1,50 @@
-# Prometheus-native alerting rules for the mnemom-observer queue pipeline.
-# Step 52 — M6 Observer Scale.
+# Alert rules for the mnemom-observer queue pipeline — Step 52, ADR-032.
 #
-# Format matches mnemom-api/dashboards/grafana-auth-alerts.yaml — import via
-# Grafana Cloud → Alerting → Alert rules → Import Prometheus alert rules,
-# pointed at the grafanacloud-mnemom-prom datasource. OTLP metrics arrive
-# there after dots are rewritten to underscores by Grafana Cloud's OTLP
-# gateway (observer.queue_depth → observer_queue_depth).
+# Split into two groups by evaluation source:
 #
-# Source metrics emitted by observer/src/metrics.ts:
-#   - observer.queue_depth           (gauge, labels: queue, gateway_id)
-#   - observer.consumer_lag_seconds  (gauge, labels: queue, gateway_id)
-#   - observer.messages_processed    (counter, DELTA, labels: outcome, mode, gateway_id)
-#   - observer.messages_failed       (counter, DELTA, labels: reason, mode, gateway_id)
+#   - prometheus (spanmetrics): imported via Grafana Cloud → Alerting →
+#       Alert rules → Import Prometheus alert rules, pointed at
+#       grafanacloud-mnemom-prom. Works because the underlying series
+#       (traces_spanmetrics_*) are populated by Grafana's metrics-generator
+#       from the spans the observer emits on the /v1/traces route.
 #
-# Thresholds inline in each `expr`. Severity maps to our two-tier setup
-# (critical=P0 page, high=P1 Slack-only). Observer page/Slack routing is
-# wired in Grafana contact points.
+#   - traceql (Tempo metrics queries): Grafana-managed rules — cannot be
+#       imported via this YAML. Create in Grafana UI: Alerting → Alert
+#       rules → New alert rule → Data source = grafanacloud-mnemom-traces.
+#       Paste the expression from the `traceql:` block below. Thresholds
+#       and annotations carried verbatim from the Prometheus rules they
+#       replace so dashboards + runbook references stay valid.
+#
+# Source spans emitted by observer/src/metrics.ts:
+#
+#   observer.queue_batch    (one per MessageBatch; attrs: env, mode,
+#                            gateway_id, batch_size, processed, skipped,
+#                            acks_on_missing, poison_acks, retries;
+#                            status=ERROR if poison_acks > 0)
+#   observer.queue_poison   (one per poison-acked message; attrs: env,
+#                            mode, gateway_id, reason=poison;
+#                            status=ERROR)
+#   observer.queue_backlog  (one per queue per scheduled() tick; attrs:
+#                            env, queue, gateway_id, depth, age_seconds)
+#
+# Severity maps to our two-tier setup (critical=P0 page, high=P1 Slack).
 
 groups:
-  - name: mnemom-observer-queue
+  - name: mnemom-observer-queue-prometheus
     interval: 1m
     rules:
 
-      # ─── 1. Main queue backlog > 50,000 messages (Step 52 primary alert) ──
-      - alert: ObserverQueueBacklogHigh
-        expr: |
-          max by (gateway_id) (observer_queue_depth{queue="main"}) > 50000
-        for: 5m
-        labels:
-          severity: high
-          service: mnemom-observer
-          area: observer-scale
-        annotations:
-          summary: Observer main queue backlog > 50k for 5m ({{ $labels.gateway_id }})
-          description: |
-            The observer queue (mnemom-observer-records / -staging) has
-            exceeded 50,000 backlogged messages for five minutes. At 1M
-            events/day (694/min) a healthy steady state holds depth near
-            zero; sustained 50k+ means the consumer is not draining. Likely
-            causes: consumer Worker crash-looping, Anthropic analysis API
-            rate-limited, Supabase submitTrace 5xx, or a recent deploy
-            regression.
-          runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
-
-      # ─── 2. DLQ depth > 0 (any DLQ'd message warrants inspection) ─────────
-      - alert: ObserverDLQNonEmpty
-        expr: |
-          max by (gateway_id) (observer_queue_depth{queue="dlq"}) > 0
-        for: 10m
-        labels:
-          severity: high
-          service: mnemom-observer
-          area: observer-scale
-        annotations:
-          summary: Observer DLQ has {{ $value }} message(s) ({{ $labels.gateway_id }})
-          description: |
-            At least one message exhausted max_retries and landed in the DLQ.
-            Non-zero DLQ depth sustained for 10m indicates either a poison
-            message the consumer's isPoisonError classifier missed, or a
-            sustained transient failure (e.g. Supabase down) that burned
-            through retries. Inspect Tier 3 Worker logs for the message ID.
-          runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
-
-      # ─── 3. Consumer lag > 10 minutes (oldest unacked message age) ────────
-      - alert: ObserverConsumerLagHigh
-        expr: |
-          max by (gateway_id) (observer_consumer_lag_seconds{queue="main"}) > 600
-        for: 10m
-        labels:
-          severity: high
-          service: mnemom-observer
-          area: observer-scale
-        annotations:
-          summary: Observer consumer lag > 10m ({{ $labels.gateway_id }})
-          description: |
-            Oldest unacked message in the main queue is > 10 minutes old.
-            Step 53's load-test pass criterion is "all processed within 10
-            minutes of generation" — this alert fires when we've breached
-            that SLO. Often co-fires with ObserverQueueBacklogHigh.
-          runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
-
-      # ─── 4. Poison-ack rate > 0 sustained (consumer dropping messages) ────
+      # ─── Poison-ack rate > 0 sustained (consumer dropping messages) ─────────
+      # Works as a direct spanmetrics rate query: each poison-acked message
+      # emits its own observer.queue_poison span, so the call-count rate is
+      # the message rate.
       - alert: ObserverPoisonAckRate
         expr: |
-          sum by (gateway_id) (rate(observer_messages_failed{reason="poison"}[15m])) > 0
+          sum by (gateway_id) (
+            rate(traces_spanmetrics_calls_total{
+              span_name="observer.queue_poison"
+            }[15m])
+          ) > 0
         for: 15m
         labels:
           severity: high
@@ -97,5 +58,59 @@ groups:
             poison-ack drops a trace permanently. Sustained poison acks
             usually mean a decryption-key mismatch on a new R2 object shape
             (rotate LOGPUSH_DECRYPT_PRIVATE_KEY or re-check the Logpush
-            envelope format).
+            envelope format). Note: the `gateway_id` label requires
+            promotion on the metrics-generator config — until that's added,
+            this alert fires with an empty `gateway_id`; the runbook
+            narrows down by checking staging vs prod observer logs.
           runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
+
+# ============================================================================
+# TraceQL metrics rules — create via Grafana UI, not YAML import.
+# ============================================================================
+#
+# These three alerts evaluate gauge-style signals (queue depth, consumer lag)
+# that don't map to spanmetrics call-rate semantics. They run against Tempo
+# via TraceQL metrics queries and must be provisioned as Grafana-managed
+# alert rules (Alerting → New alert rule → grafanacloud-mnemom-traces).
+#
+#   ObserverQueueBacklogHigh
+#     expr:       {resource.service.name="mnemom-observer"
+#                   && name="observer.queue_backlog"
+#                   && span.queue="main"} | max_over_time(span.depth)
+#     threshold:  > 50000
+#     for:        5m
+#     severity:   high
+#     summary:    Observer main queue backlog > 50k for 5m
+#     description same as pre-refactor: consumer not draining; likely causes
+#                 are consumer crash-loop, Anthropic rate-limit, Supabase
+#                 5xx, or recent deploy regression.
+#
+#   ObserverDLQNonEmpty
+#     expr:       {resource.service.name="mnemom-observer"
+#                   && name="observer.queue_backlog"
+#                   && span.queue="dlq"} | max_over_time(span.depth)
+#     threshold:  > 0
+#     for:        10m
+#     severity:   high
+#     summary:    Observer DLQ has backlogged message(s)
+#     description same as pre-refactor: a message exhausted max_retries or
+#                 was classified as poison that evaded the isPoisonError
+#                 classifier; inspect Tier 3 Worker logs for message ID.
+#
+#   ObserverConsumerLagHigh
+#     expr:       {resource.service.name="mnemom-observer"
+#                   && name="observer.queue_backlog"
+#                   && span.queue="main"} | max_over_time(span.age_seconds)
+#     threshold:  > 600
+#     for:        10m
+#     severity:   high
+#     summary:    Observer consumer lag > 10m
+#     description same as pre-refactor: oldest unacked message > 10 minutes
+#                 old. Breaches Step 53's load-test SLO; often co-fires with
+#                 ObserverQueueBacklogHigh.
+#
+# All three share runbook_url:
+#   https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
+#
+# Provisioning follow-up: move these to Terraform-managed Grafana resources
+# once the refactor burns in (tracked in scale/implementation-plan.md).
