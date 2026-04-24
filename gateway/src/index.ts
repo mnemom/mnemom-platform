@@ -78,6 +78,9 @@ import {
   computeMinHash,
   computeBandHashes,
   buildRecipeIndex,
+  evaluateRecipesTier1,
+  buildDetectorScoresFromThreats,
+  serializeRecipeTelemetry,
   type SafeHouseConfig,
   type SafeHouseDecision,
   type SafeHouseVerdict,
@@ -89,6 +92,9 @@ import {
   type ThreatDetection,
   type RecipeIndex,
   type RecipeRpcRow,
+  type RecipeMode,
+  type RecipeEvalConfig,
+  type DetectorScores,
 } from '@mnemom/safe-house';
 
 // ── SemanticAnalyzer trigger helper ────────────────────────────────────────
@@ -195,6 +201,8 @@ export interface Env {
   SAFE_HOUSE_ENABLED?: string;  // "true" to enable Safe House DB fetches; default off to avoid test interference
   // Canonical agent creation (scale/step-25b): gateway delegates to mnemom-api
   INTERNAL_API_KEY?: string;    // Shared service-to-service key (same as mnemom-api INTERNAL_API_KEY)
+  // Phase 5 Stage 5B: Detection recipes runtime
+  RECIPE_MODE?: string;         // "off" | "shadow" | "enforce", default "off". 5B only uses "off"/"shadow".
 }
 
 interface Agent {
@@ -4668,6 +4676,61 @@ export async function handleProviderProxy(
           }
 
           const { multiplied_score, session_multiplier } = applySessionMultiplier(finalScore, sessionState);
+
+          // Phase 5 Stage 5B: recipe tier1 shadow evaluation.
+          // Runs only when RECIPE_MODE='shadow' (or 'enforce', reserved for Stage 5D).
+          // Verdict is NOT affected in shadow mode — we log what would have happened.
+          // Fail-open on every failure path.
+          const recipeMode = (env.RECIPE_MODE ?? 'off') as RecipeMode;
+          if (recipeMode === 'shadow') {
+            const canonicalL2Score = typeof detectorScores.SemanticAnalyzer === 'number'
+              ? detectorScores.SemanticAnalyzer
+              : null;
+            ctx.waitUntil(
+              (async (): Promise<void> => {
+                try {
+                  const recipeIndex = await fetchActiveRecipes(env);
+                  if (recipeIndex.all.length === 0) return;
+                  const canonicalScores: DetectorScores =
+                    buildDetectorScoresFromThreats(finalThreats);
+                  if (sessionState) {
+                    canonicalScores.session_tracker =
+                      sessionState.session_threat_level === 'high' ? 0.85
+                      : sessionState.session_threat_level === 'medium' ? 0.55
+                      : 0.20;
+                  }
+                  if (canonicalL2Score !== null) {
+                    canonicalScores.semantic_analyzer = canonicalL2Score;
+                  }
+                  const evalConfig: RecipeEvalConfig = {
+                    mode: recipeMode,
+                    per_threat_type_cap: 5,
+                    global_cap: 10,
+                  };
+                  const tier1Result = evaluateRecipesTier1(
+                    canonicalScores,
+                    inboundMessage,
+                    recipeIndex,
+                    evalConfig,
+                  );
+                  const telemetry = serializeRecipeTelemetry(
+                    tier1Result,
+                    null,
+                    recipeIndex,
+                    recipeMode,
+                  );
+                  console.log(JSON.stringify({
+                    ...telemetry,
+                    agent_id: agent.id,
+                    session_id: sessionId,
+                    surface: 'user_message',
+                  }));
+                } catch {
+                  // Fail open — recipes are additive; a failure must never affect the verdict path.
+                }
+              })(),
+            );
+          }
 
           // Apply source trust rules (risk_multiplier from trusted_sources config)
           const sourceType = (requestBody as Record<string, unknown>)?.['x_sh_source_type'] as string ?? 'user_message';
