@@ -30,3 +30,19 @@ export type {
   CompiledCondition, CompiledTier1, CompiledTier2, CompiledTier2Check,
   CompiledRecipe, RecipeIndex,
 } from './recipes.js';
+export {
+  evaluateRecipesTier1,
+  buildDetectorScoresFromThreats,
+  collectTier2Checks,
+  buildRecipeTier2PromptFragment,
+  parseRecipeTier2Response,
+  serializeRecipeTelemetry,
+  DEFAULT_RECIPE_EVAL_CONFIG,
+} from './recipes-evaluator.js';
+export type {
+  RecipeMode, RecipeEvalConfig, DetectorScores,
+  MatchedCondition, SkippedCondition, ConditionSkipReason,
+  Tier1Hit, Tier1Result,
+  Tier2Check, Tier2CheckResult, Tier2CheckSkipReason, Tier2Result,
+  RecipeTelemetry, ThreatLike,
+} from './recipes-evaluator.js';
