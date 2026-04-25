@@ -86,16 +86,17 @@ async function encryptedR2Object(publicKey: CryptoKey, numRecords: number, gatew
 
 interface FakeMessage {
   body: ObserverQueueMessage;
+  timestamp: Date;
   _ack: ReturnType<typeof vi.fn>;
   _retry: ReturnType<typeof vi.fn>;
   ack: () => void;
   retry: () => void;
 }
 
-function msg(body: ObserverQueueMessage): FakeMessage {
+function msg(body: ObserverQueueMessage, timestamp: Date = new Date()): FakeMessage {
   const _ack = vi.fn();
   const _retry = vi.fn();
-  return { body, _ack, _retry, ack: _ack, retry: _retry };
+  return { body, timestamp, _ack, _retry, ack: _ack, retry: _retry };
 }
 
 function batchOf(messages: FakeMessage[]): MessageBatch<ObserverQueueMessage> {
@@ -130,6 +131,62 @@ const fakeCtx = { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as unkno
 
 beforeEach(() => {
   _resetDecryptCacheForTests();
+});
+
+describe('handleQueueBatch — oldest_message_lag_ms (ADR-033)', () => {
+  it('computes oldest message lag from message.timestamp at batch start', async () => {
+    const { publicKey, privateKeyPem } = await freshKeypair();
+    const bucket = makeBucket({
+      '20260418/a.log.gz': await encryptedR2Object(publicKey, 1, 'mnemom-staging'),
+      '20260418/b.log.gz': await encryptedR2Object(publicKey, 1, 'mnemom-staging'),
+    });
+
+    const now = Date.now();
+    // Pin Date.now() so the assertion isn't racing the clock — the lag we
+    // expect is exactly (now - oldestEnqueueMs).
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+
+    const oldEnqueueMs = now - 30_000; // 30s ago
+    const newEnqueueMs = now - 5_000;  // 5s ago
+    const messages = [
+      msg({
+        source: 'r2', objectKey: '20260418/a.log.gz', recordIndex: 0,
+        gateway: 'mnemom-staging', provider: 'anthropic',
+        model: 'claude-haiku-4-5-20251001', statusCode: 200,
+      }, new Date(oldEnqueueMs)),
+      msg({
+        source: 'r2', objectKey: '20260418/b.log.gz', recordIndex: 0,
+        gateway: 'mnemom-staging', provider: 'anthropic',
+        model: 'claude-haiku-4-5-20251001', statusCode: 200,
+      }, new Date(newEnqueueMs)),
+    ];
+    const processLog: LogProcessor = vi.fn(async () => true);
+    const stats = await handleQueueBatch(batchOf(messages), {
+      GATEWAY_ID: 'mnemom-staging',
+      GATEWAY_LOGS_BUCKET: bucket,
+      LOGPUSH_DECRYPT_PRIVATE_KEY: privateKeyPem,
+      CF_ACCOUNT_ID: 'acct',
+      CF_API_TOKEN: 'tok',
+    } as unknown as Parameters<typeof handleQueueBatch>[1], fakeCtx, processLog);
+
+    // Oldest message is 30s old at batch start.
+    expect(stats.oldest_message_lag_ms).toBe(30_000);
+
+    vi.restoreAllMocks();
+  });
+
+  it('returns 0 lag when batch is empty', async () => {
+    const { privateKeyPem } = await freshKeypair();
+    const stats = await handleQueueBatch(batchOf([]), {
+      GATEWAY_ID: 'mnemom-staging',
+      GATEWAY_LOGS_BUCKET: makeBucket({}),
+      LOGPUSH_DECRYPT_PRIVATE_KEY: privateKeyPem,
+      CF_ACCOUNT_ID: 'acct',
+      CF_API_TOKEN: 'tok',
+    } as unknown as Parameters<typeof handleQueueBatch>[1], fakeCtx, vi.fn());
+    expect(stats.total).toBe(0);
+    expect(stats.oldest_message_lag_ms).toBe(0);
+  });
 });
 
 describe('handleQueueBatch — r2 source', () => {
@@ -292,7 +349,7 @@ describe('handleQueueBatch — unknown source', () => {
   it('acks unknown-source messages as poison (forward-compat drain)', async () => {
     const processLog: LogProcessor = vi.fn();
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const m = { body: { source: 'wat' } as unknown as ObserverQueueMessage, _ack: vi.fn(), _retry: vi.fn() } as FakeMessage;
+    const m = { body: { source: 'wat' } as unknown as ObserverQueueMessage, timestamp: new Date(), _ack: vi.fn(), _retry: vi.fn() } as FakeMessage;
     m.ack = m._ack;
     m.retry = m._retry;
     const stats = await handleQueueBatch(batchOf([m]), {} as unknown as Parameters<typeof handleQueueBatch>[1], fakeCtx, processLog);

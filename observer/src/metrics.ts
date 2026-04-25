@@ -1,23 +1,20 @@
 /**
- * Observer queue observability — Step 52, span-derived per ADR-032.
+ * Observer queue observability — Step 52, span-derived per ADR-032 + ADR-033.
  *
  * Emits OTLP spans to $OTLP_ENDPOINT/v1/traces (the supported CF Workers path
  * per Grafana Cloud support ticket #225229). Grafana's metrics-generator
  * aggregates the spans into `traces_spanmetrics_*` series for RED-style
- * alerting; gauge-style queries (queue depth, consumer lag) use Tempo TraceQL
- * metrics at query time.
- *
- * Replaces the direct /v1/metrics emission that shipped in Step 52's original
- * cut — that path is not a supported CF Worker ingestion route on Grafana
- * Cloud, so every metric POST over 72h was silently dropped.
+ * alerting; gauge-style queries use Tempo TraceQL metrics at query time.
  *
  * Three span families:
  *
  *   observer.queue_batch     One span per MessageBatch. Integer counts are
- *                            span attributes; dimensions (low-cardinality,
- *                            suitable for spanmetrics labels) are env,
- *                            mode, gateway_id. Status=error when
- *                            stats.poison_acks > 0.
+ *                            span attributes; carries `oldest_message_lag_ms`
+ *                            measured from CF Queue message.timestamp at the
+ *                            moment the consumer received the batch (ADR-033
+ *                            — consumer-side lag, not from CF Analytics).
+ *                            Dimensions: env, mode, gateway_id. Status=error
+ *                            when stats.poison_acks > 0.
  *
  *   observer.queue_poison    One span per poison-acked message (emitted
  *                            stats.poison_acks times per batch). Makes
@@ -26,14 +23,22 @@
  *                            gateway_id, reason=poison.
  *
  *   observer.queue_backlog   One span per queue per scheduled() tick,
- *                            carrying `depth` + `age_seconds` as numeric
- *                            attributes. Depth/lag alerts evaluate via
- *                            TraceQL metrics (max_over_time(span.depth)).
- *                            Dimensions: env, queue, gateway_id.
+ *                            carrying `depth` (avg messages backlogged) as
+ *                            a numeric attribute. Depth alerts evaluate via
+ *                            TraceQL max_over_time(span.depth). Dimensions:
+ *                            env, queue, gateway_id.
+ *
+ * Source for backlog depth: CF GraphQL Analytics
+ * `queueBacklogAdaptiveGroups.avg.messages`. Source for consumer lag:
+ * `Date.now() - message.timestamp.getTime()` inside handleQueueBatch.
+ * The split is deliberate — CF is the only signal source for backlog (we
+ * can't see un-consumed messages); we are the only correct source for lag
+ * (we know exactly when our consumer first saw a given message).
  *
  * Fire-and-forget posture preserved: unreachable backend is swallowed, the
  * batch has already been acked before emission. See ADR-032 for the pattern
- * choice + migration triggers toward a collector tier (Option B).
+ * choice + migration triggers toward a collector tier (Option B). See
+ * ADR-033 for the consumer-side lag rationale.
  */
 
 import type { BatchStats } from './queue-consumer';
@@ -49,8 +54,9 @@ export interface MetricsEnv {
 
 export interface QueueDepth {
   queue: 'main' | 'dlq';
-  backlogMessages: number;
-  oldestMessageAgeSeconds: number;
+  /** Average backlog depth (messages) over the sample window. Source: CF
+   *  GraphQL `queueBacklogAdaptiveGroups.avg.messages`. */
+  messages: number;
 }
 
 // ============================================================================
@@ -149,6 +155,8 @@ function buildBatchSpan(
       int('acks_on_missing', stats.acks_on_missing),
       int('poison_acks', stats.poison_acks),
       int('retries', stats.retries),
+      // Consumer-side lag (ADR-033) — TraceQL alerts on max_over_time(span.oldest_message_lag_ms).
+      int('oldest_message_lag_ms', stats.oldest_message_lag_ms),
     ],
     status: { code: stats.poison_acks > 0 ? 2 : 1 },
   };
@@ -186,8 +194,7 @@ function buildBacklogSpan(env_: string, gatewayId: string, d: QueueDepth): OtlpS
       str('env', env_),
       str('queue', d.queue),
       str('gateway_id', gatewayId),
-      int('depth', d.backlogMessages),
-      int('age_seconds', d.oldestMessageAgeSeconds),
+      int('depth', d.messages),
     ],
     status: { code: 1 },
   };
@@ -312,17 +319,22 @@ async function fetchBacklogGroups(
   env: MetricsEnv,
   queueIds: string[],
 ): Promise<BacklogGroup[] | null> {
+  // CF Analytics schema (verified 2026-04-24):
+  //   queueBacklogAdaptiveGroups exposes only avg { messages, bytes,
+  //   sampleInterval } — there is no `max` aggregate, no
+  //   oldestMessageAgeSeconds field, and datetime is not orderable. The
+  //   original Step 52 query used a stale schema and silently returned
+  //   null on every tick. See ADR-033 for the lag-tracking pivot.
   const query = `
     query QueueBacklog($account: String!, $ids: [String!]!, $since: Time!) {
       viewer {
         accounts(filter: { accountTag: $account }) {
           queueBacklogAdaptiveGroups(
             filter: { queueId_in: $ids, datetime_geq: $since },
-            limit: 100,
-            orderBy: [datetime_DESC]
+            limit: 100
           ) {
             dimensions { queueId }
-            max { backlogMessages oldestMessageAgeSeconds }
+            avg { messages }
           }
         }
       }
@@ -370,8 +382,7 @@ function labeledDepth(
   const row = queueId ? groups.find((g) => g.queueId === queueId) : undefined;
   return {
     queue: label,
-    backlogMessages: row?.backlogMessages ?? 0,
-    oldestMessageAgeSeconds: row?.oldestMessageAgeSeconds ?? 0,
+    messages: row?.messages ?? 0,
   };
 }
 
@@ -427,14 +438,16 @@ function queueNamesFor(gatewayId: string): { main: string; dlq: string } | null 
 
 interface BacklogGroup {
   queueId: string;
-  backlogMessages: number;
-  oldestMessageAgeSeconds: number;
+  messages: number;
 }
 
 /**
- * Pull the flat list of {queueId, backlogMessages, oldestMessageAgeSeconds}
- * rows out of the CF GraphQL response, tolerating missing fields at every
- * layer. Returns null if the response shape is unrecognizable.
+ * Pull the flat list of {queueId, messages} rows out of the CF GraphQL
+ * response, tolerating missing fields at every layer. Returns null if the
+ * response shape is unrecognizable.
+ *
+ * Schema reference (verified 2026-04-24):
+ *   queueBacklogAdaptiveGroups[].avg.messages — uint64
  *
  * Exported for tests.
  */
@@ -453,14 +466,12 @@ export function extractBacklogGroups(body: unknown): BacklogGroup[] | null {
     for (const g of groups) {
       if (!isObject(g)) continue;
       const dims = isObject(g.dimensions) ? g.dimensions : undefined;
-      const max = isObject(g.max) ? g.max : undefined;
+      const avg = isObject(g.avg) ? g.avg : undefined;
       const queueId = typeof dims?.queueId === 'string' ? dims.queueId : null;
       if (!queueId) continue;
       rows.push({
         queueId,
-        backlogMessages: typeof max?.backlogMessages === 'number' ? max.backlogMessages : 0,
-        oldestMessageAgeSeconds:
-          typeof max?.oldestMessageAgeSeconds === 'number' ? max.oldestMessageAgeSeconds : 0,
+        messages: typeof avg?.messages === 'number' ? avg.messages : 0,
       });
     }
   }

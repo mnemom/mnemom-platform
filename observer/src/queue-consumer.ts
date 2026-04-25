@@ -203,6 +203,13 @@ export interface BatchStats {
   acks_on_missing: number;
   poison_acks: number;
   retries: number;
+  /**
+   * Age of the oldest message in this batch at the moment the consumer first
+   * looked at it (ms). Captured before any processing so it reflects the lag
+   * we want to alert on, not the lag plus our own batch-handling latency.
+   * Zero when the batch is empty. See ADR-033.
+   */
+  oldest_message_lag_ms: number;
 }
 
 /**
@@ -215,6 +222,17 @@ export async function handleQueueBatch(
   ctx: ExecutionContext,
   processLog: LogProcessor,
 ): Promise<BatchStats> {
+  // Consumer-side lag (ADR-033): each CF Queue message carries its enqueue
+  // timestamp. Computing lag here gives us a per-batch "oldest unacked
+  // message age" signal that is more accurate, lower-latency, and free of
+  // CF Analytics API dependency compared to inferring it externally.
+  const batchStartMs = Date.now();
+  const oldestMessageLagMs = batch.messages.length > 0
+    ? batchStartMs - Math.min(
+        ...batch.messages.map((m) => m.timestamp.getTime()),
+      )
+    : 0;
+
   const stats: BatchStats = {
     total: batch.messages.length,
     processed: 0,
@@ -222,6 +240,7 @@ export async function handleQueueBatch(
     acks_on_missing: 0,
     poison_acks: 0,
     retries: 0,
+    oldest_message_lag_ms: oldestMessageLagMs,
   };
 
   for (const message of batch.messages) {

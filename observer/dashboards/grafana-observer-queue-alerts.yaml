@@ -19,13 +19,19 @@
 #
 #   observer.queue_batch    (one per MessageBatch; attrs: env, mode,
 #                            gateway_id, batch_size, processed, skipped,
-#                            acks_on_missing, poison_acks, retries;
-#                            status=ERROR if poison_acks > 0)
+#                            acks_on_missing, poison_acks, retries,
+#                            oldest_message_lag_ms; status=ERROR if
+#                            poison_acks > 0)
 #   observer.queue_poison   (one per poison-acked message; attrs: env,
 #                            mode, gateway_id, reason=poison;
 #                            status=ERROR)
 #   observer.queue_backlog  (one per queue per scheduled() tick; attrs:
-#                            env, queue, gateway_id, depth, age_seconds)
+#                            env, queue, gateway_id, depth)
+#
+# Consumer lag (ADR-033) is measured per-batch in handleQueueBatch and
+# carried as the `oldest_message_lag_ms` attribute on observer.queue_batch.
+# CF Analytics doesn't expose oldest-unacked-message age; we measure it
+# directly from message.timestamp at batch arrival.
 #
 # Severity maps to our two-tier setup (critical=P0 page, high=P1 Slack).
 
@@ -99,15 +105,16 @@ groups:
 #
 #   ObserverConsumerLagHigh
 #     expr:       {resource.service.name="mnemom-observer"
-#                   && name="observer.queue_backlog"
-#                   && span.queue="main"} | max_over_time(span.age_seconds)
-#     threshold:  > 600
+#                   && name="observer.queue_batch"}
+#                   | max_over_time(span.oldest_message_lag_ms)
+#     threshold:  > 600000   (10 minutes in ms)
 #     for:        10m
 #     severity:   high
 #     summary:    Observer consumer lag > 10m
-#     description same as pre-refactor: oldest unacked message > 10 minutes
-#                 old. Breaches Step 53's load-test SLO; often co-fires with
-#                 ObserverQueueBacklogHigh.
+#     description ADR-033: per-batch lag is captured at batch arrival as
+#                 (Date.now() - min(message.timestamp)) on every queue_batch
+#                 span. Breaches Step 53's load-test SLO; often co-fires
+#                 with ObserverQueueBacklogHigh.
 #
 # All three share runbook_url:
 #   https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
