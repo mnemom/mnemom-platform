@@ -40,6 +40,7 @@ function makeStats(overrides: Partial<BatchStats> = {}): BatchStats {
     acks_on_missing: 0,
     poison_acks: 1,
     retries: 0,
+    oldest_message_lag_ms: 0,
     ...overrides,
   };
 }
@@ -139,7 +140,10 @@ describe('emitQueueBatchSpan', () => {
   it('batch span carries all integer counts + env/mode/gateway_id dimensions', async () => {
     await emitQueueBatchSpan(
       makeEnv(),
-      makeStats({ total: 10, processed: 7, skipped: 2, acks_on_missing: 1, poison_acks: 0, retries: 3 }),
+      makeStats({
+        total: 10, processed: 7, skipped: 2, acks_on_missing: 1, poison_acks: 0, retries: 3,
+        oldest_message_lag_ms: 12345,
+      }),
     );
 
     const batch = getSpans(fetchMock.mock.calls[0][1] as RequestInit)[0];
@@ -156,6 +160,9 @@ describe('emitQueueBatchSpan', () => {
     expect(attr(batch, 'acks_on_missing')).toBe('1');
     expect(attr(batch, 'poison_acks')).toBe('0');
     expect(attr(batch, 'retries')).toBe('3');
+
+    // Consumer-side lag (ADR-033) — used by ObserverConsumerLagHigh TraceQL alert.
+    expect(attr(batch, 'oldest_message_lag_ms')).toBe('12345');
 
     // status=OK when no poison acks.
     expect(batch.status.code).toBe(1);
@@ -216,10 +223,10 @@ describe('emitQueueBacklogSpans', () => {
   });
   afterEach(() => vi.unstubAllGlobals());
 
-  it('emits one observer.queue_backlog span per queue with depth + age_seconds attrs', async () => {
+  it('emits one observer.queue_backlog span per queue with depth attribute', async () => {
     const depths: QueueDepth[] = [
-      { queue: 'main', backlogMessages: 1234, oldestMessageAgeSeconds: 12 },
-      { queue: 'dlq', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
+      { queue: 'main', messages: 1234 },
+      { queue: 'dlq', messages: 0 },
     ];
     await emitQueueBacklogSpans(makeEnv(), depths);
 
@@ -229,13 +236,14 @@ describe('emitQueueBacklogSpans', () => {
 
     const main = spans.find((s) => attr(s, 'queue') === 'main')!;
     expect(attr(main, 'depth')).toBe('1234');
-    expect(attr(main, 'age_seconds')).toBe('12');
     expect(attr(main, 'gateway_id')).toBe('mnemom-staging');
     expect(attr(main, 'env')).toBe('staging');
+    // age_seconds intentionally absent — lag now lives on observer.queue_batch
+    // per ADR-033, since CF Analytics doesn't expose oldest-message age.
+    expect(attr(main, 'age_seconds')).toBeUndefined();
 
     const dlq = spans.find((s) => attr(s, 'queue') === 'dlq')!;
     expect(attr(dlq, 'depth')).toBe('0');
-    expect(attr(dlq, 'age_seconds')).toBe('0');
   });
 
   it('no-ops on empty array', async () => {
@@ -246,22 +254,22 @@ describe('emitQueueBacklogSpans', () => {
   it('no-ops when OTLP_ENDPOINT unset', async () => {
     await emitQueueBacklogSpans(
       makeEnv({ OTLP_ENDPOINT: undefined }),
-      [{ queue: 'main', backlogMessages: 1, oldestMessageAgeSeconds: 1 }],
+      [{ queue: 'main', messages: 1 }],
     );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
 describe('extractBacklogGroups', () => {
-  it('returns rows tolerating missing max fields', () => {
+  it('returns rows tolerating missing avg fields', () => {
     const body = {
       data: {
         viewer: {
           accounts: [{
             queueBacklogAdaptiveGroups: [
-              { dimensions: { queueId: 'q1' }, max: { backlogMessages: 99, oldestMessageAgeSeconds: 7 } },
-              { dimensions: { queueId: 'q2' }, max: { backlogMessages: 0 } }, // missing oldestAge
-              { dimensions: { queueId: 'q3' } }, // missing max entirely
+              { dimensions: { queueId: 'q1' }, avg: { messages: 99 } },
+              { dimensions: { queueId: 'q2' }, avg: {} }, // missing messages
+              { dimensions: { queueId: 'q3' } }, // missing avg entirely
             ],
           }],
         },
@@ -269,9 +277,9 @@ describe('extractBacklogGroups', () => {
     };
     const rows = extractBacklogGroups(body);
     expect(rows).toEqual([
-      { queueId: 'q1', backlogMessages: 99, oldestMessageAgeSeconds: 7 },
-      { queueId: 'q2', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
-      { queueId: 'q3', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
+      { queueId: 'q1', messages: 99 },
+      { queueId: 'q2', messages: 0 },
+      { queueId: 'q3', messages: 0 },
     ]);
   });
 
@@ -339,8 +347,8 @@ describe('fetchQueueDepths', () => {
         viewer: {
           accounts: [{
             queueBacklogAdaptiveGroups: [
-              { dimensions: { queueId: 'QMAIN' }, max: { backlogMessages: 42, oldestMessageAgeSeconds: 3 } },
-              { dimensions: { queueId: 'QDLQ' }, max: { backlogMessages: 0, oldestMessageAgeSeconds: 0 } },
+              { dimensions: { queueId: 'QMAIN' }, avg: { messages: 42 } },
+              { dimensions: { queueId: 'QDLQ' }, avg: { messages: 0 } },
             ],
           }],
         },
@@ -349,8 +357,8 @@ describe('fetchQueueDepths', () => {
 
     const r = await fetchQueueDepths(makeEnv());
     expect(r).toEqual([
-      { queue: 'main', backlogMessages: 42, oldestMessageAgeSeconds: 3 },
-      { queue: 'dlq', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
+      { queue: 'main', messages: 42 },
+      { queue: 'dlq', messages: 0 },
     ]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const firstUrl = fetchMock.mock.calls[0][0];
@@ -365,8 +373,8 @@ describe('fetchQueueDepths', () => {
     }));
     const r = await fetchQueueDepths(makeEnv());
     expect(r).toEqual([
-      { queue: 'main', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
-      { queue: 'dlq', backlogMessages: 0, oldestMessageAgeSeconds: 0 },
+      { queue: 'main', messages: 0 },
+      { queue: 'dlq', messages: 0 },
     ]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
