@@ -99,6 +99,7 @@ async function observerSupabaseFetch(url: string, options: RequestInit): Promise
 
 /** Exported for integration testing only. */
 export { observerSupabaseFetch as _observerSupabaseFetchForTests };
+export { isTracePkConflict as _isTracePkConflictForTests };
 
 // ============================================================================
 // Types
@@ -1864,8 +1865,11 @@ async function submitTrace(
   // 132). On conflict, merge-duplicates treats the second insert as a
   // successful no-op; a genuine write race between two consumer invocations
   // therefore returns 201 with an empty body rather than 409 — processLog
-  // completes normally. trace_id's own PK constraint is the secondary guard
-  // (same log.id → same trace_id via the tr-{suffix} derivation).
+  // completes normally. PostgREST only merges on the named conflict target,
+  // so a collision on trace_id (traces_pkey) — for instance a pre-Step-51
+  // row whose gateway_log_id is NULL, or an 8-char suffix collision in CF
+  // log ids — surfaces as a 23505 below and is handled by isTracePkConflict.
+  // ADR-034 widens trace_id derivation so that path becomes vestigial.
   const response = await observerSupabaseFetch(`${env.SUPABASE_URL}/rest/v1/traces?on_conflict=gateway_log_id`, {
     method: 'POST',
     headers: {
@@ -1879,7 +1883,28 @@ async function submitTrace(
 
   if (!response.ok) {
     const errorText = await response.text();
+    if (isTracePkConflict(response.status, errorText)) {
+      console.warn(
+        `[observer] submitTrace: trace_id PK conflict for log ${log.id} (trace=${trace.trace_id}); treating as already-processed and continuing`
+      );
+      return;
+    }
     throw new Error(`Failed to submit trace: ${response.status} - ${errorText}`);
+  }
+}
+
+/**
+ * Detect a Postgres 23505 unique-violation on `traces_pkey` from a PostgREST
+ * 409 response body. Used by submitTrace to convert that one specific failure
+ * into an idempotent no-op — see the long-form comment above the POST.
+ */
+function isTracePkConflict(status: number, errorText: string): boolean {
+  if (status !== 409) return false;
+  try {
+    const parsed = JSON.parse(errorText) as { code?: string; message?: string };
+    return parsed.code === '23505' && /traces_pkey/i.test(parsed.message ?? '');
+  } catch {
+    return false;
   }
 }
 
