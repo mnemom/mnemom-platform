@@ -10,16 +10,28 @@ export type ThreatType =
   | 'privilege_escalation'
   | 'pii_in_inbound';
 
-// Safe House operating modes
-export type SafeHouseMode = 'disabled' | 'off' | 'simulate' | 'observe' | 'enforce' | 'enforce_sync' | 'sovereign';
+// Safe House operating modes (ADR-037 unified Protection Card canonical form).
+// Unified with alignment-card `integrity.enforcement_mode` plus `off`.
+//   off     — detection skipped entirely (cost/speed/non-applicability)
+//   observe — detectors run, signals logged, no request-path action
+//   nudge   — detectors run; matches attach an advisory annotation to the
+//             agent's context and an X-Safe-House-Advisory response header,
+//             but the request proceeds
+//   enforce — detectors run synchronously; matches block the request
+export type SafeHouseMode = 'off' | 'observe' | 'nudge' | 'enforce';
 
-// Verdict after evaluation
-export type SafeHouseVerdict = 'pass' | 'warn' | 'quarantine' | 'block';
+// Verdict after evaluation. Note: 'nudge' is a verdict-equivalent in nudge
+// mode — detector tripped, advisory attached, message proceeded.
+export type SafeHouseVerdict = 'pass' | 'warn' | 'nudge' | 'quarantine' | 'block';
 
 // Trust tier for message source
 export type TrustTier = 'high' | 'medium' | 'low' | 'unknown';
 
-// Source type of inbound content
+// Source type of inbound content. Used by detectors to tune confidence per
+// surface (e.g. indirect-injection patterns are weighted differently in tool
+// results vs. user messages). Decoupled from screen_surfaces (the four
+// directional gates from ADR-037); a SourceType maps to one of those gates
+// via sourceTypeToSurface().
 export type SourceType = 'user_message' | 'tool_result' | 'agent_message' | 'email' | 'api' | 'system_prompt' | 'outbound' | 'canary' | 'unknown';
 
 // A single detected threat
@@ -65,29 +77,65 @@ export interface QuarantineNotification {
   apparent_sender?: string;
 }
 
-export interface SourceTrustRule {
-  source_pattern: string;       // e.g. "email:*@company.com" or "agent:smolt-xxx"
-  trust_tier: 'verified' | 'known' | 'unknown' | 'untrusted';
-  risk_multiplier: number;      // 0.0 (fully trusted) to 2.0 (extra suspicious)
+// ADR-037: trusted_sources are typed buckets, validated against a deny-list
+// at write time in mnemom-api. The gateway reads them as straight string[].
+export interface TrustedSourceBuckets {
+  domains: string[];     // DNS name or host:port
+  agent_ids: string[];   // mnm-* Mnemom agent IDs
+  ip_ranges: string[];   // IPv4/IPv6 CIDR
 }
 
-// Safe House configuration (from sh_configs table)
+// ADR-037: screened surfaces are direction-named bools.
+export interface ScreenSurfaces {
+  incoming: boolean;        // prompt/message reaching the agent
+  outgoing: boolean;        // agent's generated response
+  tool_calls: boolean;      // arguments to tool invocations
+  tool_responses: boolean;  // values returned by tools
+}
+
+// Map a legacy SourceType to the ADR-037 surface gate it falls under.
+// Used by dispatchers that already classify content as a SourceType to
+// decide whether the corresponding surface is enabled in screen_surfaces.
+export type SurfaceKind = keyof ScreenSurfaces;
+export function sourceTypeToSurface(type: SourceType): SurfaceKind {
+  switch (type) {
+    case 'user_message':
+    case 'system_prompt':
+    case 'email':
+    case 'api':
+      return 'incoming';
+    case 'agent_message':
+    case 'outbound':
+      return 'outgoing';
+    case 'tool_result':
+      return 'tool_responses';
+    case 'canary':
+    case 'unknown':
+    default:
+      // Conservative: unknown classifications go through the incoming gate.
+      return 'incoming';
+  }
+}
+
+// Safe House configuration — ADR-037 canonical Protection Card shape (the
+// gateway-facing slice; the full UnifiedProtectionCard adds card_version,
+// agent_id, _composition).
 export interface SafeHouseConfig {
   mode: SafeHouseMode;
   thresholds: {
-    warn: number;           // default 0.6
-    quarantine: number;     // default 0.8
-    block: number;          // default 0.95
+    warn: number;
+    quarantine: number;
+    block: number;
   };
-  screen_surfaces: SourceType[];
-  trusted_sources: SourceTrustRule[];
+  screen_surfaces: ScreenSurfaces;
+  trusted_sources: TrustedSourceBuckets;
 }
 
 export const DEFAULT_SAFE_HOUSE_CONFIG: SafeHouseConfig = {
-  mode: 'disabled',
+  mode: 'off',
   thresholds: { warn: 0.6, quarantine: 0.8, block: 0.95 },
-  screen_surfaces: ['user_message'],
-  trusted_sources: [] as SourceTrustRule[],
+  screen_surfaces: { incoming: true, outgoing: true, tool_calls: true, tool_responses: true },
+  trusted_sources: { domains: [], agent_ids: [], ip_ranges: [] },
 };
 
 // Session risk state (stored in KV)

@@ -10,11 +10,12 @@ export { buildSHAnalysisPrompt, THREAT_CATEGORY_DESCRIPTIONS } from './prompts.j
 export { buildSHUserPrompt, parseL2Response, mergeL1AndL2, buildThreatContextForAIP, buildPreemptiveNudgeContent } from './prompts.js';
 export { buildSHExitAnalysisPrompt, buildSHExitUserPrompt, SH_EXIT_THREAT_DESCRIPTIONS } from './prompts.js';
 export type {
-  ThreatType, SafeHouseMode, SafeHouseVerdict, TrustTier, SourceType,
+  ThreatType, SafeHouseMode, SafeHouseVerdict, TrustTier, SourceType, SurfaceKind,
   ThreatDetection, SafeHouseDecision, AnnotatedMessage, QuarantineNotification,
   SafeHouseConfig, SessionRiskState, ContentSurface, SafeHouseThreatPattern, DLPMatch,
-  SourceTrustRule, L1Options,
+  ScreenSurfaces, TrustedSourceBuckets, L1Options,
 } from './types.js';
+export { sourceTypeToSurface } from './types.js';
 export type { L2Result, PreemptiveNudge } from './types.js';
 export { DEFAULT_SAFE_HOUSE_CONFIG } from './types.js';
 export { computeMinHash, estimateSimilarity, serializeMinHash, deserializeMinHash, isSimilarToPattern, computeBandHashes } from './fingerprint.js';
