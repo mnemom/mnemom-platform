@@ -190,6 +190,14 @@ interface ProcessingStats {
   skipped: number;
   logs_fetched: number;
   errors: number;
+  /**
+   * Diagnostic capture from the first per-log throw on a tick. Surfaced on
+   * the cron_tick span so prod failures can be classified from Tempo without
+   * reading Worker logs (Tier 3 logpush → Loki is currently down — see
+   * scale/observability-follow-ups.md item #4). Cleared each tick.
+   */
+  first_error_name?: string;
+  first_error_message?: string;
 }
 
 // ============================================================================
@@ -576,6 +584,14 @@ async function processPollingBatch(
         } catch (error) {
           console.error(`[observer] Failed to process log ${log.id}:`, error);
           stats.errors++;
+          // Diagnostic: capture first error class for Tempo (Loki is empty,
+          // so without this we can't tell what's failing in prod). Truncate
+          // message to keep span attribute size reasonable.
+          if (!stats.first_error_name) {
+            stats.first_error_name = error instanceof Error ? error.name : 'Unknown';
+            const msg = error instanceof Error ? error.message : String(error);
+            stats.first_error_message = msg.slice(0, 400);
+          }
           // Continue processing remaining logs even if one fails
         }
       }
@@ -635,6 +651,12 @@ function emitTickSummary(env: Env, stats: ProcessingStats, source: string): void
                 { key: 'observer.logs_processed', value: { intValue: String(stats.processed) } },
                 { key: 'observer.logs_errored', value: { intValue: String(stats.errors) } },
                 { key: 'observer.backlog_estimate', value: { stringValue: String(backlog_estimate) } },
+                ...(stats.first_error_name
+                  ? [{ key: 'observer.first_error_name', value: { stringValue: stats.first_error_name } }]
+                  : []),
+                ...(stats.first_error_message
+                  ? [{ key: 'observer.first_error_message', value: { stringValue: stats.first_error_message } }]
+                  : []),
               ],
             }],
           }],
