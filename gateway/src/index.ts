@@ -51,6 +51,11 @@ import {
   fetchCanonicalProtectionCard,
 } from './card-mappers';
 import {
+  checkTrustedSource,
+  buildNudgeAnnotation,
+  prependNudgeToLastUserMessage,
+} from './safe-house-runtime';
+import {
   evaluatePolicy,
   // mergePolicies removed in UC-8 — policy is derived from the canonical card
   // at evaluation time via extractPolicyFromCard (runs inside evaluatePolicy).
@@ -3743,6 +3748,8 @@ function replaceLastUserMessageContent(
   }
 }
 
+// (helpers moved to safe-house-runtime.ts)
+
 /**
  * Extract tool call results from a request body.
  * These are returned by the application when it sends tool_result blocks
@@ -3824,38 +3831,9 @@ function replaceToolResultContent(
   } catch { /* non-blocking */ }
 }
 
-/**
- * Apply source trust rules to a base risk score.
- * Verified/known sources get a risk reduction; untrusted sources get amplification.
- */
-function applySourceTrust(
-  baseScore: number,
-  sourceType: string,
-  agentId: string,
-  trustedSources: import('@mnemom/safe-house').SourceTrustRule[]
-): number {
-  if (!trustedSources || trustedSources.length === 0) return baseScore;
-
-  // Check for matching rules (first match wins)
-  for (const rule of trustedSources) {
-    const pattern = rule.source_pattern;
-    let matches = false;
-    if (pattern === '*') {
-      matches = true;
-    } else if (pattern.startsWith('agent:')) {
-      matches = agentId === pattern.slice(6) || pattern === 'agent:smolt-*' && agentId.startsWith('smolt-');
-    } else if (pattern.startsWith('email:')) {
-      matches = sourceType === 'email' && (pattern === 'email:*' || sourceType.includes(pattern.slice(6)));
-    } else {
-      matches = sourceType === pattern || sourceType.startsWith(pattern.replaceAll('*', ''));
-    }
-
-    if (matches) {
-      return Math.min(1.0, Math.max(0.0, baseScore * rule.risk_multiplier));
-    }
-  }
-  return baseScore;
-}
+// ADR-037 helpers (checkTrustedSource, ipInCidr, buildNudgeAnnotation,
+// prependNudgeToLastUserMessage) live in safe-house-runtime.ts so they're
+// directly unit-testable. Imported below at the existing import block.
 
 /** Log a Safe House evaluation to the sh_evaluations table (fire-and-forget). */
 async function logSHEvaluation(
@@ -4478,6 +4456,7 @@ export async function handleProviderProxy(
     let shVerdict: SafeHouseVerdict | undefined;
     let shQuarantineId: string | undefined;
     let shSessionRisk: string | undefined; // set in observe mode
+    let shNudgeAdvisory: string | undefined; // ADR-037: nudge mode response header
 
     // Fetch Safe House config early (KV cached — negligible latency)
     const shConfig = await fetchSHConfig(agent.id, env);
@@ -4629,82 +4608,142 @@ export async function handleProviderProxy(
       }
 
       // ====================================================================
-      // Phase 0.5: Safe House — inbound threat screening
+      // Phase 0.5: Safe House — inbound threat screening (ADR-037)
       // ====================================================================
-      // Passive modes (`observe`, `simulate`) dispatch Safe House regardless
-      // of the legacy `feature_flags.sh_enabled` kill-switch so telemetry +
-      // Phase 5 recipe shadow eval flow for every agent. Verdict-affecting
-      // modes (`enforce`, `enforce_sync`, `sovereign`) still require explicit
-      // `sh_enabled: true` — no agent gets surprise enforcement. Wider
-      // retirement of the kill-switch waits on an audit of enforce-mode
-      // agents.
-      const isPassiveMode = shConfig.mode === 'observe' || shConfig.mode === 'simulate';
-      const shDispatchEnabled = shFeatureEnabled || isPassiveMode;
-      if (shDispatchEnabled && (
-        shConfig.mode === 'enforce' ||
-        shConfig.mode === 'enforce_sync' ||
-        shConfig.mode === 'sovereign' ||
-        shConfig.mode === 'observe' ||
-        shConfig.mode === 'simulate'
-      ) && requestBody !== null) {
+      // Mode dispatch under the unified Protection Card canonical form:
+      //   off     — skip dispatch entirely (cost / non-applicability)
+      //   observe — async detection, no request-path action
+      //   nudge   — sync detection, advisory annotation attached, no block
+      //   enforce — sync detection, block on quarantine/block verdicts
+      //
+      // Passive modes (observe / nudge) dispatch regardless of the legacy
+      // `feature_flags.sh_enabled` kill-switch so telemetry + recipe shadow
+      // eval keep flowing. enforce still requires explicit opt-in until the
+      // kill-switch is fully retired (separate audit).
+      const surfaces = shConfig.screen_surfaces;
+      const incomingGated = surfaces.incoming;
+      const isPassiveMode = shConfig.mode === 'observe' || shConfig.mode === 'nudge';
+      const shDispatchEnabled = (shFeatureEnabled || isPassiveMode) && incomingGated;
+      if (shDispatchEnabled && shConfig.mode !== 'off' && requestBody !== null) {
         const inboundMessage = extractLastUserMessage(requestBody as Record<string, unknown>, provider);
         if (inboundMessage) {
-          if (shConfig.mode === 'simulate') {
-            // Simulate: run full analysis but touch NOTHING — no message modification,
-            // no quarantine entries, no session state updates.
-            // Result goes only to sh_evaluations with mode='simulate' and response header.
-            const t0 = Date.now();
-            const [simPatterns, simSession] = await Promise.all([
-              fetchSHThreatPatterns(env),
-              getSHSessionState(sessionId, env),
-            ]);
-            const simCandidates = await getSHCandidatePatterns(inboundMessage, 'user_message', simPatterns, undefined, env);
-            const simL1 = runL1Detection(inboundMessage, simCandidates, { surface: 'user_message' });
-            let simThreats = simL1.threats;
-            let simScore = simL1.score;
-            const simDetectorScores: Record<string, number | null> = { PatternMatcher: simL1.score, SemanticAnalyzer: null };
-            const simDetectionSources: string[] = simL1.score > 0 ? ['PatternMatcher'] : [];
-            if (simL1.score >= 0.4 || shouldForceSemanticAnalysis(simL1)) {
-              const simL2Raw = await callSHAnalysisLLM(inboundMessage, 'user_message', env);
-              if (simL2Raw) {
-                const simL2 = parseL2Response(simL2Raw);
-                if (simL2) {
-                  const merged = mergeL1AndL2(simL1.threats, simL1.score, simL2);
-                  simThreats = merged.threats;
-                  simScore = merged.score;
-                  simDetectorScores.SemanticAnalyzer = simL2.overall_risk;
-                  if (simL2.overall_risk > 0) simDetectionSources.push('SemanticAnalyzer');
-                }
-              }
-            }
-            const { multiplied_score: simMultiplied } = applySessionMultiplier(simScore, simSession);
-            const thresholds = shConfig.thresholds;
-            let simVerdict: SafeHouseVerdict = 'pass';
-            if (simMultiplied >= thresholds.block) simVerdict = 'block';
-            else if (simMultiplied >= thresholds.quarantine) simVerdict = 'quarantine';
-            else if (simMultiplied >= thresholds.warn) simVerdict = 'warn';
-
-            // Log to sh_evaluations but with mode='simulate' — no quarantine, no session update
-            if (simVerdict !== 'pass') {
-              const simDecision: SafeHouseDecision = {
-                verdict: simVerdict, overall_risk: simMultiplied, threats: simThreats,
-                detector_scores: simDetectorScores, detection_sources: simDetectionSources,
-                session_multiplier: 1.0, duration_ms: Date.now() - t0,
-              };
-              ctx.waitUntil(logSHEvaluation(agent.id, sessionId, 'simulate', simDecision, 'user_message', env));
-            }
-            // Set simulated verdict — will be emitted as X-Safe-House-Simulated-Verdict below
-            shVerdict = simVerdict;
+          // ADR-037: trusted_sources short-circuit. Detection is skipped
+          // entirely for sources matching the typed allowlist; we still
+          // emit a low-priority trust trace so audit can see what was
+          // waved through.
+          const trustCtx = {
+            apparentAgentId: (requestBody as Record<string, unknown>)?.['x_sh_apparent_agent_id'] as string | undefined,
+            apparentDomain: (requestBody as Record<string, unknown>)?.['x_sh_apparent_domain'] as string | undefined,
+            clientIp: request.headers.get('cf-connecting-ip'),
+          };
+          const trustMatch = checkTrustedSource(trustCtx, shConfig.trusted_sources);
+          if (trustMatch) {
+            console.log(JSON.stringify({
+              event: 'sh_trusted_source_skip',
+              agent_id: agent.id,
+              session_id: sessionId,
+              surface: 'incoming',
+              bucket: trustMatch.bucket,
+              matched: trustMatch.entry,
+              mode: shConfig.mode,
+            }));
+            // Skip detection. Continue request normally.
           } else if (shConfig.mode === 'observe') {
             // Observe mode: pass immediately, run full analysis in background.
-            // Also screen tool results async if tool_result is in screen_surfaces.
-            const toolResultsForObserve = shConfig.screen_surfaces.includes('tool_result' as SourceType)
+            // Tool results screened async if the tool_responses surface is on.
+            const toolResultsForObserve = surfaces.tool_responses
               ? extractToolResults(requestBody as Record<string, unknown>, provider).slice(0, 3)
               : [];
             ctx.waitUntil(runObserveSH(agent.id, sessionId, inboundMessage, shConfig, env, toolResultsForObserve));
-            // Sync session risk read for observe mode header (KV, ~1ms)
             const observeSession = await getSHSessionState(sessionId, env).catch(() => null);
             shSessionRisk = observeSession?.session_threat_level ?? 'low';
+          } else if (shConfig.mode === 'nudge') {
+            // Nudge mode (ADR-037 §Decision 6): run full detection synchronously.
+            // If a verdict is warn/quarantine/block we attach an advisory
+            // annotation to the prompt context (so the model sees the nudge),
+            // emit a structured X-Safe-House-Advisory response header (so
+            // the principal's SDK can render it), and continue the request.
+            // No quarantine, no block — the message proceeds with extra signal
+            // attached.
+            const t0 = Date.now();
+            const [nudgePatterns, nudgeSession] = await Promise.all([
+              fetchSHThreatPatterns(env),
+              getSHSessionState(sessionId, env),
+            ]);
+            const nudgeCandidates = await getSHCandidatePatterns(inboundMessage, 'user_message', nudgePatterns, undefined, env);
+            const nL1 = runL1Detection(inboundMessage, nudgeCandidates, { surface: 'user_message' });
+            let nThreats = nL1.threats;
+            let nScore = nL1.score;
+            const nDetectorScores: Record<string, number | null> = { PatternMatcher: nL1.score, SemanticAnalyzer: null };
+            const nDetectionSources: string[] = nL1.score > 0 ? ['PatternMatcher'] : [];
+            if (nL1.score >= 0.4 || shouldForceSemanticAnalysis(nL1)) {
+              const nL2Raw = await callSHAnalysisLLM(inboundMessage, 'user_message', env);
+              if (nL2Raw) {
+                const nL2 = parseL2Response(nL2Raw);
+                if (nL2) {
+                  const merged = mergeL1AndL2(nL1.threats, nL1.score, nL2);
+                  nThreats = merged.threats;
+                  nScore = merged.score;
+                  nDetectorScores.SemanticAnalyzer = nL2.overall_risk;
+                  if (nL2.overall_risk > 0) nDetectionSources.push('SemanticAnalyzer');
+                }
+              }
+            }
+            const { multiplied_score: nMultiplied, session_multiplier: nSessionMultiplier } = applySessionMultiplier(nScore, nudgeSession);
+            const t = shConfig.thresholds;
+            // In nudge mode the verdict ladder is informational — we attach
+            // when the score crosses warn; the categorical label is for
+            // telemetry consistency.
+            let nVerdict: SafeHouseVerdict = 'pass';
+            if (nMultiplied >= t.block) nVerdict = 'nudge';        // would-be block
+            else if (nMultiplied >= t.quarantine) nVerdict = 'nudge'; // would-be quarantine
+            else if (nMultiplied >= t.warn) nVerdict = 'nudge';
+            const nDecision: SafeHouseDecision = {
+              verdict: nVerdict,
+              overall_risk: nMultiplied,
+              threats: nThreats,
+              detector_scores: nDetectorScores,
+              detection_sources: nDetectionSources,
+              session_multiplier: nSessionMultiplier,
+              duration_ms: Date.now() - t0,
+            };
+
+            if (nVerdict === 'nudge') {
+              // Attach advisory annotation INTO the agent's prompt context.
+              // The model sees this — the security value of nudge depends on
+              // the model receiving the warning, so this is the load-bearing
+              // injection point.
+              const nudgeNote = buildNudgeAnnotation(nDecision);
+              prependNudgeToLastUserMessage(requestBody as Record<string, unknown>, nudgeNote, provider);
+
+              // Set response header (compact JSON) for SDK / dashboard rendering.
+              // Stored on a local; applied to responseHeaders in the response phase.
+              shNudgeAdvisory = JSON.stringify({
+                surface: 'incoming',
+                verdict: nVerdict,
+                score: Number(nMultiplied.toFixed(3)),
+                threats: nThreats.map(t => ({ type: t.type, confidence: Number(t.confidence.toFixed(3)) })),
+              });
+
+              shVerdict = nVerdict;
+
+              console.log(JSON.stringify({
+                event: 'sh_nudge_attached',
+                agent_id: agent.id,
+                session_id: sessionId,
+                surface: 'incoming',
+                score: nMultiplied,
+                threats: nThreats.map(t => t.type),
+                detector_scores: nDetectorScores,
+              }));
+
+              // Persist the evaluation + update session like other paths.
+              ctx.waitUntil(logSHEvaluation(agent.id, sessionId, 'nudge', nDecision, 'user_message', env));
+              ctx.waitUntil(deliverSHWebhooks(nDecision, agent.id, sessionId, env));
+              ctx.waitUntil(cacheSHResultForAIP(sessionId, nDecision, env));
+            }
+            ctx.waitUntil(updateSHSessionState(sessionId, agent.id, nMultiplied, env));
+            ctx.waitUntil(incrementSHUsage(agent.id, env));
           } else {
           const t0 = Date.now();
           const [patterns, sessionState] = await Promise.all([
@@ -4793,9 +4832,10 @@ export async function handleProviderProxy(
             );
           }
 
-          // Apply source trust rules (risk_multiplier from trusted_sources config)
-          const sourceType = (requestBody as Record<string, unknown>)?.['x_sh_source_type'] as string ?? 'user_message';
-          const trustAdjustedScore = applySourceTrust(multiplied_score, sourceType, agent.id, shConfig.trusted_sources ?? []);
+          // ADR-037: trusted_sources are checked at the dispatch entry above
+          // and short-circuit before reaching detection. By the time we're
+          // here we know the source is not on the typed allowlist.
+          const trustAdjustedScore = multiplied_score;
 
           // Determine verdict from thresholds
           const thresholds = shConfig.thresholds;
@@ -4872,7 +4912,7 @@ export async function handleProviderProxy(
           // Screen tool results in parallel — primary indirect injection surface.
           // Always triggers SemanticAnalyzer (tool results should be data, not instructions).
           // Uses real `patterns` array (not empty []) for MinHash matching.
-          if (shConfig.screen_surfaces.includes('tool_result' as SourceType)) {
+          if (surfaces.tool_responses) {
             const toolResultsList = extractToolResults(requestBody as Record<string, unknown>, provider).slice(0, 3);
             await Promise.all(toolResultsList.map(async (toolResult) => {
               const trEnforceCandidates = await getSHCandidatePatterns(toolResult, 'tool_result', patterns, undefined, env);
@@ -5068,21 +5108,19 @@ export async function handleProviderProxy(
     responseHeaders.set('x-smoltbot-session', sessionId); // deprecated: remove after 6-month transition (2026-10)
     responseHeaders.set('x-mnemom-session', sessionId);   // canonical new name
 
-    // Add Safe House headers if screening ran
+    // Add Safe House headers if screening ran (ADR-037 mode set).
     if (shVerdict) {
-      if (shConfig.mode === 'simulate') {
-        responseHeaders.set('X-Safe-House-Simulated-Verdict', shVerdict);
-        responseHeaders.set('X-Safe-House-Mode', 'simulate');
-      } else {
-        responseHeaders.set('X-Safe-House-Verdict', shVerdict);
-        if (shQuarantineId) responseHeaders.set('X-Safe-House-Quarantine-Id', shQuarantineId);
-      }
+      responseHeaders.set('X-Safe-House-Verdict', shVerdict);
+      if (shQuarantineId) responseHeaders.set('X-Safe-House-Quarantine-Id', shQuarantineId);
     }
     if (shSessionRisk) {
       responseHeaders.set('X-Safe-House-Session-Risk', shSessionRisk);
     }
-    if (shConfig.mode === 'observe') {
-      responseHeaders.set('X-Safe-House-Mode', 'observe');
+    if (shConfig.mode === 'observe' || shConfig.mode === 'nudge') {
+      responseHeaders.set('X-Safe-House-Mode', shConfig.mode);
+    }
+    if (shNudgeAdvisory) {
+      responseHeaders.set('X-Safe-House-Advisory', shNudgeAdvisory);
     }
 
     // Add policy verdict header if evaluation ran

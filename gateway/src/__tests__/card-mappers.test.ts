@@ -118,20 +118,35 @@ describe('mapUnifiedCardToAAP', () => {
   });
 });
 
-describe('mapCanonicalToSafeHouseConfig', () => {
-  it('maps a full protection card to SafeHouseConfig', () => {
+describe('mapCanonicalToSafeHouseConfig (ADR-037)', () => {
+  it('maps a full canonical protection card to SafeHouseConfig', () => {
     const cfg = mapCanonicalToSafeHouseConfig({
-      card_version: '2026-04-15',
+      card_version: 'protection/2026-04-26',
       agent_id: 'mnm-1',
       mode: 'enforce',
       thresholds: { warn: 0.5, quarantine: 0.7, block: 0.9 },
-      screen_surfaces: ['user_message', 'tool_output'],
-      trusted_sources: [{ pattern: '*.mnemom.ai', trust_tier: 'high', risk_multiplier: 0.1 }],
+      screen_surfaces: { incoming: true, outgoing: true, tool_calls: false, tool_responses: true },
+      trusted_sources: { domains: ['internal.acme.com'], agent_ids: [], ip_ranges: ['10.0.0.0/8'] },
     });
     expect(cfg.mode).toBe('enforce');
     expect(cfg.thresholds).toEqual({ warn: 0.5, quarantine: 0.7, block: 0.9 });
-    expect(cfg.screen_surfaces).toEqual(['user_message', 'tool_output']);
-    expect(cfg.trusted_sources).toHaveLength(1);
+    expect(cfg.screen_surfaces).toEqual({
+      incoming: true, outgoing: true, tool_calls: false, tool_responses: true,
+    });
+    expect(cfg.trusted_sources.domains).toEqual(['internal.acme.com']);
+    expect(cfg.trusted_sources.ip_ranges).toEqual(['10.0.0.0/8']);
+  });
+
+  it('accepts the four canonical modes', () => {
+    for (const mode of ['off', 'observe', 'nudge', 'enforce']) {
+      const cfg = mapCanonicalToSafeHouseConfig({ agent_id: 'mnm-1', mode });
+      expect(cfg.mode).toBe(mode);
+    }
+  });
+
+  it('falls back to observe for unrecognized mode strings', () => {
+    const cfg = mapCanonicalToSafeHouseConfig({ agent_id: 'mnm-1', mode: 'sovereign' });
+    expect(cfg.mode).toBe('observe');
   });
 
   it('supplies default thresholds when thresholds object is missing', () => {
@@ -145,27 +160,48 @@ describe('mapCanonicalToSafeHouseConfig', () => {
       agent_id: 'mnm-1',
       thresholds: { block: 0.5 } as any,
     });
-    // warn/quarantine fall back to defaults, block honoured
     expect(cfg.thresholds.warn).toBe(0.6);
     expect(cfg.thresholds.quarantine).toBe(0.8);
     expect(cfg.thresholds.block).toBe(0.5);
   });
 
-  it('defaults screen_surfaces to ["user_message"] when absent or not an array', () => {
-    const cfg1 = mapCanonicalToSafeHouseConfig({ agent_id: 'mnm-1' });
-    expect(cfg1.screen_surfaces).toEqual(['user_message']);
-
-    const cfg2 = mapCanonicalToSafeHouseConfig({ agent_id: 'mnm-1', screen_surfaces: 'junk' as any });
-    expect(cfg2.screen_surfaces).toEqual(['user_message']);
+  it('defaults screen_surfaces to all-true when absent', () => {
+    const cfg = mapCanonicalToSafeHouseConfig({ agent_id: 'mnm-1' });
+    expect(cfg.screen_surfaces).toEqual({
+      incoming: true, outgoing: true, tool_calls: true, tool_responses: true,
+    });
   });
 
-  it('defaults trusted_sources to [] when absent', () => {
-    const cfg = mapCanonicalToSafeHouseConfig({ agent_id: 'mnm-1' });
-    expect(cfg.trusted_sources).toEqual([]);
+  it('defaults screen_surfaces to all-true when shape is wrong (legacy array)', () => {
+    const cfg = mapCanonicalToSafeHouseConfig({
+      agent_id: 'mnm-1',
+      screen_surfaces: ['user_message'] as any,
+    });
+    expect(cfg.screen_surfaces).toEqual({
+      incoming: true, outgoing: true, tool_calls: true, tool_responses: true,
+    });
   });
 
-  it('defaults mode to observe when absent', () => {
+  it('partial screen_surfaces fills missing keys with defaults', () => {
+    const cfg = mapCanonicalToSafeHouseConfig({
+      agent_id: 'mnm-1',
+      screen_surfaces: { incoming: false } as any,
+    });
+    expect(cfg.screen_surfaces).toEqual({
+      incoming: false, outgoing: true, tool_calls: true, tool_responses: true,
+    });
+  });
+
+  it('defaults trusted_sources to empty buckets when absent', () => {
     const cfg = mapCanonicalToSafeHouseConfig({ agent_id: 'mnm-1' });
-    expect(cfg.mode).toBe('observe');
+    expect(cfg.trusted_sources).toEqual({ domains: [], agent_ids: [], ip_ranges: [] });
+  });
+
+  it('defaults trusted_sources to empty buckets when shape is wrong (legacy array)', () => {
+    const cfg = mapCanonicalToSafeHouseConfig({
+      agent_id: 'mnm-1',
+      trusted_sources: [{ pattern: 'x', trust_tier: 'high', risk_multiplier: 0.5 }] as any,
+    });
+    expect(cfg.trusted_sources).toEqual({ domains: [], agent_ids: [], ip_ranges: [] });
   });
 });

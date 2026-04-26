@@ -100,6 +100,7 @@ async function observerSupabaseFetch(url: string, options: RequestInit): Promise
 /** Exported for integration testing only. */
 export { observerSupabaseFetch as _observerSupabaseFetchForTests };
 export { isTracePkConflict as _isTracePkConflictForTests };
+export { deriveTraceId as _deriveTraceIdForTests };
 
 // ============================================================================
 // Types
@@ -860,7 +861,7 @@ async function processLog(
   const analysis = await analyzeWithHaiku(context, env, card);
 
   // Build APTrace conformant trace object
-  const trace = buildTrace(log, metadata, context, analysis, card);
+  const trace = await buildTrace(log, metadata, context, analysis, card);
 
   // Verify trace against alignment card using AAP SDK
   const verification = card ? verifyTrace(trace, card) : null;
@@ -3914,17 +3915,33 @@ async function storeDriftAlert(
 // ============================================================================
 
 /**
+ * Derive a trace_id from a CF AI Gateway log id. Per ADR-036, this is the
+ * first 16 hex chars of SHA-256(log.id) — 64 bits of entropy, deterministic,
+ * preserves the "same log = same trace" idempotency contract Step 51 relies
+ * on, and pushes birthday collisions past any plausible Phase 3 throughput.
+ * Replaces the legacy 8-char base36 suffix that surfaced in the 2026-04-26
+ * prod incident (PR #190 / PR #191).
+ */
+async function deriveTraceId(logId: string): Promise<string> {
+  const bytes = new TextEncoder().encode(logId);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `tr-${hex.slice(0, 16)}`;
+}
+
+/**
  * Build an APTrace conformant trace object
  */
-function buildTrace(
+async function buildTrace(
   log: GatewayLog,
   metadata: GatewayMetadata,
   context: ExtractedContext,
   analysis: HaikuAnalysis,
   card: AlignmentCard | null
-): APTrace {
-  // Derive trace_id from log.id for idempotency - same log = same trace
-  const traceId = `tr-${log.id.slice(-8)}`;
+): Promise<APTrace> {
+  const traceId = await deriveTraceId(log.id);
 
   // Build action name — prefer tool names, fall back to "inference"
   // Model identity is metadata (stored in parameters.model), not an action

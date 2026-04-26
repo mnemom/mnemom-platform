@@ -21,7 +21,7 @@
  * unified card schema evolves.
  */
 
-import type { SafeHouseConfig, SourceType, SourceTrustRule } from '@mnemom/safe-house';
+import type { SafeHouseConfig, ScreenSurfaces, TrustedSourceBuckets } from '@mnemom/safe-house';
 
 // ── AAP 1.0.x shape (re-declared to avoid importing from the locked pkg) ───
 
@@ -82,27 +82,57 @@ export function mapUnifiedCardToAAP(card: Record<string, unknown>): AAPAlignment
   };
 }
 
-// ── Protection card → SafeHouseConfig ──────────────────────────────────────
+// ── Protection card → SafeHouseConfig (ADR-037 canonical form) ─────────────
 
 const DEFAULT_THRESHOLDS = { warn: 0.60, quarantine: 0.80, block: 0.95 };
-const DEFAULT_SURFACES: SourceType[] = ['user_message'];
+const DEFAULT_SURFACES: ScreenSurfaces = {
+  incoming: true,
+  outgoing: true,
+  tool_calls: true,
+  tool_responses: true,
+};
+const DEFAULT_TRUSTED: TrustedSourceBuckets = { domains: [], agent_ids: [], ip_ranges: [] };
+
+const MODES = new Set(['off', 'observe', 'nudge', 'enforce']);
 
 export function mapCanonicalToSafeHouseConfig(card: Record<string, unknown>): SafeHouseConfig {
   const c = card as Record<string, any>;
+  const mode: SafeHouseConfig['mode'] = MODES.has(c.mode) ? c.mode : 'observe';
   return {
-    mode: (c.mode as SafeHouseConfig['mode']) ?? 'observe',
+    mode,
     thresholds: {
       warn: typeof c.thresholds?.warn === 'number' ? c.thresholds.warn : DEFAULT_THRESHOLDS.warn,
       quarantine: typeof c.thresholds?.quarantine === 'number' ? c.thresholds.quarantine : DEFAULT_THRESHOLDS.quarantine,
       block: typeof c.thresholds?.block === 'number' ? c.thresholds.block : DEFAULT_THRESHOLDS.block,
     },
-    screen_surfaces: Array.isArray(c.screen_surfaces)
-      ? (c.screen_surfaces as SourceType[])
-      : [...DEFAULT_SURFACES],
-    trusted_sources: Array.isArray(c.trusted_sources)
-      ? (c.trusted_sources as SourceTrustRule[])
-      : [],
+    screen_surfaces: mapSurfaces(c.screen_surfaces),
+    trusted_sources: mapTrustedSources(c.trusted_sources),
   };
+}
+
+function mapSurfaces(s: unknown): ScreenSurfaces {
+  if (s && typeof s === 'object' && !Array.isArray(s)) {
+    const obj = s as Record<string, unknown>;
+    return {
+      incoming: typeof obj.incoming === 'boolean' ? obj.incoming : DEFAULT_SURFACES.incoming,
+      outgoing: typeof obj.outgoing === 'boolean' ? obj.outgoing : DEFAULT_SURFACES.outgoing,
+      tool_calls: typeof obj.tool_calls === 'boolean' ? obj.tool_calls : DEFAULT_SURFACES.tool_calls,
+      tool_responses: typeof obj.tool_responses === 'boolean' ? obj.tool_responses : DEFAULT_SURFACES.tool_responses,
+    };
+  }
+  return { ...DEFAULT_SURFACES };
+}
+
+function mapTrustedSources(t: unknown): TrustedSourceBuckets {
+  if (t && typeof t === 'object' && !Array.isArray(t)) {
+    const obj = t as Record<string, unknown>;
+    return {
+      domains: Array.isArray(obj.domains) ? obj.domains.filter((x): x is string => typeof x === 'string') : [],
+      agent_ids: Array.isArray(obj.agent_ids) ? obj.agent_ids.filter((x): x is string => typeof x === 'string') : [],
+      ip_ranges: Array.isArray(obj.ip_ranges) ? obj.ip_ranges.filter((x): x is string => typeof x === 'string') : [],
+    };
+  }
+  return { ...DEFAULT_TRUSTED };
 }
 
 // ── Canonical-first fetch helpers ──────────────────────────────────────────
