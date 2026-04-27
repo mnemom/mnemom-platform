@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getApiUrl } from "./config.js";
-import { resolveAuth } from "./auth.js";
+import { forceRefreshAccessToken, resolveAuth } from "./auth.js";
 
 export const API_BASE = getApiUrl();
 
@@ -142,6 +142,35 @@ async function authHeaders(): Promise<Record<string, string>> {
   }
 }
 
+/**
+ * Issue an authenticated fetch, and on a 401 response transparently force a
+ * token refresh and retry once.
+ *
+ * We hit this in the wild when the locally-stored expiresAt diverges from
+ * the JWT's actual exp claim (e.g. Supabase has been observed reporting
+ * expires_in values longer than the JWT's exp). Without this retry,
+ * `whoami` cheerfully reports a "valid" token while every authenticated
+ * call gets 401 — and the user has no path forward besides
+ * `mnemom logout && mnemom login`. The retry heals stale auth files
+ * transparently for users who haven't re-logged-in since the
+ * computeExpiresAt fix landed.
+ *
+ * `buildInit` is invoked fresh for each attempt so the retry picks up the
+ * new Authorization header from the refreshed token. We do NOT mint a new
+ * Idempotency-Key on the retry — the same key keys back into the same
+ * server-side reservation by design.
+ */
+async function fetchWithAuthRetry(
+  url: string,
+  buildInit: () => Promise<RequestInit>,
+): Promise<Response> {
+  const first = await fetch(url, await buildInit());
+  if (first.status !== 401) return first;
+  const refreshed = await forceRefreshAccessToken();
+  if (!refreshed) return first;
+  return fetch(url, await buildInit());
+}
+
 export async function getAgent(id: string): Promise<Agent> {
   return fetchApi<Agent>(`/v1/agents/${id}`);
 }
@@ -158,7 +187,9 @@ export interface AgentListItem {
 
 export async function listAgents(): Promise<AgentListItem[]> {
   const url = validateUrl(`${API_BASE}/v1/agents?limit=100`);
-  const response = await fetch(url, { headers: await authHeaders() });
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: await authHeaders(),
+  }));
   if (!response.ok) {
     if (response.status === 401) {
       throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
@@ -447,15 +478,29 @@ export async function putAlignmentCard(
   opts: { idempotencyKey?: string } = {},
 ): Promise<{ card_id: string; composed: boolean }> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/alignment-card`);
-  const response = await fetch(url, {
+  // Lock in a single Idempotency-Key for this logical mutation. If the auth
+  // token is stale and the first attempt returns 401, fetchWithAuthRetry
+  // refreshes the token and retries — but the Idempotency-Key must be the
+  // same key on both attempts so the server's reservation table sees them as
+  // a single mutation, not two competing PUTs.
+  const idempotencyKey = opts.idempotencyKey ?? newIdempotencyKey();
+  const sanitizedBody = sanitizeForHttp(body);
+  const response = await fetchWithAuthRetry(url, async () => ({
     method: "PUT",
     headers: {
       "Content-Type": contentType,
-      "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
+      // The API content-negotiates the response body via Accept (see
+      // mnemom-api/src/composition/response.ts:respondYamlJson). We parse the
+      // response as JSON below, so we have to ask for JSON explicitly —
+      // Node's default Accept: */* would otherwise yield a YAML body and
+      // response.json() would crash with "Unexpected token 'a' is not valid
+      // JSON" against the canonical card we just wrote.
+      Accept: "application/json",
+      "Idempotency-Key": idempotencyKey,
       ...(await authHeaders()),
     },
-    body: sanitizeForHttp(body),
-  });
+    body: sanitizedBody,
+  }));
 
   if (!response.ok) {
     const error = (await response.json().catch(() => ({
@@ -510,15 +555,22 @@ export async function putProtectionCard(
   opts: { idempotencyKey?: string } = {},
 ): Promise<{ card_id: string; composed: boolean }> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/protection-card`);
-  const response = await fetch(url, {
+  // See putAlignmentCard for why the Idempotency-Key is computed once outside
+  // the retry closure.
+  const idempotencyKey = opts.idempotencyKey ?? newIdempotencyKey();
+  const sanitizedBody = sanitizeForHttp(body);
+  const response = await fetchWithAuthRetry(url, async () => ({
     method: "PUT",
     headers: {
       "Content-Type": contentType,
-      "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
+      // See putAlignmentCard for the rationale — the API negotiates response
+      // body format via Accept and we parse the response as JSON below.
+      Accept: "application/json",
+      "Idempotency-Key": idempotencyKey,
       ...(await authHeaders()),
     },
-    body: sanitizeForHttp(body),
-  });
+    body: sanitizedBody,
+  }));
 
   if (!response.ok) {
     const error = (await response.json().catch(() => ({

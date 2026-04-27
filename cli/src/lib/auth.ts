@@ -109,6 +109,39 @@ function sanitizeForHttp(data: string): string {
 }
 
 /**
+ * Decode a JWT's `exp` claim (unix seconds), or null if the token can't be
+ * parsed. We use the JWT's own exp as the source of truth for expiry rather
+ * than `expires_in` returned by the auth endpoint — the two can disagree
+ * (Supabase has been observed reporting expires_in values longer than the
+ * JWT's actual exp), and a divergence makes `whoami` cheerfully report a
+ * "valid" token while every authenticated API call gets 401.
+ */
+function jwtExpSeconds(accessToken: string): number | null {
+  const parts = accessToken.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(
+      Buffer.from(parts[1], "base64url").toString("utf-8"),
+    ) as { exp?: unknown };
+    if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
+      return null;
+    }
+    return payload.exp;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compute the effective expiresAt for a freshly issued access token.
+ * Prefers the JWT's own `exp` claim; falls back to `now + expires_in` if the
+ * token can't be parsed (e.g. an opaque token).
+ */
+export function computeExpiresAt(accessToken: string, expiresInSeconds: number): number {
+  return jwtExpSeconds(accessToken) ?? Math.floor(Date.now() / 1000) + expiresInSeconds;
+}
+
+/**
  * Get a valid access token, or null if not authenticated.
  *
  * Resolution order:
@@ -133,6 +166,24 @@ export async function getAccessToken(): Promise<string | null> {
   if (refreshed) return refreshed.accessToken;
 
   return null;
+}
+
+/**
+ * Force a refresh of the stored access token regardless of local expiry, and
+ * return the new access token (or null if refresh failed).
+ *
+ * Intended as a 401-recovery hook for callers: if an authenticated request
+ * comes back unauthorized despite the local cache claiming a valid token, the
+ * cache is stale (clock skew, divergence between expires_in and the JWT's
+ * actual exp, or server-side revocation). Force a refresh and retry once.
+ */
+export async function forceRefreshAccessToken(): Promise<string | null> {
+  const envToken = process.env.MNEMOM_TOKEN;
+  if (envToken) return envToken; // env-supplied tokens are not refreshable
+  const auth = getAuthInfo();
+  if (!auth?.refreshToken) return null;
+  const refreshed = await refreshAccessToken(auth.refreshToken);
+  return refreshed?.accessToken ?? null;
 }
 
 /**
@@ -279,7 +330,7 @@ async function startCallbackServer(expectedState: string): Promise<{
         const tokens: AuthTokens = {
           accessToken: data.access_token,
           refreshToken: data.refresh_token,
-          expiresAt: Math.floor(Date.now() / 1000) + data.expires_in,
+          expiresAt: computeExpiresAt(data.access_token, data.expires_in),
           userId: data.user_id,
           email: data.user_email,
         };
@@ -366,7 +417,7 @@ export async function loginWithPassword(
   const tokens: AuthTokens = {
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
-    expiresAt: Math.floor(Date.now() / 1000) + data.expires_in,
+    expiresAt: computeExpiresAt(data.access_token, data.expires_in),
     userId: data.user.id,
     email: data.user.email,
   };
@@ -405,7 +456,7 @@ async function refreshAccessToken(
     const tokens: AuthTokens = {
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
-      expiresAt: Math.floor(Date.now() / 1000) + data.expires_in,
+      expiresAt: computeExpiresAt(data.access_token, data.expires_in),
       userId: existing?.userId ?? "",
       email: existing?.email ?? "",
     };

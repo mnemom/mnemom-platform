@@ -1,4 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+// Mock auth.js so the 401-retry path can simulate a successful forced refresh
+// without touching the real auth file on disk. The other tests don't depend
+// on this — they exercise unauthenticated GET/POST paths.
+vi.mock("../lib/auth.js", async () => {
+  const actual = await vi.importActual<typeof import("../lib/auth.js")>("../lib/auth.js");
+  return {
+    ...actual,
+    resolveAuth: vi.fn(async () => ({ type: "none" as const })),
+    forceRefreshAccessToken: vi.fn(async () => "refreshed-jwt"),
+  };
+});
+
 import {
   getAgent,
   getIntegrity,
@@ -359,6 +372,102 @@ describe("api", () => {
       const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
       const headers = init.headers as Record<string, string>;
       expect(headers["Idempotency-Key"]).toBe(explicitKey);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Accept: application/json on PUT cards
+  //
+  // The API content-negotiates the response by Accept (see
+  // mnemom-api/src/composition/response.ts:respondYamlJson). With Node's
+  // default Accept: */* the API returns a YAML body, which crashes
+  // response.json() on the client with "Unexpected token 'a' is not valid
+  // JSON". This pins the explicit Accept so the bug never returns.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("PUT response content negotiation", () => {
+    function jsonOk() {
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue({ card_id: "x", composed: true }),
+      } as unknown as Response;
+    }
+
+    it("putAlignmentCard asks for JSON in the response", async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(jsonOk());
+      await putAlignmentCard("mnm-test", "card_version: x", "text/yaml");
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Accept"]).toBe("application/json");
+    });
+
+    it("putProtectionCard asks for JSON in the response", async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(jsonOk());
+      await putProtectionCard("mnm-test", "card_version: x", "text/yaml");
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Accept"]).toBe("application/json");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // 401 retry with forced refresh
+  //
+  // When local expiresAt diverges from the JWT's actual exp, authenticated
+  // calls 401 even though the local cache claims the token is valid. The
+  // CLI now refreshes once on 401 and retries — and the second attempt must
+  // reuse the same Idempotency-Key so the server's reservation table sees
+  // a single mutation.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("401 retry on PUT", () => {
+    it("putAlignmentCard retries with the same Idempotency-Key after 401", async () => {
+      // First PUT returns 401; auth.js mock unconditionally returns a fresh
+      // token from forceRefreshAccessToken; second PUT returns 200.
+      vi.mocked(globalThis.fetch)
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 401,
+          statusText: "Unauthorized",
+          json: vi.fn().mockResolvedValue({ error: "unauthorized", message: "expired" }),
+        } as unknown as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: vi.fn().mockResolvedValue({ card_id: "ac-1", composed: true }),
+        } as unknown as Response);
+
+      const explicitKey = "33333333-3333-4333-8333-333333333333";
+      const result = await putAlignmentCard("mnm-test", "card_version: x", "text/yaml", {
+        idempotencyKey: explicitKey,
+      });
+      expect(result.card_id).toBe("ac-1");
+
+      const calls = vi.mocked(globalThis.fetch).mock.calls;
+      expect(calls.length).toBe(2);
+      const firstHeaders = calls[0][1]!.headers as Record<string, string>;
+      const retryHeaders = calls[1][1]!.headers as Record<string, string>;
+      expect(firstHeaders["Idempotency-Key"]).toBe(explicitKey);
+      expect(retryHeaders["Idempotency-Key"]).toBe(explicitKey);
+    });
+
+    it("putAlignmentCard does not retry when refresh fails", async () => {
+      const auth = await import("../lib/auth.js");
+      vi.mocked(auth.forceRefreshAccessToken).mockResolvedValueOnce(null);
+
+      vi.mocked(globalThis.fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        json: vi.fn().mockResolvedValue({ error: "unauthorized", message: "expired" }),
+      } as unknown as Response);
+
+      await expect(
+        putAlignmentCard("mnm-test", "card_version: x", "text/yaml"),
+      ).rejects.toThrow();
+      expect(vi.mocked(globalThis.fetch).mock.calls.length).toBe(1);
     });
   });
 });
