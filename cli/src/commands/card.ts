@@ -682,9 +682,8 @@ export async function cardPublishCommand(
       idempotencyKey: options.idempotencyKey,
     });
     console.log(fmt.success("Alignment card published!"));
-    console.log(fmt.label("  Card ID:", ` ${result.card_id}`));
-    if (result.composed) {
-      console.log(fmt.success("Canonical card recomposed"));
+    if (typeof result.card_id === "string" && result.card_id.length > 0) {
+      console.log(fmt.label("  Card ID:", ` ${result.card_id}`));
     }
     console.log();
   } catch (error) {
@@ -848,7 +847,10 @@ export async function cardEditCommand(
       idempotencyKey: options.idempotencyKey,
     });
     console.log(fmt.success("Alignment card published!"));
-    console.log(fmt.label("  Card ID:", ` ${putResult.card_id}`) + "\n");
+    if (typeof putResult.card_id === "string" && putResult.card_id.length > 0) {
+      console.log(fmt.label("  Card ID:", ` ${putResult.card_id}`));
+    }
+    console.log();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.log("\n" + fmt.error(`Failed to publish card: ${message}`) + "\n");
