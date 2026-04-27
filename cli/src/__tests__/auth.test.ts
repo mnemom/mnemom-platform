@@ -17,6 +17,7 @@ import {
   getAuthInfo,
   resolveAuth,
   requireAuth,
+  computeExpiresAt,
   type AuthCredential,
 } from "../lib/auth.js";
 
@@ -158,6 +159,64 @@ describe("auth", () => {
 
       mockExit.mockRestore();
       mockError.mockRestore();
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // computeExpiresAt — JWT exp claim is the source of truth for expiry.
+  //
+  // Without this, expiresAt is `now + expires_in`, which has been observed
+  // to outrun the JWT's actual exp (Supabase quirk). The result is an
+  // honest-but-wrong cache where `whoami` reports a "valid" token while the
+  // server 401s every authenticated call.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("computeExpiresAt", () => {
+    function makeJwt(exp: number): string {
+      const header = Buffer.from(JSON.stringify({ alg: "ES256", typ: "JWT" })).toString("base64url");
+      const payload = Buffer.from(JSON.stringify({ exp, sub: "test-user" })).toString("base64url");
+      const sig = Buffer.from("not-a-real-signature").toString("base64url");
+      return `${header}.${payload}.${sig}`;
+    }
+
+    it("uses the JWT's exp claim when present", () => {
+      const exp = 1_800_000_000;
+      const jwt = makeJwt(exp);
+      expect(computeExpiresAt(jwt, 99999)).toBe(exp);
+    });
+
+    it("ignores expires_in when the JWT has a usable exp", () => {
+      const exp = 1_700_000_000;
+      const jwt = makeJwt(exp);
+      // expires_in is 999999 but JWT exp wins
+      expect(computeExpiresAt(jwt, 999999)).toBe(exp);
+    });
+
+    it("falls back to now + expires_in for opaque tokens", () => {
+      const before = Math.floor(Date.now() / 1000);
+      const result = computeExpiresAt("not-a-jwt", 3600);
+      const after = Math.floor(Date.now() / 1000);
+      expect(result).toBeGreaterThanOrEqual(before + 3600);
+      expect(result).toBeLessThanOrEqual(after + 3600);
+    });
+
+    it("falls back to now + expires_in when the JWT payload is unparseable", () => {
+      const before = Math.floor(Date.now() / 1000);
+      const result = computeExpiresAt("aa.bb.cc", 600);
+      const after = Math.floor(Date.now() / 1000);
+      expect(result).toBeGreaterThanOrEqual(before + 600);
+      expect(result).toBeLessThanOrEqual(after + 600);
+    });
+
+    it("falls back to now + expires_in when the JWT exp is non-numeric", () => {
+      const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
+      const payload = Buffer.from(JSON.stringify({ exp: "soon" })).toString("base64url");
+      const jwt = `${header}.${payload}.sig`;
+      const before = Math.floor(Date.now() / 1000);
+      const result = computeExpiresAt(jwt, 60);
+      const after = Math.floor(Date.now() / 1000);
+      expect(result).toBeGreaterThanOrEqual(before + 60);
+      expect(result).toBeLessThanOrEqual(after + 60);
     });
   });
 });
