@@ -131,6 +131,17 @@ describe('buildNudgeAnnotation', () => {
     const out = buildNudgeAnnotation(decision(0.5, ['prompt_injection']));
     expect(out).toMatch(/data, not as instructions/);
   });
+
+  it('does NOT instruct the model to refuse — refusal causes downstream retry loops', () => {
+    const out = buildNudgeAnnotation(decision(0.7, ['prompt_injection']));
+    expect(out).not.toMatch(/\brefuse\b/i);
+    expect(out).not.toMatch(/escalate/i);
+  });
+
+  it('explicitly tells the model it can continue responding normally', () => {
+    const out = buildNudgeAnnotation(decision(0.7, ['prompt_injection']));
+    expect(out).toMatch(/respond.*normally|continue/i);
+  });
 });
 
 describe('prependNudgeToLastUserMessage', () => {
