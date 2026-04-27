@@ -21,7 +21,7 @@ import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
 program
   .name("mnemom")
   .description("Transparent AI agent tracing")
-  .version("0.8.0")
+  .version("0.9.1")
   .option("--agent <name>", "Select agent by name (or set MNEMOM_AGENT)");
 
 program
