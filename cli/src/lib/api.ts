@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { getApiUrl } from "./config.js";
 import { resolveAuth } from "./auth.js";
 
@@ -15,6 +16,19 @@ function validateUrl(url: string): string {
     throw new Error(`Invalid URL protocol: ${parsed.protocol}`);
   }
   return parsed.href;
+}
+
+/**
+ * Generate a fresh Idempotency-Key for a mutation request.
+ *
+ * The server's beginIdempotentMutation contract (mnemom-api/src/idempotency.ts)
+ * requires this header on every PUT/POST/DELETE to a mutation endpoint;
+ * without it the server short-circuits with a 400 "Idempotency-Key header is
+ * required". Callers may pass an explicit key (for retries that must hit the
+ * cached reservation) — when omitted, we mint a UUIDv4.
+ */
+export function newIdempotencyKey(): string {
+  return randomUUID();
 }
 
 export interface Agent {
@@ -66,11 +80,16 @@ async function fetchApi<T>(endpoint: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function postApi<T>(endpoint: string, body: unknown): Promise<T> {
+export async function postApi<T>(
+  endpoint: string,
+  body: unknown,
+  opts: { idempotencyKey?: string } = {},
+): Promise<T> {
   const url = validateUrl(`${API_BASE}${endpoint}`);
   const cred = await resolveAuth();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
   };
   if (cred.type === "jwt") {
     headers["Authorization"] = `Bearer ${cred.token}`;
@@ -243,12 +262,17 @@ export async function getCard(agentId: string): Promise<CardResponse | null> {
 
 export async function updateCard(
   agentId: string,
-  cardJson: AlignmentCard
+  cardJson: AlignmentCard,
+  opts: { idempotencyKey?: string } = {},
 ): Promise<{ updated: boolean; card_id: string }> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/card`);
   const response = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
+      ...(await authHeaders()),
+    },
     body: sanitizeForHttp(JSON.stringify({ card_json: cardJson })),
   });
 
@@ -264,12 +288,17 @@ export async function updateCard(
 }
 
 export async function reverifyAgent(
-  agentId: string
+  agentId: string,
+  opts: { idempotencyKey?: string } = {},
 ): Promise<{ reverified: number }> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/reverify`);
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
+      ...(await authHeaders()),
+    },
   });
 
   if (!response.ok) {
@@ -316,12 +345,17 @@ export async function getPolicy(agentId: string): Promise<PolicyListResponse | n
 
 export async function publishPolicy(
   agentId: string,
-  policyJson: Record<string, unknown>
+  policyJson: Record<string, unknown>,
+  opts: { idempotencyKey?: string } = {},
 ): Promise<{ id: string; version: number; created: boolean }> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/policy`);
   const response = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
+      ...(await authHeaders()),
+    },
     body: sanitizeForHttp(JSON.stringify({ policy_json: policyJson })),
   });
 
@@ -399,6 +433,9 @@ export async function getAlignmentCard(
   return { body, contentType: ct };
 }
 
+/** Hard cap enforced by the API on inbound alignment-card bodies (413 otherwise). */
+export const ALIGNMENT_CARD_MAX_BYTES = 128 * 1024;
+
 /**
  * Publish (create or update) an alignment card.
  * Accepts YAML or JSON body; set contentType accordingly.
@@ -407,11 +444,16 @@ export async function putAlignmentCard(
   agentId: string,
   body: string,
   contentType: "text/yaml" | "application/json" = "text/yaml",
+  opts: { idempotencyKey?: string } = {},
 ): Promise<{ card_id: string; composed: boolean }> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/alignment-card`);
   const response = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": contentType, ...(await authHeaders()) },
+    headers: {
+      "Content-Type": contentType,
+      "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
+      ...(await authHeaders()),
+    },
     body: sanitizeForHttp(body),
   });
 
@@ -455,6 +497,9 @@ export async function getProtectionCard(
   return { body, contentType: ct };
 }
 
+/** Hard cap enforced by the API on inbound protection-card bodies (413 otherwise). */
+export const PROTECTION_CARD_MAX_BYTES = 64 * 1024;
+
 /**
  * Publish (create or update) a protection card.
  */
@@ -462,11 +507,16 @@ export async function putProtectionCard(
   agentId: string,
   body: string,
   contentType: "text/yaml" | "application/json" = "text/yaml",
+  opts: { idempotencyKey?: string } = {},
 ): Promise<{ card_id: string; composed: boolean }> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/protection-card`);
   const response = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": contentType, ...(await authHeaders()) },
+    headers: {
+      "Content-Type": contentType,
+      "Idempotency-Key": opts.idempotencyKey ?? newIdempotencyKey(),
+      ...(await authHeaders()),
+    },
     body: sanitizeForHttp(body),
   });
 

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import yaml from "js-yaml";
 import {
+  ALIGNMENT_CARD_MAX_BYTES,
   getAlignmentCard,
   putAlignmentCard,
   resolveAgentId,
@@ -50,7 +51,20 @@ export function parseCardFile(filePath: string): ParsedCard {
 }
 
 // ============================================================================
-// Unified card validation (ADR-008 schema)
+// Unified alignment-card validation (ADR-039 canonical form)
+//
+// This validator mirrors the platform's authoritative rules in
+// mnemom-api/src/composition/validate.ts:validateUnifiedAlignmentCard. Post
+// migration 146 the dual-key window is closed: top-level autonomy_mode +
+// integrity_mode are required, and the legacy locations
+// (integrity.enforcement_mode, enforcement.{mode, unmapped_tool_action,
+// fail_open}, audit.storage, capabilities.<n>.required_actions) are rejected
+// with a pointer to the new field name.
+//
+// The two codebases live in different repos so we keep this hand-rolled copy
+// in sync rather than depending on a shared package — a candidate for
+// extraction once the validator stabilises (TODO: shared/composition-validators
+// package).
 // ============================================================================
 
 export interface ValidationCheck {
@@ -59,134 +73,487 @@ export interface ValidationCheck {
   message: string;
 }
 
-// Standard AAP values that do not require custom definitions
-const STANDARD_VALUES = new Set([
-  "transparency", "honesty", "safety", "privacy", "fairness",
-  "accountability", "beneficence", "non-maleficence", "autonomy",
-  "justice", "reliability", "security", "human_oversight", "explainability",
-]);
+const ALIGNMENT_MODES = ["off", "observe", "nudge", "enforce"] as const;
+const PRINCIPAL_TYPES = ["human", "organization", "agent", "unspecified"] as const;
+const PRINCIPAL_RELATIONSHIPS = ["delegated_authority", "advisory", "autonomous"] as const;
+const VALUE_HIERARCHIES = ["lexicographic", "weighted", "contextual"] as const;
+const ESCALATION_ACTIONS = ["escalate", "deny", "log"] as const;
+const CONSCIENCE_MODES = ["augment", "replace"] as const;
+const CONSCIENCE_VALUE_TYPES = ["BOUNDARY", "FEAR", "COMMITMENT", "BELIEF", "HOPE"] as const;
+const CONSCIENCE_SEVERITIES = ["advisory", "mandatory"] as const;
+const TAMPER_EVIDENCE = ["append_only", "signed", "merkle"] as const;
+const UNMAPPED_SEVERITIES = ["low", "medium", "high", "critical"] as const;
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
 
 /**
- * Validate a unified alignment card object against ADR-008 schema.
- * Sections: principal, values, conscience, integrity, autonomy,
- *           capabilities, enforcement, audit, extensions
+ * Validate a unified alignment card against ADR-039 canonical form.
+ *
+ * Required: card_version, agent_id, autonomy_mode, integrity_mode,
+ *           principal (with identifier when type != unspecified),
+ *           values.declared (non-empty), autonomy.bounded_actions (non-empty,
+ *           disjoint from forbidden_actions), audit (retention_days, queryable,
+ *           query_endpoint when queryable=true).
+ *
+ * Rejected legacy locations: integrity.enforcement_mode,
+ *   enforcement.{mode, unmapped_tool_action, fail_open}, _composition.
  */
 export function validateUnifiedCard(card: Record<string, unknown>): ValidationCheck[] {
   const checks: ValidationCheck[] = [];
 
-  // Required sections
-  const requiredSections = ["principal", "values", "autonomy"] as const;
-  for (const section of requiredSections) {
-    if (card[section] && typeof card[section] === "object") {
-      checks.push({ name: `Section: ${section}`, passed: true, message: "Present" });
-    } else {
-      checks.push({ name: `Section: ${section}`, passed: false, message: "Missing or invalid" });
-    }
-  }
-
-  // Optional sections — validate shape if present
-  const optionalSections = ["conscience", "integrity", "capabilities", "enforcement", "audit", "extensions"] as const;
-  for (const section of optionalSections) {
-    if (card[section] !== undefined) {
-      if (typeof card[section] === "object" && card[section] !== null) {
-        checks.push({ name: `Section: ${section}`, passed: true, message: "Present" });
-      } else {
-        checks.push({ name: `Section: ${section}`, passed: false, message: "Must be an object" });
-      }
-    }
-  }
-
-  // values.declared is non-empty array
-  const values = card.values as Record<string, unknown> | undefined;
-  const declared = values?.declared;
-  if (Array.isArray(declared) && declared.length > 0) {
+  // ── card_version (required) ──
+  if (typeof card.card_version !== "string" || card.card_version.length === 0) {
     checks.push({
-      name: "values.declared",
-      passed: true,
-      message: `${declared.length} value(s) declared`,
-    });
-  } else if (values) {
-    checks.push({
-      name: "values.declared",
+      name: "card_version",
       passed: false,
-      message: "Must be a non-empty array",
+      message: 'Required (string, e.g. "unified/2026-04-26").',
     });
+  } else {
+    checks.push({ name: "card_version", passed: true, message: card.card_version });
   }
 
-  // Custom values need definitions
-  if (Array.isArray(declared)) {
-    const definitions = (values?.definitions ?? {}) as Record<string, string>;
-    const customValues = declared.filter((v: string) => !STANDARD_VALUES.has(v));
-    const missingDefs = customValues.filter((v: string) => !definitions[v]);
+  // ── agent_id (required) ──
+  if (typeof card.agent_id !== "string" || card.agent_id.length === 0) {
+    checks.push({ name: "agent_id", passed: false, message: "Required (string)." });
+  } else {
+    checks.push({ name: "agent_id", passed: true, message: card.agent_id });
+  }
 
-    if (missingDefs.length === 0) {
+  // ── autonomy_mode (top-level master switch, ADR-039 Decision 1) ──
+  if (typeof card.autonomy_mode !== "string") {
+    checks.push({
+      name: "autonomy_mode",
+      passed: false,
+      message: `Required (top-level master switch). Must be one of: ${ALIGNMENT_MODES.join(" | ")}. Per ADR-039 the legacy enforcement.mode location is no longer accepted.`,
+    });
+  } else if (!(ALIGNMENT_MODES as readonly string[]).includes(card.autonomy_mode)) {
+    checks.push({
+      name: "autonomy_mode",
+      passed: false,
+      message: `Invalid: "${card.autonomy_mode}". Must be one of: ${ALIGNMENT_MODES.join(" | ")}.`,
+    });
+  } else {
+    checks.push({ name: "autonomy_mode", passed: true, message: card.autonomy_mode });
+  }
+
+  // ── integrity_mode (top-level master switch, ADR-039 Decision 1) ──
+  if (typeof card.integrity_mode !== "string") {
+    checks.push({
+      name: "integrity_mode",
+      passed: false,
+      message: `Required (top-level master switch). Must be one of: ${ALIGNMENT_MODES.join(" | ")}. Per ADR-039 the legacy integrity.enforcement_mode location is no longer accepted.`,
+    });
+  } else if (!(ALIGNMENT_MODES as readonly string[]).includes(card.integrity_mode)) {
+    checks.push({
+      name: "integrity_mode",
+      passed: false,
+      message: `Invalid: "${card.integrity_mode}". Must be one of: ${ALIGNMENT_MODES.join(" | ")}.`,
+    });
+  } else {
+    checks.push({ name: "integrity_mode", passed: true, message: card.integrity_mode });
+  }
+
+  // ── ADR-039 cutover: reject legacy locations with a pointer to the new field ──
+  const integ = card.integrity as Record<string, unknown> | undefined;
+  if (integ && typeof integ === "object" && integ.enforcement_mode !== undefined) {
+    checks.push({
+      name: "integrity.enforcement_mode",
+      passed: false,
+      message: "Legacy field rejected. Use top-level integrity_mode instead (ADR-039).",
+    });
+  }
+  const enf = card.enforcement as Record<string, unknown> | undefined;
+  if (enf && typeof enf === "object") {
+    if (enf.mode !== undefined) {
       checks.push({
-        name: "Custom value definitions",
-        passed: true,
-        message: customValues.length === 0
-          ? "No custom values (all standard)"
-          : `${customValues.length} custom value(s) defined`,
-      });
-    } else {
-      checks.push({
-        name: "Custom value definitions",
+        name: "enforcement.mode",
         passed: false,
-        message: `Missing definitions for: ${missingDefs.join(", ")}`,
+        message: "Legacy field rejected. Use top-level autonomy_mode instead (ADR-039).",
+      });
+    }
+    if (enf.unmapped_tool_action !== undefined) {
+      checks.push({
+        name: "enforcement.unmapped_tool_action",
+        passed: false,
+        message: "Legacy field rejected. Derived from enforcement.allow_unmapped_tools instead (ADR-039).",
+      });
+    }
+    if (enf.fail_open !== undefined) {
+      checks.push({
+        name: "enforcement.fail_open",
+        passed: false,
+        message: "Legacy field rejected. fail_open is a runtime safety knob (gateway env config), not a card field (ADR-039).",
+      });
+    }
+  }
+  // _composition is system-managed
+  if (card._composition !== undefined) {
+    checks.push({
+      name: "_composition",
+      passed: false,
+      message: "System-managed field — cannot be set on inbound cards.",
+    });
+  }
+
+  // ── principal (required: type + relationship; identifier when type != unspecified) ──
+  if (!isObj(card.principal)) {
+    checks.push({
+      name: "principal",
+      passed: false,
+      message: "Required (object with at least type + relationship).",
+    });
+  } else {
+    const p = card.principal as Record<string, unknown>;
+    if (!(PRINCIPAL_TYPES as readonly string[]).includes(String(p.type))) {
+      checks.push({
+        name: "principal.type",
+        passed: false,
+        message: `Must be one of: ${PRINCIPAL_TYPES.join(", ")}.`,
+      });
+    }
+    if (!(PRINCIPAL_RELATIONSHIPS as readonly string[]).includes(String(p.relationship))) {
+      checks.push({
+        name: "principal.relationship",
+        passed: false,
+        message: `Must be one of: ${PRINCIPAL_RELATIONSHIPS.join(", ")}.`,
+      });
+    }
+    // ADR-039 Decision 10: identifier required when type != unspecified
+    if (
+      p.type !== "unspecified" &&
+      (PRINCIPAL_TYPES as readonly string[]).includes(String(p.type)) &&
+      (typeof p.identifier !== "string" || p.identifier.length === 0)
+    ) {
+      checks.push({
+        name: "principal.identifier",
+        passed: false,
+        message: 'Required when principal.type is not "unspecified" (ADR-039 Decision 10).',
       });
     }
   }
 
-  // autonomy.bounded_actions is non-empty
-  const autonomy = card.autonomy as Record<string, unknown> | undefined;
-  const bounded = autonomy?.bounded_actions;
-  if (Array.isArray(bounded) && bounded.length > 0) {
+  // ── values.declared (required, non-empty array of strings) ──
+  if (!isObj(card.values) || !Array.isArray((card.values as Record<string, unknown>).declared)) {
     checks.push({
-      name: "autonomy.bounded_actions",
-      passed: true,
-      message: `${bounded.length} bounded action(s)`,
+      name: "values.declared",
+      passed: false,
+      message: "Required (non-empty array of strings).",
     });
-  } else if (autonomy) {
+  } else {
+    const v = card.values as Record<string, unknown>;
+    const decl = v.declared as unknown[];
+    if (decl.length === 0) {
+      checks.push({
+        name: "values.declared",
+        passed: false,
+        message: "Must contain at least one value.",
+      });
+    } else if (!decl.every(s => typeof s === "string")) {
+      checks.push({
+        name: "values.declared",
+        passed: false,
+        message: "All entries must be strings.",
+      });
+    } else {
+      checks.push({
+        name: "values.declared",
+        passed: true,
+        message: `${decl.length} value(s) declared`,
+      });
+    }
+    // definitions ⊆ declared (ADR-039 Decision 10)
+    if (v.definitions !== undefined) {
+      if (!isObj(v.definitions)) {
+        checks.push({
+          name: "values.definitions",
+          passed: false,
+          message: "Must be an object keyed by value names.",
+        });
+      } else {
+        const declSet = new Set(decl.filter((s): s is string => typeof s === "string"));
+        for (const key of Object.keys(v.definitions)) {
+          if (!declSet.has(key)) {
+            checks.push({
+              name: `values.definitions.${key}`,
+              passed: false,
+              message: "Definition key not present in values.declared (ADR-039 Decision 10).",
+            });
+          }
+        }
+      }
+    }
+    // hierarchy enum
+    if (v.hierarchy !== undefined && !(VALUE_HIERARCHIES as readonly string[]).includes(String(v.hierarchy))) {
+      checks.push({
+        name: "values.hierarchy",
+        passed: false,
+        message: `Must be one of: ${VALUE_HIERARCHIES.join(", ")}.`,
+      });
+    }
+  }
+
+  // ── autonomy.bounded_actions (required, non-empty; disjoint from forbidden_actions) ──
+  if (!isObj(card.autonomy) || !Array.isArray((card.autonomy as Record<string, unknown>).bounded_actions)) {
     checks.push({
       name: "autonomy.bounded_actions",
       passed: false,
-      message: "Must be a non-empty array",
+      message: "Required (non-empty array of strings).",
     });
-  }
-
-  // capabilities shape validation (if present)
-  const capabilities = card.capabilities as Record<string, unknown> | undefined;
-  if (capabilities && typeof capabilities === "object") {
-    for (const [name, mapping] of Object.entries(capabilities)) {
-      const m = mapping as Record<string, unknown>;
-      if (!Array.isArray(m?.tools)) {
+  } else {
+    const a = card.autonomy as Record<string, unknown>;
+    const bounded = a.bounded_actions as unknown[];
+    if (bounded.length === 0) {
+      checks.push({
+        name: "autonomy.bounded_actions",
+        passed: false,
+        message: "Must contain at least one action.",
+      });
+    } else {
+      checks.push({
+        name: "autonomy.bounded_actions",
+        passed: true,
+        message: `${bounded.length} bounded action(s)`,
+      });
+    }
+    // Disjoint check (ADR-039 Decision 10)
+    if (Array.isArray(a.forbidden_actions)) {
+      const forbidden = new Set(
+        (a.forbidden_actions as unknown[]).filter((x): x is string => typeof x === "string"),
+      );
+      const overlap = bounded.filter((x): x is string => typeof x === "string" && forbidden.has(x));
+      if (overlap.length > 0) {
         checks.push({
-          name: `capabilities.${name}.tools`,
+          name: "autonomy.bounded_actions",
           passed: false,
-          message: "Must be an array",
+          message: `bounded_actions and forbidden_actions must be disjoint; both contain: ${overlap.join(", ")} (ADR-039 Decision 10).`,
         });
       }
-      if (!Array.isArray(m?.required_actions)) {
+    }
+    // escalation_triggers shape (ADR-039 Decision 10)
+    if (a.escalation_triggers !== undefined) {
+      if (!Array.isArray(a.escalation_triggers)) {
         checks.push({
-          name: `capabilities.${name}.required_actions`,
+          name: "autonomy.escalation_triggers",
           passed: false,
-          message: "Must be an array",
+          message: "Must be an array (may be empty).",
+        });
+      } else {
+        (a.escalation_triggers as unknown[]).forEach((t, i) => {
+          if (!isObj(t)) {
+            checks.push({
+              name: `autonomy.escalation_triggers[${i}]`,
+              passed: false,
+              message: "Must be an object.",
+            });
+            return;
+          }
+          const tr = t as Record<string, unknown>;
+          if (typeof tr.condition !== "string" || tr.condition.length === 0) {
+            checks.push({
+              name: `autonomy.escalation_triggers[${i}].condition`,
+              passed: false,
+              message: "Required (string).",
+            });
+          }
+          if (!(ESCALATION_ACTIONS as readonly string[]).includes(String(tr.action))) {
+            checks.push({
+              name: `autonomy.escalation_triggers[${i}].action`,
+              passed: false,
+              message: `Must be one of: ${ESCALATION_ACTIONS.join(", ")}.`,
+            });
+          }
+          if (typeof tr.reason !== "string" || tr.reason.length === 0) {
+            checks.push({
+              name: `autonomy.escalation_triggers[${i}].reason`,
+              passed: false,
+              message: "Required (string).",
+            });
+          }
         });
       }
     }
   }
 
-  // enforcement.forbidden_tools shape validation (if present)
-  const enforcement = card.enforcement as Record<string, unknown> | undefined;
-  const forbidden = enforcement?.forbidden_tools;
-  if (Array.isArray(forbidden)) {
-    for (let i = 0; i < forbidden.length; i++) {
-      const rule = forbidden[i] as Record<string, unknown>;
-      if (!rule?.pattern || !rule?.reason) {
+  // ── audit (required: retention_days, queryable; query_endpoint when queryable=true) ──
+  if (!isObj(card.audit)) {
+    checks.push({
+      name: "audit",
+      passed: false,
+      message: "Required (object with retention_days, queryable, trace_format).",
+    });
+  } else {
+    const a = card.audit as Record<string, unknown>;
+    if (typeof a.retention_days !== "number" || a.retention_days < 0) {
+      checks.push({
+        name: "audit.retention_days",
+        passed: false,
+        message: "Required (non-negative number).",
+      });
+    }
+    if (typeof a.queryable !== "boolean") {
+      checks.push({
+        name: "audit.queryable",
+        passed: false,
+        message: "Required (boolean).",
+      });
+    }
+    if (a.queryable === true && typeof a.query_endpoint !== "string") {
+      checks.push({
+        name: "audit.query_endpoint",
+        passed: false,
+        message: "Required when audit.queryable is true.",
+      });
+    }
+    // ADR-039 Decision 7: tamper_evidence enum
+    if (a.tamper_evidence !== undefined && a.tamper_evidence !== null) {
+      if (!(TAMPER_EVIDENCE as readonly string[]).includes(String(a.tamper_evidence))) {
         checks.push({
-          name: `enforcement.forbidden_tools[${i}]`,
+          name: "audit.tamper_evidence",
           passed: false,
-          message: "Must have 'pattern' and 'reason' fields",
+          message: `Must be one of: ${TAMPER_EVIDENCE.join(", ")}, or null.`,
         });
+      }
+    }
+    // ADR-039 cutover: audit.storage no longer accepted
+    if (a.storage !== undefined) {
+      checks.push({
+        name: "audit.storage",
+        passed: false,
+        message: "Legacy field rejected. audit.storage is no longer accepted (ADR-039).",
+      });
+    }
+  }
+
+  // ── conscience (optional, BOUNDARY+advisory rejected per ADR-039 Decision 10) ──
+  if (card.conscience !== undefined) {
+    if (!isObj(card.conscience)) {
+      checks.push({
+        name: "conscience",
+        passed: false,
+        message: "Must be an object if present.",
+      });
+    } else {
+      const cns = card.conscience as Record<string, unknown>;
+      if (!(CONSCIENCE_MODES as readonly string[]).includes(String(cns.mode))) {
+        checks.push({
+          name: "conscience.mode",
+          passed: false,
+          message: `Must be one of: ${CONSCIENCE_MODES.join(", ")}.`,
+        });
+      }
+      if (!Array.isArray(cns.values)) {
+        checks.push({
+          name: "conscience.values",
+          passed: false,
+          message: "Must be an array.",
+        });
+      } else {
+        cns.values.forEach((v, i) => {
+          if (!isObj(v)) {
+            checks.push({
+              name: `conscience.values[${i}]`,
+              passed: false,
+              message: "Must be an object with type + content.",
+            });
+            return;
+          }
+          const cv = v as Record<string, unknown>;
+          if (!(CONSCIENCE_VALUE_TYPES as readonly string[]).includes(String(cv.type))) {
+            checks.push({
+              name: `conscience.values[${i}].type`,
+              passed: false,
+              message: `Must be one of: ${CONSCIENCE_VALUE_TYPES.join(", ")}.`,
+            });
+          }
+          if (typeof cv.content !== "string" || cv.content.length === 0) {
+            checks.push({
+              name: `conscience.values[${i}].content`,
+              passed: false,
+              message: "Required (non-empty string).",
+            });
+          }
+          if (cv.severity !== undefined && !(CONSCIENCE_SEVERITIES as readonly string[]).includes(String(cv.severity))) {
+            checks.push({
+              name: `conscience.values[${i}].severity`,
+              passed: false,
+              message: `Must be one of: ${CONSCIENCE_SEVERITIES.join(", ")}.`,
+            });
+          }
+          if (cv.type === "BOUNDARY" && cv.severity === "advisory") {
+            checks.push({
+              name: `conscience.values[${i}]`,
+              passed: false,
+              message: "BOUNDARY entries cannot have severity=advisory; BOUNDARY is inviolable by definition (ADR-039 Decision 10).",
+            });
+          }
+        });
+      }
+    }
+  }
+
+  // ── enforcement (optional, ADR-039 Decision 3 user-facing knobs) ──
+  if (card.enforcement !== undefined) {
+    if (!isObj(card.enforcement)) {
+      checks.push({
+        name: "enforcement",
+        passed: false,
+        message: "Must be an object if present.",
+      });
+    } else {
+      const e = card.enforcement as Record<string, unknown>;
+      if (e.allow_unmapped_tools !== undefined && typeof e.allow_unmapped_tools !== "boolean") {
+        checks.push({
+          name: "enforcement.allow_unmapped_tools",
+          passed: false,
+          message: "Must be a boolean.",
+        });
+      }
+      if (e.default_unmapped_severity !== undefined &&
+          !(UNMAPPED_SEVERITIES as readonly string[]).includes(String(e.default_unmapped_severity))) {
+        checks.push({
+          name: "enforcement.default_unmapped_severity",
+          passed: false,
+          message: `Must be one of: ${UNMAPPED_SEVERITIES.join(", ")}.`,
+        });
+      }
+    }
+  }
+
+  // ── capabilities (optional; ADR-039 cutover rejects required_actions) ──
+  if (card.capabilities !== undefined) {
+    if (!isObj(card.capabilities)) {
+      checks.push({
+        name: "capabilities",
+        passed: false,
+        message: "Must be an object if present.",
+      });
+    } else {
+      for (const [name, mapping] of Object.entries(card.capabilities)) {
+        if (!isObj(mapping)) {
+          checks.push({
+            name: `capabilities.${name}`,
+            passed: false,
+            message: "Must be an object.",
+          });
+          continue;
+        }
+        const m = mapping as Record<string, unknown>;
+        if (m.tools !== undefined && !Array.isArray(m.tools)) {
+          checks.push({
+            name: `capabilities.${name}.tools`,
+            passed: false,
+            message: "Must be an array.",
+          });
+        }
+        if (m.required_actions !== undefined) {
+          checks.push({
+            name: `capabilities.${name}.required_actions`,
+            passed: false,
+            message: "Legacy field rejected. capabilities.<n>.required_actions is no longer accepted (ADR-039).",
+          });
+        }
       }
     }
   }
@@ -235,7 +602,11 @@ export async function cardShowCommand(agentName?: string): Promise<void> {
   }
 }
 
-export async function cardPublishCommand(file: string, agentName?: string): Promise<void> {
+export async function cardPublishCommand(
+  file: string,
+  agentName?: string,
+  options: { idempotencyKey?: string } = {},
+): Promise<void> {
   const agentId = await resolveAgentId(agentName);
 
   // Resolve file path
@@ -296,7 +667,20 @@ export async function cardPublishCommand(file: string, agentName?: string): Prom
     console.log("\nPublishing alignment card...");
     const contentType = parsed!.format === "yaml" ? "text/yaml" as const : "application/json" as const;
     const body = parsed!.format === "yaml" ? parsed!.raw : JSON.stringify(parsed!.parsed);
-    const result = await putAlignmentCard(agentId, body, contentType);
+    const bodyBytes = Buffer.byteLength(body, "utf-8");
+    if (bodyBytes > ALIGNMENT_CARD_MAX_BYTES) {
+      console.log(
+        "\n" +
+          fmt.error(
+            `Alignment card is ${bodyBytes} bytes; limit is ${ALIGNMENT_CARD_MAX_BYTES} bytes (128 KB). The API will return 413.`,
+          ) +
+          "\n",
+      );
+      process.exit(1);
+    }
+    const result = await putAlignmentCard(agentId, body, contentType, {
+      idempotencyKey: options.idempotencyKey,
+    });
     console.log(fmt.success("Alignment card published!"));
     console.log(fmt.label("  Card ID:", ` ${result.card_id}`));
     if (result.composed) {
@@ -358,7 +742,10 @@ export async function cardValidateCommand(file: string): Promise<void> {
   }
 }
 
-export async function cardEditCommand(agentName?: string): Promise<void> {
+export async function cardEditCommand(
+  agentName?: string,
+  options: { idempotencyKey?: string } = {},
+): Promise<void> {
   const agentId = await resolveAgentId(agentName);
   await requireAuth();
 
@@ -371,9 +758,18 @@ export async function cardEditCommand(agentName?: string): Promise<void> {
   }
 
   const cardYaml = original || yaml.dump({
-    principal: { name: "", type: "ai_agent", organization: "" },
+    card_version: "unified/2026-04-26",
+    agent_id: agentId,
+    autonomy_mode: "observe",
+    integrity_mode: "observe",
+    principal: { type: "agent", identifier: agentId, relationship: "delegated_authority" },
     values: { declared: ["transparency", "safety", "honesty"] },
-    autonomy: { bounded_actions: [], forbidden_actions: [], escalation_triggers: [] },
+    autonomy: {
+      bounded_actions: ["respond_to_prompts"],
+      forbidden_actions: [],
+      escalation_triggers: [],
+    },
+    audit: { retention_days: 30, queryable: false, trace_format: "otel" },
   }, { lineWidth: 120, noRefs: true });
 
   // Write to temp file
@@ -437,7 +833,20 @@ export async function cardEditCommand(agentName?: string): Promise<void> {
 
   try {
     console.log("\nPublishing alignment card...");
-    const putResult = await putAlignmentCard(agentId, edited, "text/yaml");
+    const editedBytes = Buffer.byteLength(edited, "utf-8");
+    if (editedBytes > ALIGNMENT_CARD_MAX_BYTES) {
+      console.log(
+        "\n" +
+          fmt.error(
+            `Alignment card is ${editedBytes} bytes; limit is ${ALIGNMENT_CARD_MAX_BYTES} bytes (128 KB). The API will return 413.`,
+          ) +
+          "\n",
+      );
+      process.exit(1);
+    }
+    const putResult = await putAlignmentCard(agentId, edited, "text/yaml", {
+      idempotencyKey: options.idempotencyKey,
+    });
     console.log(fmt.success("Alignment card published!"));
     console.log(fmt.label("  Card ID:", ` ${putResult.card_id}`) + "\n");
   } catch (error) {

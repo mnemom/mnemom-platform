@@ -129,10 +129,11 @@ cardCmd
 cardCmd
   .command("edit")
   .description("Edit alignment card in $EDITOR")
-  .action(async () => {
+  .option("--idempotency-key <uuid>", "Reuse a specific Idempotency-Key (for retries; default: auto)")
+  .action(async (subOpts: { idempotencyKey?: string }) => {
     try {
       const opts = program.opts();
-      await cardEditCommand(opts.agent);
+      await cardEditCommand(opts.agent, { idempotencyKey: subOpts.idempotencyKey });
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
@@ -143,10 +144,11 @@ cardCmd
   .command("publish")
   .argument("<file>", "Path to alignment card file (YAML or JSON)")
   .description("Publish alignment card")
-  .action(async (file: string) => {
+  .option("--idempotency-key <uuid>", "Reuse a specific Idempotency-Key (for retries; default: auto)")
+  .action(async (file: string, subOpts: { idempotencyKey?: string }) => {
     try {
       const opts = program.opts();
-      await cardPublishCommand(file, opts.agent);
+      await cardPublishCommand(file, opts.agent, { idempotencyKey: subOpts.idempotencyKey });
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
@@ -206,10 +208,11 @@ protectionCmd
 protectionCmd
   .command("edit")
   .description("Edit protection card in $EDITOR")
-  .action(async () => {
+  .option("--idempotency-key <uuid>", "Reuse a specific Idempotency-Key (for retries; default: auto)")
+  .action(async (subOpts: { idempotencyKey?: string }) => {
     try {
       const opts = program.opts();
-      await protectionEditCommand(opts.agent);
+      await protectionEditCommand(opts.agent, { idempotencyKey: subOpts.idempotencyKey });
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
@@ -220,10 +223,11 @@ protectionCmd
   .command("publish")
   .argument("<file>", "Path to protection card file (YAML or JSON)")
   .description("Publish protection card")
-  .action(async (file: string) => {
+  .option("--idempotency-key <uuid>", "Reuse a specific Idempotency-Key (for retries; default: auto)")
+  .action(async (file: string, subOpts: { idempotencyKey?: string }) => {
     try {
       const opts = program.opts();
-      await protectionPublishCommand(file, opts.agent);
+      await protectionPublishCommand(file, opts.agent, { idempotencyKey: subOpts.idempotencyKey });
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);

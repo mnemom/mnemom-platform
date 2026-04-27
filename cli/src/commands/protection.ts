@@ -4,6 +4,7 @@ import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import yaml from "js-yaml";
 import {
+  PROTECTION_CARD_MAX_BYTES,
   getProtectionCard,
   putProtectionCard,
   resolveAgentId,
@@ -13,7 +14,13 @@ import { fmt } from "../lib/format.js";
 import { askYesNo, isInteractive } from "../lib/prompt.js";
 
 // ============================================================================
-// Protection card validation
+// Protection card validation (ADR-037 canonical form)
+//
+// This validator mirrors the platform's authoritative rules in
+// mnemom-api/src/composition/validate.ts:validateUnifiedProtectionCard. The two
+// codebases live in different repos so we keep this hand-rolled copy in sync
+// rather than depending on a shared package — a candidate for extraction once
+// the validator stabilises (TODO: shared/composition-validators package).
 // ============================================================================
 
 export interface ValidationCheck {
@@ -22,68 +29,285 @@ export interface ValidationCheck {
   message: string;
 }
 
-const VALID_MODES = new Set(["observe", "warn", "block"]);
+const PROTECTION_MODES = ["off", "observe", "nudge", "enforce"] as const;
+const SURFACE_KEYS = ["incoming", "outgoing", "tool_calls", "tool_responses"] as const;
+
+// Per ADR-037 Decision 4: deny public LLM endpoints + public DNS providers,
+// and the any-host CIDRs, at write time.
+const DENY_DOMAINS = new Set([
+  "api.openai.com",
+  "api.anthropic.com",
+  "generativelanguage.googleapis.com",
+  "api.cohere.ai",
+  "api.mistral.ai",
+  "api.groq.com",
+  "cloud.google.com",
+  "dns.google",
+  "cloudflare-dns.com",
+  "one.one.one.one",
+  "dns.quad9.net",
+]);
+const DENY_IP_PREFIXES = [
+  "0.0.0.0/0",
+  "::/0",
+  "8.8.8.0/24",
+  "8.8.4.0/24",
+  "1.1.1.0/24",
+  "1.0.0.0/24",
+  "9.9.9.0/24",
+];
+
+const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+(:\d{1,5})?$/i;
+const AGENT_ID_RE = /^mnm-[a-z0-9-]{4,}$/i;
+const CIDR_RE = /^([0-9]{1,3}(\.[0-9]{1,3}){3})\/([0-9]|[12][0-9]|3[0-2])$|^([0-9a-f:]+)\/(\d{1,3})$/i;
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function validateDomain(d: string): string | null {
+  const lower = d.toLowerCase();
+  if (DENY_DOMAINS.has(lower.split(":")[0])) {
+    return "domain is on the static deny-list (public LLM/DNS endpoint)";
+  }
+  if (!DOMAIN_RE.test(lower)) return "not a valid DNS name (or host:port)";
+  return null;
+}
+
+function validateAgentId(a: string): string | null {
+  if (!AGENT_ID_RE.test(a)) return "must match Mnemom agent ID format (mnm-*)";
+  return null;
+}
+
+function validateCidr(c: string): string | null {
+  if (DENY_IP_PREFIXES.includes(c)) {
+    return "CIDR is on the static deny-list (public DNS / 0.0.0.0/0 / ::/0)";
+  }
+  if (!CIDR_RE.test(c)) return "not a valid CIDR notation";
+  return null;
+}
+
+function validateTrustedBucket(
+  name: string,
+  bucket: unknown,
+  checks: ValidationCheck[],
+  perEntry: (entry: string) => string | null,
+): void {
+  if (bucket === undefined) return;
+  if (!Array.isArray(bucket)) {
+    checks.push({
+      name: `trusted_sources.${name}`,
+      passed: false,
+      message: `Must be an array of strings (got ${typeof bucket}). Per ADR-037 trusted_sources is an object of typed buckets — not an array of objects.`,
+    });
+    return;
+  }
+  let bad = 0;
+  bucket.forEach((entry, i) => {
+    if (typeof entry !== "string") {
+      checks.push({
+        name: `trusted_sources.${name}[${i}]`,
+        passed: false,
+        message: "Must be a string",
+      });
+      bad++;
+      return;
+    }
+    const err = perEntry(entry);
+    if (err) {
+      checks.push({
+        name: `trusted_sources.${name}[${i}]`,
+        passed: false,
+        message: `${entry}: ${err}`,
+      });
+      bad++;
+    }
+  });
+  if (bad === 0) {
+    checks.push({
+      name: `trusted_sources.${name}`,
+      passed: true,
+      message: `${bucket.length} entr${bucket.length === 1 ? "y" : "ies"}`,
+    });
+  }
+}
 
 /**
- * Validate a protection card object.
- * Schema: mode, thresholds, screen_surfaces, trusted_sources
+ * Validate a protection card against ADR-037 canonical form.
+ *
+ * Required: card_version, agent_id, mode (off|observe|nudge|enforce).
+ * Optional: thresholds (warn ≤ quarantine ≤ block, all in [0,1]),
+ *           screen_surfaces (object of bools with the four named keys),
+ *           trusted_sources (object of typed buckets, per-bucket deny-lists).
  */
 export function validateProtectionCard(card: Record<string, unknown>): ValidationCheck[] {
   const checks: ValidationCheck[] = [];
 
-  // mode: required, must be observe | warn | block
-  const mode = card.mode;
-  if (typeof mode === "string" && VALID_MODES.has(mode)) {
-    checks.push({ name: "mode", passed: true, message: mode });
-  } else if (mode === undefined) {
-    checks.push({ name: "mode", passed: false, message: "Required (observe | warn | block)" });
+  // ── card_version (required) ──
+  if (typeof card.card_version !== "string" || card.card_version.length === 0) {
+    checks.push({
+      name: "card_version",
+      passed: false,
+      message: 'Required (string, e.g. "protection/2026-04-26"). See ADR-037.',
+    });
   } else {
-    checks.push({ name: "mode", passed: false, message: `Invalid: "${mode}". Must be observe | warn | block` });
+    checks.push({ name: "card_version", passed: true, message: card.card_version });
   }
 
-  // thresholds: optional, if present must have warn/quarantine/block in ascending order (0-1)
-  const thresholds = card.thresholds as Record<string, unknown> | undefined;
-  if (thresholds !== undefined) {
-    if (typeof thresholds !== "object" || thresholds === null) {
-      checks.push({ name: "thresholds", passed: false, message: "Must be an object" });
-    } else {
-      const w = thresholds.warn as number | undefined;
-      const q = thresholds.quarantine as number | undefined;
-      const b = thresholds.block as number | undefined;
+  // ── agent_id (required) ──
+  if (typeof card.agent_id !== "string" || card.agent_id.length === 0) {
+    checks.push({
+      name: "agent_id",
+      passed: false,
+      message: "Required (string).",
+    });
+  } else {
+    checks.push({ name: "agent_id", passed: true, message: card.agent_id });
+  }
 
-      if (w === undefined || q === undefined || b === undefined) {
-        checks.push({ name: "thresholds", passed: false, message: "Must have warn, quarantine, and block fields" });
-      } else if (typeof w !== "number" || typeof q !== "number" || typeof b !== "number") {
-        checks.push({ name: "thresholds", passed: false, message: "Values must be numbers" });
-      } else if (w < 0 || w > 1 || q < 0 || q > 1 || b < 0 || b > 1) {
-        checks.push({ name: "thresholds", passed: false, message: "Values must be between 0 and 1" });
-      } else if (!(w <= q && q <= b)) {
-        checks.push({ name: "thresholds", passed: false, message: `Must be in ascending order (warn=${w} <= quarantine=${q} <= block=${b})` });
-      } else {
-        checks.push({ name: "thresholds", passed: true, message: `warn=${w}, quarantine=${q}, block=${b}` });
+  // ── mode (required, ADR-037 canonical enum) ──
+  const mode = card.mode;
+  if (typeof mode !== "string") {
+    checks.push({
+      name: "mode",
+      passed: false,
+      message: `Required. Must be one of: ${PROTECTION_MODES.join(" | ")}. Per ADR-037 the legacy "block"/"warn" values are no longer accepted.`,
+    });
+  } else if (!(PROTECTION_MODES as readonly string[]).includes(mode)) {
+    checks.push({
+      name: "mode",
+      passed: false,
+      message: `Invalid: "${mode}". Must be one of: ${PROTECTION_MODES.join(" | ")}. (Per ADR-037 the legacy "block"/"warn" values are no longer accepted; use "enforce"/"nudge".)`,
+    });
+  } else {
+    checks.push({ name: "mode", passed: true, message: mode });
+  }
+
+  // ── thresholds (optional) ──
+  if (card.thresholds !== undefined) {
+    if (!isObject(card.thresholds)) {
+      checks.push({ name: "thresholds", passed: false, message: "Must be an object if present" });
+    } else {
+      const t = card.thresholds as Record<string, unknown>;
+      const nums: Record<string, number | undefined> = {};
+      let bad = false;
+      for (const key of ["warn", "quarantine", "block"] as const) {
+        const v = t[key];
+        if (v === undefined) {
+          checks.push({
+            name: `thresholds.${key}`,
+            passed: false,
+            message: "Required when thresholds is present",
+          });
+          bad = true;
+          continue;
+        }
+        if (typeof v !== "number" || v < 0 || v > 1 || Number.isNaN(v)) {
+          checks.push({
+            name: `thresholds.${key}`,
+            passed: false,
+            message: "Must be a number in [0, 1]",
+          });
+          bad = true;
+          continue;
+        }
+        nums[key] = v;
+      }
+      if (nums.warn !== undefined && nums.quarantine !== undefined && nums.warn > nums.quarantine) {
+        checks.push({
+          name: "thresholds.warn",
+          passed: false,
+          message: `Must be ≤ thresholds.quarantine (warn=${nums.warn} > quarantine=${nums.quarantine})`,
+        });
+        bad = true;
+      }
+      if (nums.quarantine !== undefined && nums.block !== undefined && nums.quarantine > nums.block) {
+        checks.push({
+          name: "thresholds.quarantine",
+          passed: false,
+          message: `Must be ≤ thresholds.block (quarantine=${nums.quarantine} > block=${nums.block})`,
+        });
+        bad = true;
+      }
+      if (!bad) {
+        checks.push({
+          name: "thresholds",
+          passed: true,
+          message: `warn=${nums.warn}, quarantine=${nums.quarantine}, block=${nums.block}`,
+        });
       }
     }
   }
 
-  // screen_surfaces: optional, array of strings
-  const surfaces = card.screen_surfaces;
-  if (surfaces !== undefined) {
-    if (!Array.isArray(surfaces)) {
-      checks.push({ name: "screen_surfaces", passed: false, message: "Must be an array" });
-    } else if (surfaces.some((s: unknown) => typeof s !== "string")) {
-      checks.push({ name: "screen_surfaces", passed: false, message: "All entries must be strings" });
+  // ── screen_surfaces (optional, object of bools) ──
+  if (card.screen_surfaces !== undefined) {
+    if (Array.isArray(card.screen_surfaces)) {
+      checks.push({
+        name: "screen_surfaces",
+        passed: false,
+        message: 'Must be an object of booleans, not an array. Per ADR-037 use { incoming: true, outgoing: true, tool_calls: true, tool_responses: true }.',
+      });
+    } else if (!isObject(card.screen_surfaces)) {
+      checks.push({ name: "screen_surfaces", passed: false, message: "Must be an object if present" });
     } else {
-      checks.push({ name: "screen_surfaces", passed: true, message: `${surfaces.length} surface(s)` });
+      const s = card.screen_surfaces as Record<string, unknown>;
+      let bad = false;
+      for (const key of SURFACE_KEYS) {
+        const v = s[key];
+        if (v !== undefined && typeof v !== "boolean") {
+          checks.push({
+            name: `screen_surfaces.${key}`,
+            passed: false,
+            message: "Must be a boolean",
+          });
+          bad = true;
+        }
+      }
+      for (const key of Object.keys(s)) {
+        if (!(SURFACE_KEYS as readonly string[]).includes(key)) {
+          checks.push({
+            name: `screen_surfaces.${key}`,
+            passed: false,
+            message: `Unknown surface (allowed: ${SURFACE_KEYS.join(", ")})`,
+          });
+          bad = true;
+        }
+      }
+      if (!bad) {
+        const enabled = SURFACE_KEYS.filter(k => s[k] === true).length;
+        checks.push({
+          name: "screen_surfaces",
+          passed: true,
+          message: `${enabled}/${SURFACE_KEYS.length} surfaces enabled`,
+        });
+      }
     }
   }
 
-  // trusted_sources: optional, array of objects
-  const trusted = card.trusted_sources;
-  if (trusted !== undefined) {
-    if (!Array.isArray(trusted)) {
-      checks.push({ name: "trusted_sources", passed: false, message: "Must be an array" });
+  // ── trusted_sources (optional, typed buckets) ──
+  if (card.trusted_sources !== undefined) {
+    if (Array.isArray(card.trusted_sources)) {
+      checks.push({
+        name: "trusted_sources",
+        passed: false,
+        message: 'Must be an object of typed buckets, not an array. Per ADR-037 use { domains: [...], agent_ids: [...], ip_ranges: [...] } — the legacy [{pattern, ...}] shape is no longer accepted.',
+      });
+    } else if (!isObject(card.trusted_sources)) {
+      checks.push({ name: "trusted_sources", passed: false, message: "Must be an object if present" });
     } else {
-      checks.push({ name: "trusted_sources", passed: true, message: `${trusted.length} source(s)` });
+      const ts = card.trusted_sources as Record<string, unknown>;
+      validateTrustedBucket("domains", ts.domains, checks, validateDomain);
+      validateTrustedBucket("agent_ids", ts.agent_ids, checks, validateAgentId);
+      validateTrustedBucket("ip_ranges", ts.ip_ranges, checks, validateCidr);
+      for (const key of Object.keys(ts)) {
+        if (!["domains", "agent_ids", "ip_ranges"].includes(key)) {
+          checks.push({
+            name: `trusted_sources.${key}`,
+            passed: false,
+            message: "Unknown bucket (allowed: domains, agent_ids, ip_ranges)",
+          });
+        }
+      }
     }
   }
 
@@ -146,7 +370,11 @@ export async function protectionShowCommand(agentName?: string): Promise<void> {
   }
 }
 
-export async function protectionPublishCommand(file: string, agentName?: string): Promise<void> {
+export async function protectionPublishCommand(
+  file: string,
+  agentName?: string,
+  options: { idempotencyKey?: string } = {},
+): Promise<void> {
   const agentId = await resolveAgentId(agentName);
 
   const filePath = path.resolve(file);
@@ -202,7 +430,20 @@ export async function protectionPublishCommand(file: string, agentName?: string)
     console.log("\nPublishing protection card...");
     const contentType = parsed!.format === "yaml" ? "text/yaml" as const : "application/json" as const;
     const body = parsed!.format === "yaml" ? parsed!.raw : JSON.stringify(parsed!.parsed);
-    const result = await putProtectionCard(agentId, body, contentType);
+    const bodyBytes = Buffer.byteLength(body, "utf-8");
+    if (bodyBytes > PROTECTION_CARD_MAX_BYTES) {
+      console.log(
+        "\n" +
+          fmt.error(
+            `Protection card is ${bodyBytes} bytes; limit is ${PROTECTION_CARD_MAX_BYTES} bytes (64 KB). The API will return 413.`,
+          ) +
+          "\n",
+      );
+      process.exit(1);
+    }
+    const result = await putProtectionCard(agentId, body, contentType, {
+      idempotencyKey: options.idempotencyKey,
+    });
     console.log(fmt.success("Protection card published!"));
     console.log(fmt.label("  Card ID:", ` ${result.card_id}`));
     if (result.composed) {
@@ -261,7 +502,10 @@ export async function protectionValidateCommand(file: string): Promise<void> {
   }
 }
 
-export async function protectionEditCommand(agentName?: string): Promise<void> {
+export async function protectionEditCommand(
+  agentName?: string,
+  options: { idempotencyKey?: string } = {},
+): Promise<void> {
   const agentId = await resolveAgentId(agentName);
   await requireAuth();
 
@@ -273,10 +517,17 @@ export async function protectionEditCommand(agentName?: string): Promise<void> {
   }
 
   const cardYaml = original || yaml.dump({
+    card_version: "protection/2026-04-26",
+    agent_id: agentId,
     mode: "observe",
     thresholds: { warn: 0.3, quarantine: 0.6, block: 0.9 },
-    screen_surfaces: ["system_prompt", "tool_input", "tool_output"],
-    trusted_sources: [],
+    screen_surfaces: {
+      incoming: true,
+      outgoing: true,
+      tool_calls: true,
+      tool_responses: true,
+    },
+    trusted_sources: { domains: [], agent_ids: [], ip_ranges: [] },
   }, { lineWidth: 120, noRefs: true });
 
   const tmpDir = os.tmpdir();
@@ -335,7 +586,20 @@ export async function protectionEditCommand(agentName?: string): Promise<void> {
 
   try {
     console.log("\nPublishing protection card...");
-    const putResult = await putProtectionCard(agentId, edited, "text/yaml");
+    const editedBytes = Buffer.byteLength(edited, "utf-8");
+    if (editedBytes > PROTECTION_CARD_MAX_BYTES) {
+      console.log(
+        "\n" +
+          fmt.error(
+            `Protection card is ${editedBytes} bytes; limit is ${PROTECTION_CARD_MAX_BYTES} bytes (64 KB). The API will return 413.`,
+          ) +
+          "\n",
+      );
+      process.exit(1);
+    }
+    const putResult = await putProtectionCard(agentId, edited, "text/yaml", {
+      idempotencyKey: options.idempotencyKey,
+    });
     console.log(fmt.success("Protection card published!"));
     console.log(fmt.label("  Card ID:", ` ${putResult.card_id}`) + "\n");
   } catch (error) {

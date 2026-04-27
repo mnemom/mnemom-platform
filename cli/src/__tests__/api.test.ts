@@ -3,6 +3,9 @@ import {
   getAgent,
   getIntegrity,
   getTraces,
+  newIdempotencyKey,
+  putAlignmentCard,
+  putProtectionCard,
   API_BASE,
   type Agent,
   type IntegrityScore,
@@ -246,6 +249,116 @@ describe("api", () => {
       await expect(getTraces("smolt-abc12345")).rejects.toThrow(
         "API request failed: 503"
       );
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Idempotency-Key on mutations (ADR-039 / mnemom-api/src/idempotency.ts)
+  // The API short-circuits with 400 if PUT/POST/DELETE arrives without the
+  // header — every CLI mutation must mint or accept one.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("newIdempotencyKey", () => {
+    it("returns a UUIDv4 string", () => {
+      const key = newIdempotencyKey();
+      expect(key).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+    });
+
+    it("returns a different key on every call", () => {
+      const a = newIdempotencyKey();
+      const b = newIdempotencyKey();
+      expect(a).not.toEqual(b);
+    });
+  });
+
+  describe("putAlignmentCard", () => {
+    it("sends an Idempotency-Key header on every PUT", async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue({ card_id: "ac-1", composed: true }),
+      } as unknown as Response);
+
+      await putAlignmentCard("mnm-test", "card_version: x", "text/yaml");
+
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Idempotency-Key"]).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+    });
+
+    it("uses the explicit idempotencyKey when provided (retry case)", async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue({ card_id: "ac-1", composed: true }),
+      } as unknown as Response);
+
+      const explicitKey = "11111111-1111-4111-8111-111111111111";
+      await putAlignmentCard("mnm-test", "card_version: x", "text/yaml", {
+        idempotencyKey: explicitKey,
+      });
+
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Idempotency-Key"]).toBe(explicitKey);
+    });
+
+    it("mints a fresh key on every call when none is provided", async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue({ card_id: "ac-1", composed: true }),
+      } as unknown as Response);
+
+      await putAlignmentCard("mnm-test", "card_version: x", "text/yaml");
+      await putAlignmentCard("mnm-test", "card_version: x", "text/yaml");
+
+      const calls = vi.mocked(globalThis.fetch).mock.calls;
+      const k1 = (calls[0][1]!.headers as Record<string, string>)["Idempotency-Key"];
+      const k2 = (calls[1][1]!.headers as Record<string, string>)["Idempotency-Key"];
+      expect(k1).not.toEqual(k2);
+    });
+  });
+
+  describe("putProtectionCard", () => {
+    it("sends an Idempotency-Key header on every PUT", async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue({ card_id: "pc-1", composed: true }),
+      } as unknown as Response);
+
+      await putProtectionCard("mnm-test", "card_version: x", "text/yaml");
+
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Idempotency-Key"]).toBeTruthy();
+    });
+
+    it("uses the explicit idempotencyKey when provided", async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue({ card_id: "pc-1", composed: true }),
+      } as unknown as Response);
+
+      const explicitKey = "22222222-2222-4222-8222-222222222222";
+      await putProtectionCard("mnm-test", "card_version: x", "text/yaml", {
+        idempotencyKey: explicitKey,
+      });
+
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Idempotency-Key"]).toBe(explicitKey);
     });
   });
 });
