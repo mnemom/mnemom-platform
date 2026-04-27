@@ -10,17 +10,18 @@ export async function integrityCommand(agentName?: string): Promise<void> {
   try {
     const integrity = await getIntegrity(agentId);
 
-    const scorePercent = (integrity.score * 100).toFixed(1);
-    const scoreBar = generateScoreBar(integrity.score);
+    // Field names match the docs.mnemom.ai canonical IntegrityScore schema:
+    // integrity_score (in [0,1]), total_traces, verified_traces, violation_count.
+    const scorePercent = (integrity.integrity_score * 100).toFixed(1);
+    const scoreBar = generateScoreBar(integrity.integrity_score);
 
     console.log(fmt.header("Integrity Score"));
     console.log(`  ${fmt.label("Score:     ", `${scorePercent}% ${scoreBar}`)}`);
     console.log(`  ${fmt.label("Total:     ", `${integrity.total_traces} traces`)}`);
-    console.log(`  ${fmt.label("Verified:  ", `${integrity.verified}`)} ${fmt.success("")}`);
-    console.log(`  ${fmt.label("Violations:", ` ${integrity.violations}`)} ${fmt.error("")}`);
-    console.log(`  ${fmt.label("Updated:   ", integrity.last_updated)}`);
+    console.log(`  ${fmt.label("Verified:  ", `${integrity.verified_traces}`)}`);
+    console.log(`  ${fmt.label("Violations:", ` ${integrity.violation_count}`)}`);
 
-    if (integrity.violations > 0) {
+    if (integrity.violation_count > 0) {
       console.log("\n" + fmt.warn("You have integrity violations. Run `mnemom logs` to investigate.") + "\n");
     } else if (integrity.total_traces === 0) {
       console.log("\nNo traces recorded yet. Start using Claude to build your integrity score.\n");
