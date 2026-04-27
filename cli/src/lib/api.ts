@@ -40,13 +40,33 @@ export interface Agent {
   created_at: string;
 }
 
+/**
+ * Per docs.mnemom.ai/api-reference/openapi.json#components/schemas/IntegrityScore:
+ *
+ *   { agent_id, total_traces, verified_traces, violation_count, integrity_score }
+ *
+ * `integrity_score` is a value in [0, 1].
+ *
+ * Pre-this-fix the CLI's interface declared `score` / `verified` /
+ * `violations` / `last_updated` — none of which exist on the wire. The
+ * `mnemom integrity` command rendered every field as `undefined` (and the
+ * score as `NaN%`) against any agent. Field names now match the docs
+ * verbatim.
+ *
+ * NOTE — API shape divergence (flagged for a follow-up mnemom-api PR):
+ * the RPC path in handleGetIntegrity returns an *array* of one object
+ * (Supabase wraps TABLE-returning RPCs as arrays) without `agent_id`;
+ * the manual fallback returns the *object* with `agent_id`. The docs
+ * canonical is the object shape. We accept both shapes defensively in
+ * getIntegrity below so this CLI works against today's prod API and
+ * keeps working when the API normalizes to a single shape.
+ */
 export interface IntegrityScore {
-  agent_id: string;
-  score: number;
+  agent_id?: string;
   total_traces: number;
-  verified: number;
-  violations: number;
-  last_updated: string;
+  verified_traces: number;
+  violation_count: number;
+  integrity_score: number;
 }
 
 export interface Trace {
@@ -246,7 +266,25 @@ export async function getIntegrity(id: string): Promise<IntegrityScore> {
     }))) as ApiError;
     throw new Error(error.message || `API request failed: ${response.status}`);
   }
-  return response.json() as Promise<IntegrityScore>;
+  // Accept both the canonical docs shape (object) and the RPC-wrapped shape
+  // (array of one row). The latter is what prod actually returns today on
+  // the RPC path; flagged for a follow-up API normalization.
+  const body = (await response.json()) as IntegrityScore | IntegrityScore[];
+  const row: IntegrityScore = Array.isArray(body) ? (body[0] ?? emptyIntegrityRow(id)) : body;
+  // Fill in agent_id when the API didn't (RPC path) so the field is always
+  // populated for consumers regardless of which API path served the request.
+  if (!row.agent_id) row.agent_id = id;
+  return row;
+}
+
+function emptyIntegrityRow(agentId: string): IntegrityScore {
+  return {
+    agent_id: agentId,
+    total_traces: 0,
+    verified_traces: 0,
+    violation_count: 0,
+    integrity_score: 1,
+  };
 }
 
 /**

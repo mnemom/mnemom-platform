@@ -125,21 +125,20 @@ describe("api", () => {
   });
 
   describe("getIntegrity", () => {
-    it("should fetch integrity score by agent ID", async () => {
-      const mockIntegrity: IntegrityScore = {
+    it("returns the canonical IntegrityScore shape from the docs (object response)", async () => {
+      const apiResponse: IntegrityScore = {
         agent_id: "smolt-abc12345",
-        score: 95.5,
         total_traces: 100,
-        verified: 95,
-        violations: 5,
-        last_updated: "2024-01-15T12:00:00Z",
+        verified_traces: 95,
+        violation_count: 5,
+        integrity_score: 0.95,
       };
 
-      mockFetchResponse(mockIntegrity);
+      mockFetchResponse(apiResponse);
 
       const result = await getIntegrity("smolt-abc12345");
 
-      expect(result).toEqual(mockIntegrity);
+      expect(result).toEqual(apiResponse);
       // PR-B: getIntegrity now sends auth headers via fetchWithAuthRetry, so
       // the call signature is fetch(url, { headers }) — second arg present
       // (was previously just `fetch(url)`).
@@ -149,22 +148,53 @@ describe("api", () => {
       );
     });
 
-    it("should handle zero score", async () => {
-      const mockIntegrity: IntegrityScore = {
+    // Defensive — today's prod RPC path returns an array of one row (Supabase
+    // wraps TABLE-returning RPCs as arrays) without `agent_id`. Flagged as
+    // a follow-up mnemom-api PR; in the meantime the CLI unwraps and fills
+    // in agent_id from the request param.
+    it("unwraps the array shape from the RPC path and fills in agent_id", async () => {
+      mockFetchResponse([
+        {
+          total_traces: 100,
+          verified_traces: 95,
+          violation_count: 5,
+          integrity_score: 0.95,
+        },
+      ]);
+
+      const result = await getIntegrity("smolt-abc12345");
+
+      expect(result.agent_id).toBe("smolt-abc12345");
+      expect(result.integrity_score).toBe(0.95);
+      expect(result.verified_traces).toBe(95);
+      expect(result.violation_count).toBe(5);
+    });
+
+    it("handles a zero score (object response)", async () => {
+      const apiResponse: IntegrityScore = {
         agent_id: "smolt-newagent",
-        score: 0,
         total_traces: 0,
-        verified: 0,
-        violations: 0,
-        last_updated: "2024-01-15T00:00:00Z",
+        verified_traces: 0,
+        violation_count: 0,
+        integrity_score: 0,
       };
 
-      mockFetchResponse(mockIntegrity);
+      mockFetchResponse(apiResponse);
 
       const result = await getIntegrity("smolt-newagent");
 
-      expect(result.score).toBe(0);
+      expect(result.integrity_score).toBe(0);
       expect(result.total_traces).toBe(0);
+    });
+
+    it("falls back to a clean record when the API returns an empty array", async () => {
+      mockFetchResponse([]);
+
+      const result = await getIntegrity("smolt-empty");
+
+      expect(result.agent_id).toBe("smolt-empty");
+      expect(result.total_traces).toBe(0);
+      expect(result.integrity_score).toBe(1);
     });
 
     it("should throw error when integrity not found", async () => {
@@ -497,11 +527,10 @@ describe("api", () => {
 
       mockFetchResponse({
         agent_id: "mnm-x",
-        score: 1,
         total_traces: 0,
-        verified: 0,
-        violations: 0,
-        last_updated: "2026-04-27T00:00:00Z",
+        verified_traces: 0,
+        violation_count: 0,
+        integrity_score: 1,
       });
 
       await getIntegrity("mnm-x");
@@ -525,16 +554,15 @@ describe("api", () => {
           statusText: "OK",
           json: vi.fn().mockResolvedValue({
             agent_id: "mnm-x",
-            score: 0.9,
             total_traces: 10,
-            verified: 9,
-            violations: 1,
-            last_updated: "2026-04-27T00:00:00Z",
+            verified_traces: 9,
+            violation_count: 1,
+            integrity_score: 0.9,
           }),
         } as unknown as Response);
 
       const result = await getIntegrity("mnm-x");
-      expect(result.score).toBe(0.9);
+      expect(result.integrity_score).toBe(0.9);
       expect(vi.mocked(globalThis.fetch).mock.calls.length).toBe(2);
     });
   });

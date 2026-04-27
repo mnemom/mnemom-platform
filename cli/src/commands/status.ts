@@ -396,12 +396,14 @@ async function showTraceSummary(agentId: string): Promise<void> {
 
     if (integrityResult.status === "fulfilled") {
       const integrity = integrityResult.value;
-      const score = (integrity.score * 100).toFixed(1);
+      // Field names per docs.mnemom.ai IntegrityScore: integrity_score
+      // (in [0,1]), verified_traces, violation_count.
+      const score = (integrity.integrity_score * 100).toFixed(1);
       console.log(`Integrity Score: ${score}%`);
       console.log(`Total Traces:    ${integrity.total_traces}`);
-      console.log(`Verified:        ${integrity.verified}`);
-      if (integrity.violations > 0) {
-        console.log(`Violations:      ${integrity.violations}`);
+      console.log(`Verified:        ${integrity.verified_traces}`);
+      if (integrity.violation_count > 0) {
+        console.log(`Violations:      ${integrity.violation_count}`);
       }
     } else {
       console.log("Integrity: No data yet");
