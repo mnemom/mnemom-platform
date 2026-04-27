@@ -2,183 +2,211 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { validateUnifiedCard, validateCardJson, parseCardFile, type ValidationCheck } from "../commands/card.js";
+import { validateUnifiedCard, validateCardJson, parseCardFile } from "../commands/card.js";
 
 // ============================================================================
-// Unified card validation tests (ADR-008 schema)
+// Unified alignment-card validation tests (ADR-039 canonical form)
 // ============================================================================
 
-describe("validateUnifiedCard", () => {
-  it("should pass for a valid card with all required sections", () => {
-    const card = {
-      principal: { name: "TestBot", type: "ai_agent" },
-      values: {
-        declared: ["transparency", "honesty"],
-      },
-      autonomy: {
-        bounded_actions: ["code_generation", "file_read"],
-        forbidden_actions: ["delete_data"],
-        escalation_triggers: [
-          { condition: "high_risk_action", action: "notify_human" },
-        ],
-      },
-    };
+/** Minimal card that should pass every check. */
+const validCard = () => ({
+  card_version: "unified/2026-04-26",
+  agent_id: "mnm-aabbccdd-eeff-0011-2233-445566778899",
+  autonomy_mode: "observe",
+  integrity_mode: "observe",
+  principal: {
+    type: "agent",
+    identifier: "mnm-aabbccdd-eeff-0011-2233-445566778899",
+    relationship: "delegated_authority",
+  },
+  values: { declared: ["transparency", "honesty"] },
+  autonomy: {
+    bounded_actions: ["respond_to_prompts"],
+    forbidden_actions: [],
+    escalation_triggers: [],
+  },
+  audit: { retention_days: 30, queryable: false, trace_format: "otel" },
+});
 
-    const checks = validateUnifiedCard(card);
-    const allPassed = checks.every((c) => c.passed);
-    expect(allPassed).toBe(true);
+describe("validateUnifiedCard — ADR-039 canonical form", () => {
+  it("passes for a minimal valid card", () => {
+    const checks = validateUnifiedCard(validCard());
+    const failed = checks.filter(c => !c.passed);
+    expect(failed, JSON.stringify(failed, null, 2)).toHaveLength(0);
   });
 
-  it("should fail when required sections are missing", () => {
-    const card = { principal: { name: "TestBot" } };
+  it("requires card_version", () => {
+    const card = validCard() as Record<string, unknown>;
+    delete card.card_version;
     const checks = validateUnifiedCard(card);
-
-    const principalCheck = checks.find((c) => c.name === "Section: principal");
-    const valuesCheck = checks.find((c) => c.name === "Section: values");
-    const autonomyCheck = checks.find((c) => c.name === "Section: autonomy");
-
-    expect(principalCheck?.passed).toBe(true);
-    expect(valuesCheck?.passed).toBe(false);
-    expect(autonomyCheck?.passed).toBe(false);
+    expect(checks.find(c => c.name === "card_version")?.passed).toBe(false);
   });
 
-  it("should pass with optional sections present", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: ["transparency"] },
-      autonomy: { bounded_actions: ["x"] },
-      conscience: { mode: "advisory" },
-      integrity: { enforcement_mode: "strict" },
-      capabilities: {},
-      enforcement: { mode: "observe" },
-      audit: { log_level: "full" },
-      extensions: { custom: true },
-    };
-
+  it("requires agent_id", () => {
+    const card = validCard() as Record<string, unknown>;
+    delete card.agent_id;
     const checks = validateUnifiedCard(card);
-    expect(checks.every((c) => c.passed)).toBe(true);
+    expect(checks.find(c => c.name === "agent_id")?.passed).toBe(false);
   });
 
-  it("should fail when optional section is not an object", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: ["transparency"] },
-      autonomy: { bounded_actions: ["x"] },
-      conscience: "invalid",
-    };
-
+  it("requires top-level autonomy_mode", () => {
+    const card = validCard() as Record<string, unknown>;
+    delete card.autonomy_mode;
     const checks = validateUnifiedCard(card);
-    const conscienceCheck = checks.find((c) => c.name === "Section: conscience");
-    expect(conscienceCheck?.passed).toBe(false);
+    const check = checks.find(c => c.name === "autonomy_mode");
+    expect(check?.passed).toBe(false);
+    expect(check?.message).toMatch(/required/i);
   });
 
-  it("should fail when values.declared is empty", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: [] },
-      autonomy: { bounded_actions: ["x"] },
-    };
-
+  it("requires top-level integrity_mode", () => {
+    const card = validCard() as Record<string, unknown>;
+    delete card.integrity_mode;
     const checks = validateUnifiedCard(card);
-    const declaredCheck = checks.find((c) => c.name === "values.declared");
-    expect(declaredCheck?.passed).toBe(false);
+    const check = checks.find(c => c.name === "integrity_mode");
+    expect(check?.passed).toBe(false);
   });
 
-  it("should fail when custom values lack definitions", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: {
-        declared: ["transparency", "custom_value_1", "custom_value_2"],
-        definitions: { custom_value_1: "A custom value" },
-      },
-      autonomy: { bounded_actions: ["x"] },
-    };
-
+  it("rejects autonomy_mode outside the enum", () => {
+    const card = { ...validCard(), autonomy_mode: "block" };
     const checks = validateUnifiedCard(card);
-    const defCheck = checks.find((c) => c.name === "Custom value definitions");
-    expect(defCheck?.passed).toBe(false);
-    expect(defCheck?.message).toContain("custom_value_2");
+    const check = checks.find(c => c.name === "autonomy_mode");
+    expect(check?.passed).toBe(false);
+    expect(check?.message).toContain("off | observe | nudge | enforce");
   });
 
-  it("should pass when all custom values have definitions", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: {
-        declared: ["transparency", "custom_value_1"],
-        definitions: { custom_value_1: "A custom value" },
-      },
-      autonomy: { bounded_actions: ["x"] },
-    };
-
+  it("rejects legacy integrity.enforcement_mode with a pointer to integrity_mode", () => {
+    const card = { ...validCard(), integrity: { enforcement_mode: "strict" } };
     const checks = validateUnifiedCard(card);
-    const defCheck = checks.find((c) => c.name === "Custom value definitions");
-    expect(defCheck?.passed).toBe(true);
+    const check = checks.find(c => c.name === "integrity.enforcement_mode");
+    expect(check?.passed).toBe(false);
+    expect(check?.message).toContain("integrity_mode");
   });
 
-  it("should pass when all values are standard", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: ["transparency", "honesty", "safety"] },
-      autonomy: { bounded_actions: ["x"] },
-    };
-
+  it("rejects legacy enforcement.mode", () => {
+    const card = { ...validCard(), enforcement: { mode: "observe" } };
     const checks = validateUnifiedCard(card);
-    const defCheck = checks.find((c) => c.name === "Custom value definitions");
-    expect(defCheck?.passed).toBe(true);
-    expect(defCheck?.message).toContain("all standard");
+    const check = checks.find(c => c.name === "enforcement.mode");
+    expect(check?.passed).toBe(false);
+    expect(check?.message).toContain("autonomy_mode");
   });
 
-  it("should fail when bounded_actions is empty", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: ["transparency"] },
-      autonomy: { bounded_actions: [] },
-    };
-
+  it("rejects legacy enforcement.unmapped_tool_action", () => {
+    const card = { ...validCard(), enforcement: { unmapped_tool_action: "deny" } };
     const checks = validateUnifiedCard(card);
-    const boundedCheck = checks.find((c) => c.name === "autonomy.bounded_actions");
-    expect(boundedCheck?.passed).toBe(false);
+    expect(checks.find(c => c.name === "enforcement.unmapped_tool_action")?.passed).toBe(false);
   });
 
-  it("should validate capabilities shape", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: ["transparency"] },
-      autonomy: { bounded_actions: ["x"] },
-      capabilities: {
-        web_fetch: {
-          tools: ["WebFetch"],
-          required_actions: ["web_fetch"],
-        },
-        broken: {
-          tools: "not-an-array",
-        },
-      },
-    };
-
+  it("rejects legacy enforcement.fail_open", () => {
+    const card = { ...validCard(), enforcement: { fail_open: true } };
     const checks = validateUnifiedCard(card);
-    const brokenToolsCheck = checks.find((c) => c.name === "capabilities.broken.tools");
-    const brokenActionsCheck = checks.find((c) => c.name === "capabilities.broken.required_actions");
-    expect(brokenToolsCheck?.passed).toBe(false);
-    expect(brokenActionsCheck?.passed).toBe(false);
+    expect(checks.find(c => c.name === "enforcement.fail_open")?.passed).toBe(false);
   });
 
-  it("should validate enforcement.forbidden_tools shape", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: ["transparency"] },
-      autonomy: { bounded_actions: ["x"] },
-      enforcement: {
-        forbidden_tools: [
-          { pattern: "mcp__*__delete*", reason: "No deletion" },
-          { pattern: "missing-reason" },
-        ],
-      },
-    };
-
+  it("rejects legacy audit.storage", () => {
+    const card = validCard();
+    (card.audit as any).storage = "s3://bucket";
     const checks = validateUnifiedCard(card);
-    const invalidRule = checks.find((c) => c.name === "enforcement.forbidden_tools[1]");
-    expect(invalidRule?.passed).toBe(false);
+    expect(checks.find(c => c.name === "audit.storage")?.passed).toBe(false);
+  });
+
+  it("rejects legacy capabilities.<n>.required_actions", () => {
+    const card = {
+      ...validCard(),
+      capabilities: { web_fetch: { tools: ["WebFetch"], required_actions: ["web_fetch"] } },
+    };
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "capabilities.web_fetch.required_actions")?.passed).toBe(false);
+  });
+
+  it("rejects _composition on inbound cards", () => {
+    const card = { ...validCard(), _composition: { sources: [] } };
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "_composition")?.passed).toBe(false);
+  });
+
+  it("requires principal.identifier when type != unspecified", () => {
+    const card = validCard();
+    delete (card.principal as any).identifier;
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "principal.identifier")?.passed).toBe(false);
+  });
+
+  it("does not require principal.identifier when type=unspecified", () => {
+    const card = validCard();
+    (card.principal as any).type = "unspecified";
+    delete (card.principal as any).identifier;
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "principal.identifier")).toBeUndefined();
+  });
+
+  it("rejects invalid principal.type", () => {
+    const card = validCard();
+    (card.principal as any).type = "ai_agent";
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "principal.type")?.passed).toBe(false);
+  });
+
+  it("rejects invalid principal.relationship", () => {
+    const card = validCard();
+    (card.principal as any).relationship = "owner";
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "principal.relationship")?.passed).toBe(false);
+  });
+
+  it("requires non-empty values.declared", () => {
+    const card = validCard();
+    (card.values as any).declared = [];
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "values.declared")?.passed).toBe(false);
+  });
+
+  it("requires definitions ⊆ declared", () => {
+    const card = validCard();
+    (card.values as any).definitions = { transparency: "ok", undefined_value: "extra" };
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "values.definitions.undefined_value")?.passed).toBe(false);
+  });
+
+  it("requires non-empty autonomy.bounded_actions", () => {
+    const card = validCard();
+    (card.autonomy as any).bounded_actions = [];
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "autonomy.bounded_actions")?.passed).toBe(false);
+  });
+
+  it("rejects bounded_actions ∩ forbidden_actions", () => {
+    const card = validCard();
+    (card.autonomy as any).bounded_actions = ["respond_to_prompts", "delete_data"];
+    (card.autonomy as any).forbidden_actions = ["delete_data"];
+    const checks = validateUnifiedCard(card);
+    const overlap = checks.find(c => c.name === "autonomy.bounded_actions" && !c.passed);
+    expect(overlap?.message).toContain("disjoint");
+  });
+
+  it("rejects BOUNDARY + advisory in conscience", () => {
+    const card = validCard() as any;
+    card.conscience = {
+      mode: "augment",
+      values: [{ type: "BOUNDARY", content: "no harm", severity: "advisory" }],
+    };
+    const checks = validateUnifiedCard(card);
+    const idx = checks.findIndex(c => c.name === "conscience.values[0]" && !c.passed);
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(checks[idx].message).toMatch(/BOUNDARY.*advisory/);
+  });
+
+  it("requires audit section", () => {
+    const card = validCard() as Record<string, unknown>;
+    delete card.audit;
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "audit")?.passed).toBe(false);
+  });
+
+  it("requires audit.query_endpoint when queryable=true", () => {
+    const card = validCard();
+    (card.audit as any).queryable = true;
+    const checks = validateUnifiedCard(card);
+    expect(checks.find(c => c.name === "audit.query_endpoint")?.passed).toBe(false);
   });
 });
 
@@ -187,20 +215,15 @@ describe("validateUnifiedCard", () => {
 // ============================================================================
 
 describe("validateCardJson (deprecated compat)", () => {
-  it("should parse JSON and validate", () => {
-    const card = {
-      principal: { name: "TestBot" },
-      values: { declared: ["transparency"] },
-      autonomy: { bounded_actions: ["x"] },
-    };
-
-    const checks = validateCardJson(JSON.stringify(card));
-    expect(checks.every((c) => c.passed)).toBe(true);
+  it("parses JSON and validates", () => {
+    const checks = validateCardJson(JSON.stringify(validCard()));
+    const failed = checks.filter(c => !c.passed);
+    expect(failed, JSON.stringify(failed, null, 2)).toHaveLength(0);
   });
 });
 
 // ============================================================================
-// YAML card parsing tests
+// YAML/JSON parsing tests
 // ============================================================================
 
 describe("parseCardFile", () => {
@@ -214,84 +237,74 @@ describe("parseCardFile", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  const validCard = {
-    principal: { name: "TestBot", type: "ai_agent" },
-    values: { declared: ["transparency", "honesty"] },
-    autonomy: {
-      bounded_actions: ["code_generation"],
-      escalation_triggers: [{ condition: "high_risk", action: "notify" }],
-    },
-  };
-
-  const validYaml = `principal:
-  name: TestBot
-  type: ai_agent
+  const validYaml = `card_version: unified/2026-04-26
+agent_id: mnm-aabbccdd-eeff-0011-2233-445566778899
+autonomy_mode: observe
+integrity_mode: observe
+principal:
+  type: agent
+  identifier: mnm-aabbccdd-eeff-0011-2233-445566778899
+  relationship: delegated_authority
 values:
   declared:
     - transparency
     - honesty
 autonomy:
   bounded_actions:
-    - code_generation
-  escalation_triggers:
-    - condition: high_risk
-      action: notify
+    - respond_to_prompts
+audit:
+  retention_days: 30
+  queryable: false
+  trace_format: otel
 `;
 
-  it("should parse a valid YAML card file", () => {
+  it("parses a valid YAML card file", () => {
     const filePath = path.join(tmpDir, "card.yaml");
     fs.writeFileSync(filePath, validYaml);
 
     const result = parseCardFile(filePath);
     expect(result.format).toBe("yaml");
-    expect((result.parsed.principal as any).name).toBe("TestBot");
-    expect((result.parsed.values as any).declared).toEqual(["transparency", "honesty"]);
+    expect(result.parsed.autonomy_mode).toBe("observe");
+    expect(result.parsed.integrity_mode).toBe("observe");
   });
 
-  it("should parse a .yml extension as YAML", () => {
+  it("treats .yml as YAML", () => {
     const filePath = path.join(tmpDir, "card.yml");
     fs.writeFileSync(filePath, validYaml);
-
-    const result = parseCardFile(filePath);
-    expect(result.format).toBe("yaml");
-    expect((result.parsed.principal as any).name).toBe("TestBot");
+    expect(parseCardFile(filePath).format).toBe("yaml");
   });
 
-  it("should parse a valid JSON card file", () => {
+  it("parses a valid JSON card file", () => {
     const filePath = path.join(tmpDir, "card.json");
-    fs.writeFileSync(filePath, JSON.stringify(validCard));
-
+    fs.writeFileSync(filePath, JSON.stringify(validCard()));
     const result = parseCardFile(filePath);
     expect(result.format).toBe("json");
-    expect((result.parsed.principal as any).name).toBe("TestBot");
+    expect(result.parsed.autonomy_mode).toBe("observe");
   });
 
-  it("should include raw content in result", () => {
+  it("includes raw content in the result", () => {
     const filePath = path.join(tmpDir, "card.yaml");
     fs.writeFileSync(filePath, validYaml);
-
-    const result = parseCardFile(filePath);
-    expect(result.raw).toBe(validYaml);
+    expect(parseCardFile(filePath).raw).toBe(validYaml);
   });
 
-  it("should throw on invalid YAML", () => {
+  it("throws on invalid YAML", () => {
     const filePath = path.join(tmpDir, "bad.yaml");
     fs.writeFileSync(filePath, ":\n  invalid: [yaml\n  broken");
-
     expect(() => parseCardFile(filePath)).toThrow();
   });
 
-  it("should throw on YAML that produces a non-object", () => {
+  it("throws on YAML that produces a non-object", () => {
     const filePath = path.join(tmpDir, "scalar.yaml");
     fs.writeFileSync(filePath, "just a string");
-
     expect(() => parseCardFile(filePath)).toThrow("YAML did not produce a valid object");
   });
 
-  it("should produce identical validation results for YAML and JSON of the same card", () => {
+  it("produces identical validation results for YAML and JSON of the same card", () => {
+    const card = validCard();
     const jsonPath = path.join(tmpDir, "card.json");
     const yamlPath = path.join(tmpDir, "card.yaml");
-    fs.writeFileSync(jsonPath, JSON.stringify(validCard));
+    fs.writeFileSync(jsonPath, JSON.stringify(card));
     fs.writeFileSync(yamlPath, validYaml);
 
     const jsonResult = parseCardFile(jsonPath);
