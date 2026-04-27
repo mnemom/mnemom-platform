@@ -225,15 +225,64 @@ export async function getAgentByName(name: string): Promise<AgentListItem | null
   return null;
 }
 
+/**
+ * Fetch the integrity score for an agent.
+ *
+ * `/v1/integrity/:id` is the public-when-agent-is-public, owner-otherwise
+ * data route. The CLI must send the owner's auth header so private claimed
+ * agents (the common case for customers and internal users) return 200
+ * instead of 401. fetchWithAuthRetry inherits the 401-retry-with-refresh
+ * path from PR #200 so a stale local expiresAt heals transparently.
+ */
 export async function getIntegrity(id: string): Promise<IntegrityScore> {
-  return fetchApi<IntegrityScore>(`/v1/integrity/${id}`);
+  const url = validateUrl(`${API_BASE}/v1/integrity/${id}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: await authHeaders(),
+  }));
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `API request failed: ${response.status}`);
+  }
+  return response.json() as Promise<IntegrityScore>;
 }
 
+/**
+ * Fetch recent traces for an agent.
+ *
+ * The API returns an envelope `{ traces, limit, offset }` (see
+ * mnemom-api/src/index.ts:handleGetTraces). Pre-this-fix the CLI typed
+ * the response as `Trace[]` and downstream code crashed with "traces is
+ * not iterable" because the envelope is not iterable. We unwrap the
+ * envelope here and return the bare array so callers (logs.ts) can keep
+ * the simpler shape.
+ *
+ * Sends auth headers — same reasoning as getIntegrity. The pre-PR-A
+ * `{ traces: [], private: true }` leaky envelope branch is gone, so we
+ * don't need a special case for it.
+ */
 export async function getTraces(
   id: string,
   limit: number = 10
 ): Promise<Trace[]> {
-  return fetchApi<Trace[]>(`/v1/traces?agent_id=${id}&limit=${limit}`);
+  const url = validateUrl(`${API_BASE}/v1/traces?agent_id=${id}&limit=${limit}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: await authHeaders(),
+  }));
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({
+      error: "unknown",
+      message: response.statusText,
+    }))) as ApiError;
+    throw new Error(error.message || `API request failed: ${response.status}`);
+  }
+  const data = (await response.json()) as { traces?: Trace[] } | Trace[];
+  // Accept both the envelope shape (current API) and a bare array (defensive
+  // — staging is mid-deploy when a CLI smoke runs against an older API).
+  if (Array.isArray(data)) return data;
+  return data.traces ?? [];
 }
 
 // ============================================================================
@@ -468,6 +517,25 @@ export async function getAlignmentCard(
 export const ALIGNMENT_CARD_MAX_BYTES = 128 * 1024;
 
 /**
+ * Shape of a successful PUT response — the canonical card the composer
+ * just wrote, serialized as JSON via mnemom-api/src/composition/response.ts:
+ * respondCard with `_composition` stripped. We type the fields we display;
+ * the rest of the canonical card is allowed (and ignored at this layer).
+ *
+ * Pre-this-fix the typed return was `{ card_id, composed: boolean }` —
+ * a fictional wrapper. The API never returned a `composed` field; the CLI
+ * was rendering "Canonical card recomposed" gated on a value that, on the
+ * real wire, is always undefined. Drop the lie; reflect the actual shape.
+ */
+export interface PublishedCardResponse {
+  card_id?: string;
+  agent_id?: string;
+  card_version?: string;
+  issued_at?: string;
+  [key: string]: unknown;
+}
+
+/**
  * Publish (create or update) an alignment card.
  * Accepts YAML or JSON body; set contentType accordingly.
  */
@@ -476,7 +544,7 @@ export async function putAlignmentCard(
   body: string,
   contentType: "text/yaml" | "application/json" = "text/yaml",
   opts: { idempotencyKey?: string } = {},
-): Promise<{ card_id: string; composed: boolean }> {
+): Promise<PublishedCardResponse> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/alignment-card`);
   // Lock in a single Idempotency-Key for this logical mutation. If the auth
   // token is stale and the first attempt returns 401, fetchWithAuthRetry
@@ -510,7 +578,7 @@ export async function putAlignmentCard(
     throw new Error(error.message || `Failed to publish alignment card: ${response.status}`);
   }
 
-  return response.json() as Promise<{ card_id: string; composed: boolean }>;
+  return response.json() as Promise<PublishedCardResponse>;
 }
 
 /**
@@ -553,7 +621,7 @@ export async function putProtectionCard(
   body: string,
   contentType: "text/yaml" | "application/json" = "text/yaml",
   opts: { idempotencyKey?: string } = {},
-): Promise<{ card_id: string; composed: boolean }> {
+): Promise<PublishedCardResponse> {
   const url = validateUrl(`${API_BASE}/v1/agents/${agentId}/protection-card`);
   // See putAlignmentCard for why the Idempotency-Key is computed once outside
   // the retry closure.
@@ -580,7 +648,7 @@ export async function putProtectionCard(
     throw new Error(error.message || `Failed to publish protection card: ${response.status}`);
   }
 
-  return response.json() as Promise<{ card_id: string; composed: boolean }>;
+  return response.json() as Promise<PublishedCardResponse>;
 }
 
 // ============================================================================

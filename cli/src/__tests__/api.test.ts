@@ -140,8 +140,12 @@ describe("api", () => {
       const result = await getIntegrity("smolt-abc12345");
 
       expect(result).toEqual(mockIntegrity);
+      // PR-B: getIntegrity now sends auth headers via fetchWithAuthRetry, so
+      // the call signature is fetch(url, { headers }) — second arg present
+      // (was previously just `fetch(url)`).
       expect(globalThis.fetch).toHaveBeenCalledWith(
-        `${API_BASE}/v1/integrity/smolt-abc12345`
+        `${API_BASE}/v1/integrity/smolt-abc12345`,
+        expect.objectContaining({ headers: expect.any(Object) }),
       );
     });
 
@@ -204,8 +208,10 @@ describe("api", () => {
       const result = await getTraces("smolt-abc12345");
 
       expect(result).toEqual(mockTraces);
+      // PR-B: getTraces now sends auth headers via fetchWithAuthRetry.
       expect(globalThis.fetch).toHaveBeenCalledWith(
-        `${API_BASE}/v1/traces?agent_id=smolt-abc12345&limit=10`
+        `${API_BASE}/v1/traces?agent_id=smolt-abc12345&limit=10`,
+        expect.objectContaining({ headers: expect.any(Object) }),
       );
     });
 
@@ -218,7 +224,8 @@ describe("api", () => {
 
       expect(result).toEqual([]);
       expect(globalThis.fetch).toHaveBeenCalledWith(
-        `${API_BASE}/v1/traces?agent_id=smolt-abc12345&limit=50`
+        `${API_BASE}/v1/traces?agent_id=smolt-abc12345&limit=50`,
+        expect.objectContaining({ headers: expect.any(Object) }),
       );
     });
 
@@ -468,6 +475,188 @@ describe("api", () => {
         putAlignmentCard("mnm-test", "card_version: x", "text/yaml"),
       ).rejects.toThrow();
       expect(vi.mocked(globalThis.fetch).mock.calls.length).toBe(1);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // getIntegrity sends auth headers
+  //
+  // Pre-PR-B getIntegrity used the unauth fetchApi helper. The API's
+  // /v1/integrity/:id route requires owner auth for private claimed agents
+  // (which is the common case), so unauth calls returned 403. CLI now
+  // sends authHeaders + uses fetchWithAuthRetry so 401s heal transparently.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("getIntegrity (auth)", () => {
+    it("sends an Authorization header on the request", async () => {
+      const auth = await import("../lib/auth.js");
+      vi.mocked(auth.resolveAuth).mockResolvedValueOnce({
+        type: "jwt",
+        token: "test-jwt-token",
+      });
+
+      mockFetchResponse({
+        agent_id: "mnm-x",
+        score: 1,
+        total_traces: 0,
+        verified: 0,
+        violations: 0,
+        last_updated: "2026-04-27T00:00:00Z",
+      });
+
+      await getIntegrity("mnm-x");
+
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe("Bearer test-jwt-token");
+    });
+
+    it("retries with a refreshed token on 401", async () => {
+      vi.mocked(globalThis.fetch)
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 401,
+          statusText: "Unauthorized",
+          json: vi.fn().mockResolvedValue({ error: "unauthorized" }),
+        } as unknown as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: vi.fn().mockResolvedValue({
+            agent_id: "mnm-x",
+            score: 0.9,
+            total_traces: 10,
+            verified: 9,
+            violations: 1,
+            last_updated: "2026-04-27T00:00:00Z",
+          }),
+        } as unknown as Response);
+
+      const result = await getIntegrity("mnm-x");
+      expect(result.score).toBe(0.9);
+      expect(vi.mocked(globalThis.fetch).mock.calls.length).toBe(2);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // getTraces handles the API envelope
+  //
+  // The API returns `{ traces, limit, offset }` (mnemom-api/src/index.ts:
+  // handleGetTraces). Pre-PR-B the CLI typed the response as Trace[] and
+  // crashed downstream with "traces is not iterable" against the envelope.
+  // CLI now unwraps; defensive against a bare-array shape too (older API).
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("getTraces (envelope)", () => {
+    it("unwraps the API envelope { traces, limit, offset }", async () => {
+      const traces: Trace[] = [
+        {
+          id: "trace-1",
+          agent_id: "mnm-x",
+          timestamp: "2026-04-27T00:00:00Z",
+          action: "respond",
+          verified: true,
+        },
+      ];
+      mockFetchResponse({ traces, limit: 10, offset: 0 });
+
+      const result = await getTraces("mnm-x");
+      expect(Array.isArray(result)).toBe(true);
+      expect(result).toEqual(traces);
+    });
+
+    it("returns [] when the envelope has no traces field", async () => {
+      mockFetchResponse({ limit: 10, offset: 0 });
+      const result = await getTraces("mnm-x");
+      expect(result).toEqual([]);
+    });
+
+    it("accepts a bare array (defensive — older API shape)", async () => {
+      const traces: Trace[] = [
+        {
+          id: "trace-1",
+          agent_id: "mnm-x",
+          timestamp: "2026-04-27T00:00:00Z",
+          action: "respond",
+          verified: true,
+        },
+      ];
+      mockFetchResponse(traces);
+      const result = await getTraces("mnm-x");
+      expect(result).toEqual(traces);
+    });
+
+    it("sends an Authorization header", async () => {
+      const auth = await import("../lib/auth.js");
+      vi.mocked(auth.resolveAuth).mockResolvedValueOnce({
+        type: "jwt",
+        token: "trace-jwt",
+      });
+      mockFetchResponse({ traces: [], limit: 10, offset: 0 });
+
+      await getTraces("mnm-x");
+
+      const init = vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit;
+      const headers = init.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe("Bearer trace-jwt");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // PublishedCardResponse — typed return matches API contract
+  //
+  // The API returns the canonical card directly (Unified*Card with
+  // _composition stripped). Pre-PR-B the CLI typed the return as
+  // `{ card_id, composed: boolean }` — a fictional wrapper. The composed
+  // field never existed on the wire. After PR-A both alignment and
+  // protection canonical reliably carry card_id; we surface it
+  // defensively (only print when present) since canonical can still be
+  // sparse on edge paths.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("PublishedCardResponse shape", () => {
+    it("putAlignmentCard returns the canonical card with card_id", async () => {
+      mockFetchResponse({
+        card_id: "ac-realfromserver",
+        agent_id: "mnm-x",
+        card_version: "unified/2026-04-27",
+        autonomy_mode: "observe",
+      });
+
+      const result = await putAlignmentCard("mnm-x", "card_version: x", "text/yaml");
+      expect(result.card_id).toBe("ac-realfromserver");
+      expect(result.agent_id).toBe("mnm-x");
+      // `composed` is no longer in the typed shape.
+      expect((result as Record<string, unknown>).composed).toBeUndefined();
+    });
+
+    it("putProtectionCard returns the canonical card with card_id (after PR-A composer parity)", async () => {
+      mockFetchResponse({
+        card_id: "pc-realfromserver",
+        agent_id: "mnm-x",
+        card_version: "protection/2026-04-27",
+        mode: "observe",
+      });
+
+      const result = await putProtectionCard("mnm-x", "card_version: x", "text/yaml");
+      expect(result.card_id).toBe("pc-realfromserver");
+      expect(result.agent_id).toBe("mnm-x");
+    });
+
+    it("putProtectionCard tolerates a missing card_id (graceful, no crash)", async () => {
+      // Defensive: pre-PR-A the protection canonical didn't include card_id.
+      // The CLI no longer prints "Card ID: undefined" — but the return value
+      // shape is still valid (card_id is optional on PublishedCardResponse).
+      mockFetchResponse({
+        agent_id: "mnm-x",
+        card_version: "protection/2026-04-27",
+        mode: "observe",
+      });
+
+      const result = await putProtectionCard("mnm-x", "card_version: x", "text/yaml");
+      expect(result.card_id).toBeUndefined();
+      expect(result.agent_id).toBe("mnm-x");
     });
   });
 });
