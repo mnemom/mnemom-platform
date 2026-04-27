@@ -857,14 +857,35 @@ async function processLog(
     fetchCanonicalAlignmentCard(agent_id, env),
   ]);
 
+  // ADR-039 Decision 1: read autonomy_mode (master switch for action-policing
+  // pipeline — gates trace verification + CLPI policy evaluation here on the
+  // observer side). Falls back to legacy enforcement.mode for canonicals
+  // composed before the dual-key window. Default 'observe' keeps existing
+  // observer behavior for any agent without explicit configuration.
+  const autonomyMode: 'off' | 'observe' | 'nudge' | 'enforce' = (() => {
+    if (!unifiedCard) return 'observe';
+    const u = unifiedCard as Record<string, any>;
+    const top = u.autonomy_mode;
+    if (top === 'off' || top === 'observe' || top === 'nudge' || top === 'enforce') return top;
+    const legacy = u.enforcement?.mode;
+    if (legacy === 'off') return 'off';
+    if (legacy === 'enforce') return 'enforce';
+    return 'observe';  // legacy 'warn' and unknown both → observe
+  })();
+
   // Analyze reasoning with Claude Haiku (card-aware)
   const analysis = await analyzeWithHaiku(context, env, card);
 
   // Build APTrace conformant trace object
   const trace = await buildTrace(log, metadata, context, analysis, card);
 
+  // ADR-039 Decision 1: autonomy_mode='off' → skip trace verification +
+  // policy evaluation. The trace itself is still submitted (audit data lives
+  // independent of the gating decision).
+  const verifyAndPolicyEnabled = autonomyMode !== 'off';
+
   // Verify trace against alignment card using AAP SDK
-  const verification = card ? verifyTrace(trace, card) : null;
+  const verification = (card && verifyAndPolicyEnabled) ? verifyTrace(trace, card) : null;
 
   if (verification && otelExporter) {
     otelExporter.recordVerification(verification);
@@ -874,7 +895,7 @@ async function processLog(
   // evaluator derives a Policy from card.capabilities + card.enforcement +
   // card.autonomy.escalation_triggers internally via extractPolicyFromCard.
   let policyResult: EvaluationResult | null = null;
-  if (unifiedCard) {
+  if (unifiedCard && verifyAndPolicyEnabled) {
     const tools = extractToolsFromTrace(trace);
     if (tools.length > 0) {
       policyResult = evaluatePolicy({
@@ -944,8 +965,29 @@ async function processLog(
   // Emit Safe House calibration signal for false negative detection (fire-and-forget)
   ctx.waitUntil(emitSHCalibrationSignal(agent_id, session_id, verification?.verified === false ? 'boundary_violation' : '', null, env));
 
-  // Check for behavioral drift (runs in background)
-  ctx.waitUntil(checkForDrift(agent_id, card, env, otelExporter));
+  // ADR-039 Decision 1: read integrity_mode (master switch for the values /
+  // conscience pipeline — gates drift detection on the observer side). Falls
+  // back to legacy integrity.enforcement_mode for canonicals composed before
+  // the dual-key window.
+  const integrityMode: 'off' | 'observe' | 'nudge' | 'enforce' = (() => {
+    if (!unifiedCard) return 'observe';
+    const u = unifiedCard as Record<string, any>;
+    const top = u.integrity_mode;
+    if (top === 'off' || top === 'observe' || top === 'nudge' || top === 'enforce') return top;
+    const legacy = u.integrity?.enforcement_mode;
+    if (legacy === 'observe' || legacy === 'nudge' || legacy === 'enforce') return legacy;
+    return 'observe';
+  })();
+
+  // Check for behavioral drift (runs in background) — gated by integrity_mode.
+  // 'off' means the customer has opted out of drift detection entirely.
+  if (integrityMode !== 'off') {
+    ctx.waitUntil(checkForDrift(agent_id, card, env, otelExporter));
+  } else {
+    console.log(JSON.stringify({
+      event: 'drift_check_skipped', agent_id, reason: 'integrity_mode_off',
+    }));
+  }
 
   // Deliver AAP webhooks (runs in background)
   ctx.waitUntil(deliverAAPWebhooks(trace, verification, policyResult, env));

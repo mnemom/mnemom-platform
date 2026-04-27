@@ -1051,11 +1051,22 @@ async function fetchAlignmentData(
       }));
       const aapShaped = mapUnifiedCardToAAP(canonical) as unknown as Record<string, any>;
       const consciencePayload = canonical.conscience as { values?: ConscienceValue[] } | undefined;
+      // ADR-039 Decision 1: prefer top-level integrity_mode (the new master
+      // switch governing AIP). Fall back to legacy integrity.enforcement_mode
+      // for canonicals composed before the dual-key window. The new vocabulary
+      // adds 'off' (skip checkpoint entirely) — older AIP code paths treat
+      // unknown values as 'observe' (fail-open), which is the safe behavior.
       const integrityPayload = canonical.integrity as { enforcement_mode?: string } | undefined;
+      const topLevelIntegrityMode = (canonical as Record<string, any>).integrity_mode;
+      const validModes = ['off', 'observe', 'nudge', 'enforce'];
+      const integrityMode =
+        typeof topLevelIntegrityMode === 'string' && validModes.includes(topLevelIntegrityMode)
+          ? topLevelIntegrityMode
+          : integrityPayload?.enforcement_mode ?? 'observe';
       return {
         card: aapShaped,
         conscienceValues: consciencePayload?.values ?? null,
-        enforcementMode: integrityPayload?.enforcement_mode ?? 'observe',
+        enforcementMode: integrityMode,
       };
     }
     // Canonical row missing — log loudly so the composition pipeline gets
@@ -2010,6 +2021,16 @@ async function analyzeStreamInBackground(
 
     if (!card) {
       console.log('[gateway/stream-aip] No alignment card found, skipping');
+      return;
+    }
+
+    // ADR-039 Decision 1: integrity_mode === 'off' means the customer / org /
+    // platform has opted out of AIP for this agent. Skip the checkpoint
+    // entirely — no Haiku call, no DB write, no telemetry.
+    if (enforcementMode === 'off') {
+      console.log(JSON.stringify({
+        event: 'aip_skipped', agent_id: agent.id, reason: 'integrity_mode_off',
+      }));
       return;
     }
 
@@ -4978,9 +4999,25 @@ export async function handleProviderProxy(
         // fetchAlignmentData handles request metadata; policy is not enforced.
         console.warn(`[gateway/policy] No canonical card for ${agent.id}; skipping policy enforcement`);
       } else {
+        // ADR-039 Decision 1: prefer top-level autonomy_mode (the new master
+        // switch governing CLPI policy). Fall back to legacy enforcement.mode
+        // for canonicals composed before the dual-key window. Map the new
+        // 4-mode vocabulary to the legacy 3-mode CLPI vocabulary so the rest
+        // of this branch (which is keyed off off|warn|enforce) keeps working
+        // unchanged: nudge → warn (gateway pre-PR-#5 doesn't render advisory
+        // annotations for CLPI; warn is the safe fallback that logs but
+        // doesn't block), observe → warn (log without blocking), off → off.
         const enforcement = (canonicalCard.enforcement ?? {}) as Record<string, any>;
+        const topLevelAutonomyMode = (canonicalCard as Record<string, any>).autonomy_mode;
+        const mapAutonomyToLegacy = (m: unknown): 'off' | 'warn' | 'enforce' | undefined => {
+          if (m === 'off') return 'off';
+          if (m === 'observe' || m === 'nudge') return 'warn';
+          if (m === 'enforce') return 'enforce';
+          return undefined;
+        };
         const enforcementMode: string =
           (agentSettings as any)?.policy_enforcement_mode ??
+          mapAutonomyToLegacy(topLevelAutonomyMode) ??
           enforcement.mode ??
           'warn';
 
@@ -5296,6 +5333,23 @@ export async function handleProviderProxy(
       // If no card available, forward with clear verdict
       if (!card) {
         console.log('[gateway/aip] No alignment card found, forwarding as clear');
+        responseHeaders.set('X-AIP-Verdict', 'clear');
+        responseHeaders.set('X-AIP-Synthetic', 'true');
+        return new Response(responseBodyText, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: responseHeaders,
+        });
+      }
+
+      // ADR-039 Decision 1: integrity_mode === 'off' means AIP is fully
+      // opted-out for this agent. Skip the checkpoint entirely and forward
+      // the response as clear. Distinct from the no-card path (this is an
+      // explicit opt-out, not a missing card).
+      if (enforcementMode === 'off') {
+        console.log(JSON.stringify({
+          event: 'aip_skipped', agent_id: agent.id, reason: 'integrity_mode_off',
+        }));
         responseHeaders.set('X-AIP-Verdict', 'clear');
         responseHeaders.set('X-AIP-Synthetic', 'true');
         return new Response(responseBodyText, {
