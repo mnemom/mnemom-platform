@@ -4932,6 +4932,154 @@ export async function writeBackDoorAdvisory(
   }
 }
 
+/**
+ * Append a suffix string to the per-provider text content slot of a
+ * buffered response (T0-8, ADR-040 §I10). Mirrors the format detection
+ * pattern used by replaceIntegrityViolationContent (T0-5) and
+ * applyBackDoorRedaction (T0-6).
+ *
+ *   - Anthropic: appends a new text block to `content[]`
+ *   - OpenAI: appends to the LAST choice's `message.content`
+ *   - Gemini: appends a new text part to the LAST candidate's parts
+ *   - Unrecognized: returns body unchanged (caller can fall back to
+ *     header-only signaling)
+ *
+ * Returns the modified body string + a flag indicating whether the
+ * suffix was actually applied. On parse failure or unrecognized shape,
+ * returns the body unchanged with `applied=false`.
+ */
+export function appendSuffixToProviderResponse(
+  originalBody: string,
+  suffix: string,
+): { body: string; applied: boolean } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(originalBody);
+  } catch {
+    return { body: originalBody, applied: false };
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { body: originalBody, applied: false };
+  }
+  const obj = parsed as Record<string, unknown>;
+
+  // Anthropic content[]
+  if (Array.isArray(obj.content)) {
+    obj.content = [
+      ...(obj.content as unknown[]),
+      { type: 'text', text: suffix },
+    ];
+    return { body: JSON.stringify(obj), applied: true };
+  }
+
+  // OpenAI choices[]
+  if (Array.isArray(obj.choices) && obj.choices.length > 0) {
+    const choices = obj.choices as Array<Record<string, unknown>>;
+    const last = choices[choices.length - 1];
+    const message = (last.message as Record<string, unknown> | undefined) ?? {
+      role: 'assistant',
+      content: '',
+    };
+    const existing = typeof message.content === 'string' ? message.content : '';
+    choices[choices.length - 1] = {
+      ...last,
+      message: {
+        ...message,
+        content: existing ? `${existing}\n\n${suffix}` : suffix,
+      },
+    };
+    obj.choices = choices;
+    return { body: JSON.stringify(obj), applied: true };
+  }
+
+  // Gemini candidates[]
+  if (Array.isArray(obj.candidates) && obj.candidates.length > 0) {
+    const candidates = obj.candidates as Array<Record<string, unknown>>;
+    const last = candidates[candidates.length - 1];
+    const content = (last.content as Record<string, unknown> | undefined) ?? {
+      parts: [],
+      role: 'model',
+    };
+    const parts = Array.isArray(content.parts) ? [...(content.parts as unknown[])] : [];
+    parts.push({ text: suffix });
+    candidates[candidates.length - 1] = {
+      ...last,
+      content: { ...content, parts },
+    };
+    obj.candidates = candidates;
+    return { body: JSON.stringify(obj), applied: true };
+  }
+
+  return { body: originalBody, applied: false };
+}
+
+/**
+ * Per ADR-040 invariant I10 ("100% user-visible explanation"), every
+ * response delivered after a Safe House intervention must contain
+ * intervention-naming language. Most paths satisfy this naturally:
+ * T0-4's `buildAutonomyEnforceResponse` and T0-5's
+ * `replaceIntegrityViolationContent` already produce text that begins
+ * with "[Mnemom Intervention: ...]" and never reach this helper.
+ *
+ * The cases that need a fallback are the request paths where the
+ * gateway modified input (T0-3 front-door quarantine notice that the
+ * agent saw and may not have referenced verbatim) or modified the
+ * agent's output post-generation (T0-6 back-door redaction that the
+ * agent didn't know about). For both, T0-8 inspects the delivered
+ * body for a canonical Mnemom intervention marker; if absent, it
+ * appends a structured suffix so the user always sees the prevention
+ * named.
+ *
+ * Returns the (possibly suffixed) body + a `suffixed` flag the caller
+ * uses to set `X-Mnemom-Suffixed: true` for harness assertions.
+ */
+export function ensureInterventionReference(
+  responseBody: string,
+  interventionSummaries: string[],
+): { body: string; suffixed: boolean } {
+  if (interventionSummaries.length === 0) {
+    return { body: responseBody, suffixed: false };
+  }
+  // Canonical markers the writers in T0-3..T0-6 produce, plus the
+  // legacy "Mnemom advisory" prefix that pre-T0-3 nudge content uses.
+  // Case-insensitive to keep paraphrases of the marker matching.
+  const REF_PATTERN = /\[Mnemom (?:Intervention|advisory|advisor|Advisor|advisories)\b/i;
+  if (REF_PATTERN.test(responseBody)) {
+    return { body: responseBody, suffixed: false };
+  }
+  const summary = interventionSummaries.join('; ');
+  const suffix = `[Mnemom: ${summary}]`;
+  const result = appendSuffixToProviderResponse(responseBody, suffix);
+  return { body: result.body, suffixed: result.applied };
+}
+
+/**
+ * Build a list of intervention summary strings for a request given
+ * the front-door verdict + back-door modification state. Used by T0-8
+ * to populate the response suffix when the agent's response doesn't
+ * naturally name the prevention.
+ *
+ * Returns an empty array when no intervention occurred — the caller
+ * skips the suffix logic entirely in that case (zero overhead).
+ */
+export function summarizeRequestInterventions(args: {
+  shVerdict: SafeHouseVerdict | undefined;
+  outboundDLPMatches: { type: string }[];
+  backDoorBodyReplaced: boolean;
+}): string[] {
+  const summaries: string[] = [];
+  if (args.shVerdict === 'block' || args.shVerdict === 'quarantine') {
+    summaries.push(`front-door ${args.shVerdict}`);
+  } else if (args.shVerdict === 'warn') {
+    summaries.push('front-door warn');
+  }
+  if (args.backDoorBodyReplaced && args.outboundDLPMatches.length > 0) {
+    const types = Array.from(new Set(args.outboundDLPMatches.map((m) => m.type)));
+    summaries.push(`back-door redacted ${args.outboundDLPMatches.length} item(s) (${types.slice(0, 5).join(', ')})`);
+  }
+  return summaries;
+}
+
 /** Write a pre-emptive Safe House nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
@@ -6263,6 +6411,11 @@ export async function handleProviderProxy(
       // ====================================================================
       let outboundDLPDetected = false;
       let outboundDLPMatches: DLPMatch[] = [];
+      // T0-8: tracks whether the back door actually replaced the
+      // response body (vs. observe mode which scans + logs only).
+      // Read at the delivery sites to decide whether the user-visible
+      // explanation suffix needs to fire.
+      let backDoorBodyReplaced = false;
       const outgoingGated = shConfig.screen_surfaces.outgoing;
       const backDoorActive =
         env.SAFE_HOUSE_ENABLED === 'true' &&
@@ -6283,6 +6436,7 @@ export async function handleProviderProxy(
               shConfig.mode === 'nudge' || shConfig.mode === 'enforce';
             if (bodyReplaced) {
               responseBodyText = result.body;
+              backDoorBodyReplaced = true;
             }
             ctx.waitUntil(logCBDEvaluation(
               agent.id, sessionId, 'warn',
@@ -6325,6 +6479,28 @@ export async function handleProviderProxy(
       // CBD Semantic analysis — async, never blocks the response
       if (env.SAFE_HOUSE_ENABLED === 'true' && outputText) {
         ctx.waitUntil(runCBDSemanticAnalysis(outputText, agent.id, sessionId, env));
+      }
+
+      // ====================================================================
+      // T0-8 / ADR-040 §I10: 100% user-visible explanation suffix.
+      // Computed ONCE here (post-back-door, pre-AIP) so any downstream
+      // delivery site automatically picks up the suffixed body without
+      // per-site wiring. Skipped when AIP later replaces the response
+      // entirely (T0-5 boundary_violation paths produce text that
+      // already begins with "[Mnemom Intervention:" and would not need
+      // a suffix).
+      // ====================================================================
+      const t08Summaries = summarizeRequestInterventions({
+        shVerdict,
+        outboundDLPMatches,
+        backDoorBodyReplaced,
+      });
+      if (t08Summaries.length > 0) {
+        const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
+        if (i10.suffixed) {
+          responseBodyText = i10.body;
+          responseHeaders.set('X-Mnemom-Suffixed', 'true');
+        }
       }
 
       // Phase 7: Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
