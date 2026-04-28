@@ -2444,7 +2444,12 @@ export async function markNudgesDelivered(
             Prefer: 'return=minimal',
           },
           body: JSON.stringify({
-            status: 'delivered',
+            // T0-12: status 'consumed' replaces the legacy 'delivered'
+            // term per ADR-040's canonical pending|consumed|expired
+            // enum. mnemom-api migration 154 extends the CHECK to allow
+            // both during the transition; a follow-up migration ≥30
+            // days later tightens the CHECK to remove 'delivered'.
+            status: 'consumed',
             delivered_at: new Date().toISOString(),
             delivery_session_id: sessionId,
           }),
