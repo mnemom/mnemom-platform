@@ -4111,6 +4111,159 @@ async function markCanaryTriggered(agentId: string, canaryValue: string, env: En
   }
 }
 
+/**
+ * Read the platform-wide pending advisory TTL (ADR-040, T0-2).
+ *
+ * Backed by `platform_settings.pending_advisory_ttl_hours` (single-row,
+ * platform-admin-configurable only). KV-cached for one hour so the
+ * advisory write path does not hammer Supabase. Falls back to the
+ * ADR-040 default of 24 hours on any failure (KV miss + unreachable
+ * Supabase, malformed row, out-of-bound value) so misconfiguration
+ * cannot block intervention.
+ */
+export async function getPendingAdvisoryTtlHours(env: Env): Promise<number> {
+  const DEFAULT_TTL_HOURS = 24;
+  const cacheKey = 'platform:pending-advisory-ttl';
+  if (env.BILLING_CACHE) {
+    try {
+      const cached = (await env.BILLING_CACHE.get(cacheKey, 'json')) as
+        | { ttl_hours: number }
+        | null;
+      if (cached && Number.isInteger(cached.ttl_hours)) {
+        return cached.ttl_hours;
+      }
+    } catch {
+      // Cache read failure: fall through to Supabase.
+    }
+  }
+  try {
+    const res = await supabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/platform_settings?id=eq.default&select=pending_advisory_ttl_hours`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+        },
+      }
+    );
+    if (!res.ok) return DEFAULT_TTL_HOURS;
+    const rows = (await res.json()) as Array<{ pending_advisory_ttl_hours: number }>;
+    const ttl = rows[0]?.pending_advisory_ttl_hours;
+    if (!Number.isInteger(ttl) || ttl < 1 || ttl > 168) {
+      return DEFAULT_TTL_HOURS;
+    }
+    if (env.BILLING_CACHE) {
+      await env.BILLING_CACHE.put(
+        cacheKey,
+        JSON.stringify({ ttl_hours: ttl }),
+        { expirationTtl: 3600 }
+      ).catch(() => {});
+    }
+    return ttl;
+  } catch {
+    return DEFAULT_TTL_HOURS;
+  }
+}
+
+/**
+ * Compose the agent-facing advisory text for a front-door enforce
+ * intervention. The text becomes the row injected into the agent's
+ * context on the next turn so the agent has cross-turn context for
+ * what was prevented.
+ */
+export function buildFrontDoorAdvisoryContent(decision: SafeHouseDecision): {
+  text: string;
+  summary: string;
+} {
+  const threatTypes = Array.from(
+    new Set(decision.threats.map((t) => t.type))
+  ).slice(0, 3);
+  const verdictWord = decision.verdict === 'block' ? 'blocked' : 'quarantined';
+  const threatStr = threatTypes.length > 0 ? threatTypes.join(', ') : 'unspecified';
+  const text =
+    `[Mnemom advisory: an incoming message on the previous turn was ` +
+    `${verdictWord} by the front-door Safe House check ` +
+    `(threats: ${threatStr}; risk: ${decision.overall_risk.toFixed(2)}). ` +
+    `The intervention has already been applied; this note is for context.]`;
+  const summary =
+    `Front-door ${verdictWord}: ${threatStr} ` +
+    `(overall_risk=${decision.overall_risk.toFixed(2)})`;
+  return { text, summary };
+}
+
+/**
+ * Write a front-door enforce advisory (ADR-040, T0-3).
+ *
+ * Per ADR-040 §"Sources", an enforce-mode same-turn intervention at the
+ * front door also writes a pending_advisories row with
+ * `source='runtime.front_door.enforce'` so the agent has cross-turn
+ * context next turn for what was quarantined or blocked.
+ *
+ * Writes directly to `pending_advisories` (not the legacy
+ * `enforcement_nudges` compatibility view) so source / source_ref /
+ * expires_at populate correctly. Best-effort: failures are swallowed
+ * because the same-turn intervention is the actual enforcement
+ * mechanism; this carryover row is informational and must never
+ * affect the current turn's response path.
+ *
+ * Fires only on `verdict === 'block' || verdict === 'quarantine'` —
+ * warn paths use the legacy `writePreemptiveNudge` until T0-7
+ * consolidates writers onto pending_advisories directly.
+ */
+export async function writeFrontDoorAdvisory(
+  agentId: string,
+  sessionId: string,
+  decision: SafeHouseDecision,
+  env: Env
+): Promise<void> {
+  if (decision.verdict !== 'block' && decision.verdict !== 'quarantine') {
+    return;
+  }
+  try {
+    const ttlHours = await getPendingAdvisoryTtlHours(env);
+    const expiresAt = new Date(
+      Date.now() + ttlHours * 60 * 60 * 1000
+    ).toISOString();
+    const { text, summary } = buildFrontDoorAdvisoryContent(decision);
+    const id = `pa-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/pending_advisories`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        id,
+        agent_id: agentId,
+        session_id: sessionId,
+        // checkpoint_id intentionally omitted — NULL means non-AIP-originated
+        // (front door has no integrity checkpoint to reference; migration 107
+        // made checkpoint_id nullable for this case).
+        status: 'pending',
+        nudge_content: text,
+        concerns_summary: summary,
+        source: 'runtime.front_door.enforce',
+        source_ref: {
+          quarantine_id: decision.quarantine_id ?? null,
+          verdict: decision.verdict,
+          overall_risk: decision.overall_risk,
+          detection_sources: decision.detection_sources,
+          threat_types: Array.from(
+            new Set(decision.threats.map((t) => t.type))
+          ),
+        },
+        expires_at: expiresAt,
+      }),
+    });
+  } catch {
+    // Non-blocking. See ADR-040: pending advisories are best-effort
+    // cross-turn context. The same-turn enforce mechanism is the chat
+    // completion path, not this row.
+  }
+}
+
 /** Write a pre-emptive Safe House nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
@@ -4894,6 +5047,10 @@ export async function handleProviderProxy(
               const contentHash = await hashContent(inboundMessage);
               ctx.waitUntil(logQuarantinedMessage(quarantineId!, agent.id, sessionId, contentHash, decision, 'user_message', env));
               ctx.waitUntil(logSHEvaluation(agent.id, sessionId, shConfig.mode, decision, 'user_message', env));
+              // ADR-040 / T0-3: write a pending_advisories row with
+              // source=runtime.front_door.enforce so the agent has
+              // cross-turn context next turn for what was prevented.
+              ctx.waitUntil(writeFrontDoorAdvisory(agent.id, sessionId, decision, env));
             } else {
               // WARN: decorate message with XML Spotlighting annotation
               const annotated = decorateMessage(inboundMessage, decision);
