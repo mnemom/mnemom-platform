@@ -27,9 +27,11 @@ OBSERVER_MAX_LOGS = "5000"
 LOGPUSH_SOURCE = "polling"
 OBSERVER_MAX_R2_OBJECTS = "200"
 # scale/step-50 / ADR-010: "direct" (pre-step-50 behavior — scheduled() also processes)
-# or "queue" (scheduled() only enqueues; queue() handler processes). Default "direct"
-# at ship time; staging flips first, prod follows once Step 51 (idempotency) is live.
-OBSERVER_PROCESSING_MODE = "direct"
+# or "queue" (scheduled() only enqueues; queue() handler processes). Flipped to "queue"
+# 2026-04-28 at Step 50.6 after Step 51 (idempotency) burned in and Step 52 alerts (ADR-032 +
+# ADR-043) reached Normal (NoData) on a clean re-soak. Staging has been on queue mode since
+# 2026-04-19; prod's polling pipeline drained 2026-04-26 18:40Z and stayed clean since.
+OBSERVER_PROCESSING_MODE = "queue"
 
 [[env.production.kv_namespaces]]
 binding = "BILLING_CACHE"
