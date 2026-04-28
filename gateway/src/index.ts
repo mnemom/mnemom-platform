@@ -76,6 +76,7 @@ import {
   buildThreatContextForAIP,
   buildPreemptiveNudgeContent,
   redactDLPMatches,
+  type DLPMatch,
   buildSHExitAnalysisPrompt,
   buildSHExitUserPrompt,
   DEFAULT_SAFE_HOUSE_CONFIG,
@@ -4685,6 +4686,191 @@ export async function writeIntegrityEnforceAdvisory(
   }
 }
 
+/**
+ * Apply back-door DLP redaction to a buffered provider response (T0-6,
+ * ADR-040). Walks the per-provider text slot(s) and applies
+ * `redactDLPMatches` to each, leaving the rest of the response shape
+ * intact so customer SDKs continue to parse it.
+ *
+ *   - Anthropic: `content[]` text blocks
+ *   - OpenAI:    `choices[].message.content`
+ *   - Gemini:    `candidates[].content.parts[].text`
+ *
+ * Returns the (possibly modified) body, the aggregated DLP matches
+ * across all redacted segments, and a `modified` flag the caller can
+ * use to decide whether to write the cross-turn advisory.
+ *
+ * If the body fails to parse as JSON or doesn't match a known shape,
+ * falls back to running `redactDLPMatches` on the raw text — better
+ * to over-redact than to leak PII because the response shape was
+ * unrecognized.
+ */
+export function applyBackDoorRedaction(originalBody: string): {
+  body: string;
+  matches: DLPMatch[];
+  modified: boolean;
+} {
+  const allMatches: DLPMatch[] = [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(originalBody);
+  } catch {
+    const result = redactDLPMatches(originalBody);
+    return {
+      body: result.redacted,
+      matches: result.matches,
+      modified: result.matches.length > 0,
+    };
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { body: originalBody, matches: [], modified: false };
+  }
+  const obj = parsed as Record<string, unknown>;
+  let changed = false;
+
+  // Anthropic content[]
+  if (Array.isArray(obj.content)) {
+    obj.content = (obj.content as Array<Record<string, unknown>>).map((block) => {
+      if (block.type === 'text' && typeof block.text === 'string') {
+        const result = redactDLPMatches(block.text);
+        if (result.matches.length > 0) {
+          allMatches.push(...result.matches);
+          changed = true;
+          return { ...block, text: result.redacted };
+        }
+      }
+      return block;
+    });
+  }
+
+  // OpenAI choices[].message.content
+  if (Array.isArray(obj.choices)) {
+    obj.choices = (obj.choices as Array<Record<string, unknown>>).map((choice) => {
+      const message = choice.message as Record<string, unknown> | undefined;
+      if (message && typeof message.content === 'string') {
+        const result = redactDLPMatches(message.content);
+        if (result.matches.length > 0) {
+          allMatches.push(...result.matches);
+          changed = true;
+          return { ...choice, message: { ...message, content: result.redacted } };
+        }
+      }
+      return choice;
+    });
+  }
+
+  // Gemini candidates[].content.parts[].text
+  if (Array.isArray(obj.candidates)) {
+    obj.candidates = (obj.candidates as Array<Record<string, unknown>>).map((candidate) => {
+      const content = candidate.content as Record<string, unknown> | undefined;
+      const parts = content?.parts as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(parts)) {
+        const newParts = parts.map((part) => {
+          if (typeof part.text === 'string') {
+            const result = redactDLPMatches(part.text);
+            if (result.matches.length > 0) {
+              allMatches.push(...result.matches);
+              changed = true;
+              return { ...part, text: result.redacted };
+            }
+          }
+          return part;
+        });
+        return { ...candidate, content: { ...content, parts: newParts } };
+      }
+      return candidate;
+    });
+  }
+
+  if (!changed) {
+    return { body: originalBody, matches: [], modified: false };
+  }
+  return { body: JSON.stringify(obj), matches: allMatches, modified: true };
+}
+
+/**
+ * Write a back-door modification advisory (T0-6, ADR-040).
+ *
+ * Companion to writeFrontDoorAdvisory + writeAutonomyEnforceAdvisory +
+ * writeIntegrityEnforceAdvisory. Per ADR-040 §"Sources" the source
+ * value is `runtime.back_door.modification`. The advisory tells the
+ * agent next turn what was redacted from its response so it doesn't
+ * reference the redacted content as if it had been delivered.
+ *
+ * Mode gating: skip on `observe` (today's behavior — log only, no
+ * response mutation, no advisory). Fires under `nudge` and `enforce`
+ * because both modes apply the redaction to the response body before
+ * delivery; the advisory mirrors that fact for the next turn.
+ *
+ * Best-effort: errors swallowed so the same-turn redaction (which
+ * already happened in the response body) is never affected.
+ */
+export async function writeBackDoorAdvisory(
+  agentId: string,
+  sessionId: string,
+  modification: { matches: DLPMatch[]; mode: string },
+  env: Env,
+): Promise<void> {
+  if (modification.matches.length === 0) return;
+  if (modification.mode !== 'nudge' && modification.mode !== 'enforce') return;
+  try {
+    const ttlHours = await getPendingAdvisoryTtlHours(env);
+    const expiresAt = new Date(
+      Date.now() + ttlHours * 60 * 60 * 1000,
+    ).toISOString();
+
+    const types = Array.from(new Set(modification.matches.map((m) => m.type)));
+    const counts: Record<string, number> = {};
+    for (const m of modification.matches) {
+      counts[m.type] = (counts[m.type] ?? 0) + 1;
+    }
+    const typeStr = types.slice(0, 5).join(', ') || 'unspecified';
+    const count = modification.matches.length;
+    const text =
+      `[Mnemom advisory: on the previous turn the back door redacted ` +
+      `${count} sensitive item${count === 1 ? '' : 's'} from your response ` +
+      `(types: ${typeStr}). The redactions have already been applied; ` +
+      `this note is for context so you don't reference the redacted ` +
+      `content as if it had been delivered.]`;
+    const summary =
+      `Back-door redacted ${count} item${count === 1 ? '' : 's'} ` +
+      `(${typeStr})`;
+    const id = `pa-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/pending_advisories`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        id,
+        agent_id: agentId,
+        session_id: sessionId,
+        // checkpoint_id intentionally omitted — back door has no
+        // integrity checkpoint to reference.
+        status: 'pending',
+        nudge_content: text,
+        concerns_summary: summary,
+        source: 'runtime.back_door.modification',
+        source_ref: {
+          mode: modification.mode,
+          modification_count: count,
+          threat_types: types,
+          counts,
+        },
+        expires_at: expiresAt,
+      }),
+    });
+  } catch {
+    // Non-blocking. The same-turn redaction (response body already
+    // modified) is the actual enforcement mechanism; this carryover
+    // row is informational.
+  }
+}
+
 /** Write a pre-emptive Safe House nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
@@ -5857,7 +6043,9 @@ export async function handleProviderProxy(
 
     // Buffer the full response for analysis
     let canaryTriggered = false;
-    const responseBodyText = await response.text();
+    // Mutable so the back-door (T0-6) can redact PII / secrets in place
+    // before downstream paths (AIP, response delivery) operate on the body.
+    let responseBodyText = await response.text();
 
     // Safe House Canary detection: scan response for planted canary credentials
     // This is in the fail-open wrapper — any error continues without blocking
@@ -5998,48 +6186,78 @@ export async function handleProviderProxy(
       const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
 
       // ====================================================================
-      // CBD Outbound DLP — screen agent response for data leaks
-      // Scans extracted text content; logs to sh_exit_evaluations.
+      // Back door — outbound DLP redaction (Phase 6 per validation-charter,
+      // T0-6, ADR-040). Surgical redaction of PII / secret patterns in the
+      // agent's response. Modes:
+      //   - off:     skip dispatch entirely
+      //   - observe: scan + log only, body unchanged
+      //   - nudge:   scan + log + redact body in-place + write advisory
+      //   - enforce: same as nudge (back door's "intervention" is the
+      //              redaction itself; nudge vs enforce on this surface
+      //              differs in the upstream policy thresholds, not the
+      //              same-turn mechanism)
+      // Gated by `screen_surfaces.outgoing` so customers can opt out per
+      // protection card.
       // ====================================================================
       let outboundDLPDetected = false;
-      if (env.SAFE_HOUSE_ENABLED === 'true' && env.BILLING_CACHE) {
+      let outboundDLPMatches: DLPMatch[] = [];
+      const outgoingGated = shConfig.screen_surfaces.outgoing;
+      const backDoorActive =
+        env.SAFE_HOUSE_ENABLED === 'true' &&
+        env.BILLING_CACHE &&
+        outgoingGated &&
+        shConfig.mode !== 'off';
+      if (backDoorActive) {
         try {
-          const textToScan = outputText ?? (() => {
-            try {
-              const parsed = JSON.parse(responseBodyText);
-              const content = parsed?.content as Array<{ type: string; text?: string }> | undefined;
-              if (Array.isArray(content)) {
-                return content.filter(b => b.type === 'text').map(b => b.text ?? '').join('\n');
-              }
-            } catch { /* fall through */ }
-            return responseBodyText;
-          })();
-
-          if (textToScan && textToScan.length > 0) {
-            const { matches } = redactDLPMatches(textToScan);
-            if (matches.length > 0) {
-              outboundDLPDetected = true;
-              ctx.waitUntil(logCBDEvaluation(agent.id, sessionId, 'warn',
-                { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
-                ['DLPScanner'], 'outbound',
-                matches.map(m => ({
-                  type: 'pii_in_inbound' as ThreatType,
-                  confidence: 0.95,
-                  reasoning: `Outbound DLP: ${m.type} detected in agent response`,
-                })),
-                0.9, env));
-              console.log(JSON.stringify({
-                event: 'sh_exit_dlp',
-                agent_id: agent.id,
-                match_types: [...new Set(matches.map(m => m.type))],
-              }));
+          const result = applyBackDoorRedaction(responseBodyText);
+          if (result.matches.length > 0) {
+            outboundDLPDetected = true;
+            outboundDLPMatches = result.matches;
+            // Under nudge / enforce, replace the response body with the
+            // redacted version so the customer never sees the
+            // unredacted content. Under observe, leave the body intact
+            // (today's behavior) — detection-only.
+            const bodyReplaced =
+              shConfig.mode === 'nudge' || shConfig.mode === 'enforce';
+            if (bodyReplaced) {
+              responseBodyText = result.body;
             }
+            ctx.waitUntil(logCBDEvaluation(
+              agent.id, sessionId, 'warn',
+              { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
+              ['DLPScanner'], 'outbound',
+              result.matches.map((m) => ({
+                type: 'pii_in_inbound' as ThreatType,
+                confidence: 0.95,
+                reasoning: `Outbound DLP: ${m.type} detected in agent response`,
+              })),
+              0.9, env,
+            ));
+            console.log(JSON.stringify({
+              event: 'sh_exit_dlp',
+              agent_id: agent.id,
+              session_id: sessionId,
+              mode: shConfig.mode,
+              body_replaced: bodyReplaced,
+              match_count: result.matches.length,
+              match_types: Array.from(new Set(result.matches.map((m) => m.type))),
+            }));
           }
         } catch { /* fail-open */ }
       }
 
       if (outboundDLPDetected) {
         responseHeaders.set('X-Safe-House-DLP', 'detected');
+        // Cross-turn carryover advisory under nudge / enforce so the
+        // agent knows next turn what was redacted. Mode is checked
+        // inside writeBackDoorAdvisory; observe never reaches here in
+        // a way that triggers a write.
+        ctx.waitUntil(writeBackDoorAdvisory(
+          agent.id,
+          sessionId,
+          { matches: outboundDLPMatches, mode: shConfig.mode },
+          env,
+        ));
       }
 
       // CBD Semantic analysis — async, never blocks the response
