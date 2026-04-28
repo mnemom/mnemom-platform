@@ -27,6 +27,8 @@ import {
   writeIntegrityEnforceAdvisory,
   type Env,
 } from '../index';
+import { parseSSEEvents } from '../sse-parser';
+import { synthesizeProviderStream } from '../sse-synthesizer';
 
 interface KVStub {
   get: ReturnType<typeof vi.fn>;
@@ -479,5 +481,53 @@ describe('writeIntegrityEnforceAdvisory', () => {
         makeEnv(makeKV()),
       ),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ─── T0-5 streaming addendum: SSE round-trip of intervention text ───────────
+
+describe('buildIntegrityInterventionText → synthesizeProviderStream round-trip', () => {
+  const checkpoint = {
+    checkpoint_id: 'cp_test_1',
+    verdict: 'boundary_violation' as const,
+    concerns: [
+      { relevant_conscience_value: 'BOUNDARY:no_harm', severity: 'high' as const, description: 'reasoning toward harm' },
+    ],
+    reasoning_summary: 'Model was reasoning toward an action that harms the user.',
+  };
+
+  it('produces an SSE stream that parses back to the same intervention text for every provider', async () => {
+    const text = buildIntegrityInterventionText(checkpoint);
+    expect(text).toContain('Mnemom Intervention');
+    expect(text).toContain('no_harm');
+
+    for (const provider of ['anthropic', 'openai', 'gemini'] as const) {
+      const { body, headers } = synthesizeProviderStream(
+        provider,
+        text,
+        { model: 'm' },
+      );
+      expect(headers['Content-Type']).toMatch(/^text\/event-stream/);
+      const decoder = new TextDecoder();
+      const chunks: string[] = [];
+      const reader = body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(decoder.decode(value));
+      }
+      const sse = chunks.join('');
+      const parsed = parseSSEEvents(sse, provider);
+      expect(parsed.text).toBe(text);
+    }
+  });
+
+  it('emits text/event-stream content-type — not application/json (CAC: streaming clients must receive SSE)', async () => {
+    const text = buildIntegrityInterventionText(checkpoint);
+    for (const provider of ['anthropic', 'openai', 'gemini'] as const) {
+      const { headers } = synthesizeProviderStream(provider, text, null);
+      expect(headers['Content-Type']).toMatch(/^text\/event-stream/);
+      expect(headers['Content-Type']).not.toBe('application/json');
+    }
   });
 });
