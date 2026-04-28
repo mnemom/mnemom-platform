@@ -3055,6 +3055,115 @@ function extractToolsFromRequest(
 }
 
 /**
+ * Build a synthetic 200 response that names what was prevented when CLPI
+ * fails under autonomy_mode=enforce (T0-4, ADR-040).
+ *
+ * Replaces the prior 403 path. The chat completes 2xx with an
+ * assistant-shaped message that explains the prevention; the customer's
+ * agent runtime can render it like any other model response. Per-provider
+ * shape so customers don't have to special-case the gateway intervention.
+ *
+ * NOTE: today's CLPI runs on the request's *declared* tool list (before
+ * forwarding to the provider), not on the model's emitted tool_use blocks.
+ * The "synthetic tool-result" framing in ADR-040 doesn't fit this code
+ * path — the model never emits the tool_use to begin with. Returning a
+ * text-only assistant message is the honest CAC-compliant alternative:
+ * the chat completes, the agent's response names the prevention, no
+ * fabricated tool calls.
+ *
+ * Streaming (`stream: true`) requests today receive the same buffered
+ * 403 JSON regardless of mode; this synthetic 200 keeps the same shape
+ * (no SSE), preserving the existing contract. SSE-shaped synthesis is
+ * a follow-up.
+ */
+export function buildAutonomyEnforceResponse(
+  provider: GatewayProvider,
+  evalResult: { verdict: string; violations: Array<{ tool_name?: string; type?: string; reason?: string; rule_id?: string; severity?: string }> },
+  requestBody: Record<string, any> | null,
+): { body: string; contentType: string } {
+  // Compose the agent-facing text. Lists up to three violating tools;
+  // names rule_id when present so reviewers can trace back to the card.
+  const violations = evalResult.violations.slice(0, 3);
+  const violationLines = violations.map((v) => {
+    const tool = v.tool_name ? `\`${v.tool_name}\`` : 'a tool';
+    const reason = v.reason || v.type || 'policy violation';
+    const ruleSuffix = v.rule_id ? ` (rule: ${v.rule_id})` : '';
+    return `- ${tool}: ${reason}${ruleSuffix}`;
+  });
+  const intervention =
+    `[Mnemom Intervention: I cannot proceed with this request. ` +
+    `My alignment card prevents the following tool${violations.length === 1 ? '' : 's'}:\n` +
+    `${violationLines.join('\n')}\n\n` +
+    `The tool side effect did not happen. If you'd like to continue, ` +
+    `you can either remove the disallowed capabilities from the request ` +
+    `or update the alignment card to permit them.]`;
+
+  const requestedModel: string =
+    (requestBody && typeof (requestBody as any).model === 'string'
+      ? ((requestBody as any).model as string)
+      : '') || 'unknown';
+
+  const id = `mn-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  switch (provider) {
+    case 'anthropic': {
+      // Anthropic Messages API non-stream response shape.
+      const body = {
+        id: `msg_${id}`,
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: intervention }],
+        model: requestedModel,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      };
+      return { body: JSON.stringify(body), contentType: 'application/json' };
+    }
+    case 'openai': {
+      // OpenAI Chat Completions non-stream response shape.
+      const body = {
+        id: `chatcmpl-${id}`,
+        object: 'chat.completion',
+        created: nowSeconds,
+        model: requestedModel,
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: intervention },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+      return { body: JSON.stringify(body), contentType: 'application/json' };
+    }
+    case 'gemini': {
+      // Gemini generateContent non-stream response shape.
+      const body = {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: intervention }],
+              role: 'model',
+            },
+            finishReason: 'STOP',
+            index: 0,
+          },
+        ],
+        usageMetadata: {
+          promptTokenCount: 0,
+          candidatesTokenCount: 0,
+          totalTokenCount: 0,
+        },
+      };
+      return { body: JSON.stringify(body), contentType: 'application/json' };
+    }
+  }
+}
+
+/**
  * Fetch policy data for an agent from Supabase RPC.
  * Fail-open: returns null on error so agents without policies continue normally.
  */
@@ -4264,6 +4373,90 @@ export async function writeFrontDoorAdvisory(
   }
 }
 
+/**
+ * Write an inside.autonomy enforce advisory (T0-4, ADR-040).
+ *
+ * Companion to writeFrontDoorAdvisory. Fires when CLPI evaluation under
+ * `autonomy_mode=enforce` returns `fail` and the gateway has just
+ * synthesized a same-turn intervention response (via
+ * `buildAutonomyEnforceResponse`). The advisory carries cross-turn
+ * context so the agent's NEXT turn knows which tools were refused and
+ * why, even though the agent never saw an actual tool error this turn
+ * (CLPI gates the request, not the model's emitted tool_use).
+ *
+ * Best-effort: errors are swallowed because the same-turn synthetic
+ * response is the actual enforcement mechanism; the carryover row is
+ * informational and must never affect the current turn.
+ */
+export async function writeAutonomyEnforceAdvisory(
+  agentId: string,
+  sessionId: string,
+  evalResult: {
+    verdict: string;
+    violations: Array<{ tool_name?: string; type?: string; reason?: string; rule_id?: string; severity?: string }>;
+  },
+  env: Env
+): Promise<void> {
+  if (evalResult.verdict !== 'fail') return;
+  try {
+    const ttlHours = await getPendingAdvisoryTtlHours(env);
+    const expiresAt = new Date(
+      Date.now() + ttlHours * 60 * 60 * 1000
+    ).toISOString();
+
+    const violations = evalResult.violations.slice(0, 3);
+    const toolList = violations
+      .map((v) => v.tool_name)
+      .filter((n): n is string => typeof n === 'string')
+      .join(', ');
+    const reasons = violations
+      .map((v) => v.reason || v.type)
+      .filter((r): r is string => typeof r === 'string');
+    const reasonStr = reasons.length > 0 ? reasons.join(' / ') : 'policy violation';
+    const text =
+      `[Mnemom advisory: on the previous turn the alignment card ` +
+      `refused the following tool${violations.length === 1 ? '' : 's'} ` +
+      `(${toolList || 'unspecified'}). Reason: ${reasonStr}. ` +
+      `The tool side effect did not happen; this note is for context.]`;
+    const summary = `Inside.autonomy refused: ${toolList || 'unspecified'} (${reasonStr})`;
+
+    const id = `pa-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/pending_advisories`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        id,
+        agent_id: agentId,
+        session_id: sessionId,
+        // checkpoint_id intentionally omitted — NULL means non-AIP-originated
+        // (CLPI is the autonomy gate; not an integrity checkpoint).
+        status: 'pending',
+        nudge_content: text,
+        concerns_summary: summary,
+        source: 'runtime.inside.autonomy.enforce',
+        source_ref: {
+          verdict: evalResult.verdict,
+          violations: violations.map((v) => ({
+            tool_name: v.tool_name ?? null,
+            type: v.type ?? null,
+            severity: v.severity ?? null,
+            rule_id: v.rule_id ?? null,
+          })),
+        },
+        expires_at: expiresAt,
+      }),
+    });
+  } catch {
+    // Non-blocking. The same-turn synthetic 200 is the enforcement
+    // mechanism; this carryover row is informational only.
+  }
+}
+
 /** Write a pre-emptive Safe House nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
@@ -5242,16 +5435,38 @@ export async function handleProviderProxy(
               )
             );
 
-            // Enforce mode: reject on fail
+            // Enforce mode: same-turn intervention on fail (T0-4, ADR-040).
+            // Replaces the prior 403 path which violated CAC. Returns a 200
+            // with a synthesized assistant-shaped response per provider so
+            // the chat completes; the agent's response names the prevention.
+            // Best-effort cross-turn advisory writes the violation context
+            // for the next turn.
             if (enforcementMode === 'enforce' && evalResult.verdict === 'fail') {
-              return new Response(JSON.stringify({
-                error: 'Request blocked by policy',
-                type: 'policy_violation',
-                verdict: evalResult.verdict,
-                violations: evalResult.violations,
-              }), {
-                status: 403,
-                headers: { 'Content-Type': 'application/json' },
+              const synthesized = buildAutonomyEnforceResponse(
+                provider,
+                evalResult,
+                requestBody,
+              );
+              ctx.waitUntil(
+                writeAutonomyEnforceAdvisory(agent.id, sessionId, evalResult, env),
+              );
+              console.log(JSON.stringify({
+                event: 'gateway_autonomy_enforce',
+                agent_id: agent.id,
+                session_id: sessionId,
+                provider,
+                violation_count: evalResult.violations.length,
+                violation_tools: evalResult.violations
+                  .map((v: any) => v.tool_name)
+                  .filter((n: unknown) => typeof n === 'string'),
+              }));
+              return new Response(synthesized.body, {
+                status: 200,
+                headers: {
+                  'Content-Type': synthesized.contentType,
+                  'X-Policy-Verdict': 'fail',
+                  'X-Mnemom-Autonomy-Verdict': 'enforced',
+                },
               });
             }
           }
