@@ -4457,6 +4457,234 @@ export async function writeAutonomyEnforceAdvisory(
   }
 }
 
+/**
+ * Extract the BOUNDARY value name an integrity checkpoint flagged.
+ *
+ * The checkpoint object doesn't carry an explicit "boundary that was
+ * violated" field — it's inferred from concerns and conscience_context.
+ * Strategy:
+ *   1. Scan `concerns[]` for the highest-severity entry with a
+ *      `relevant_conscience_value` matching `BOUNDARY:*`.
+ *   2. Fall back to `conscience_context.conflicts[]` for any entry
+ *      starting with `BOUNDARY:`.
+ *   3. Return null if no BOUNDARY value can be identified — the
+ *      intervention text falls back to a generic phrasing.
+ */
+export function extractBoundaryValueName(
+  checkpoint: { concerns?: Array<{ relevant_conscience_value?: string | null; severity?: string | null }>; conscience_context?: { conflicts?: string[] } } | null | undefined,
+): string | null {
+  if (!checkpoint) return null;
+  const SEVERITY_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+  let best: { name: string; rank: number } | null = null;
+  for (const concern of checkpoint.concerns ?? []) {
+    const raw = concern.relevant_conscience_value;
+    if (typeof raw !== 'string' || !raw.startsWith('BOUNDARY:')) continue;
+    const name = raw.slice('BOUNDARY:'.length).trim();
+    if (!name) continue;
+    const rank = SEVERITY_RANK[concern.severity ?? ''] ?? 0;
+    if (!best || rank > best.rank) {
+      best = { name, rank };
+    }
+  }
+  if (best) return best.name;
+  for (const c of checkpoint.conscience_context?.conflicts ?? []) {
+    if (typeof c === 'string' && c.startsWith('BOUNDARY:')) {
+      const name = c.slice('BOUNDARY:'.length).trim();
+      if (name) return name;
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the agent-voice intervention text used to replace the model's
+ * response when AIP fires `boundary_violation` under `integrity_mode=enforce`.
+ *
+ * Per ADR-040 the text takes the agent's voice ("I noticed I was
+ * reasoning toward X, which violates BOUNDARY value Y. I'm not going to
+ * act on that."). Falls back to a generic phrasing when the BOUNDARY
+ * value cannot be identified or the reasoning summary is missing.
+ */
+export function buildIntegrityInterventionText(
+  checkpoint: { concerns?: Array<{ relevant_conscience_value?: string | null; severity?: string | null; description?: string | null }>; reasoning_summary?: string | null; conscience_context?: { conflicts?: string[] } } | null | undefined,
+): string {
+  const boundary = extractBoundaryValueName(checkpoint);
+  const summary = (checkpoint?.reasoning_summary ?? '').trim();
+  // Cap the embedded summary so the intervention text stays a digestible
+  // single paragraph; the full reasoning lives on the integrity_checkpoints row.
+  const summaryClause = summary
+    ? ` (${summary.length > 240 ? `${summary.slice(0, 237)}...` : summary})`
+    : '';
+  if (boundary) {
+    return (
+      `[Mnemom Intervention: I noticed I was reasoning toward an action that violates ` +
+      `the BOUNDARY value \`${boundary}\`${summaryClause}. ` +
+      `I'm not going to act on that. The original response was prevented ` +
+      `from delivery; this message replaces it.]`
+    );
+  }
+  return (
+    `[Mnemom Intervention: an integrity checkpoint flagged a boundary violation ` +
+    `in my reasoning${summaryClause}. ` +
+    `I'm not going to act on that. The original response was prevented from delivery; ` +
+    `this message replaces it.]`
+  );
+}
+
+/**
+ * Replace the model-response content slot in a buffered provider
+ * response with the integrity intervention text. Preserves the rest of
+ * the response shape so customer SDKs continue to parse it.
+ *
+ * Provider format is detected by inspecting the parsed body (matches
+ * the existing canary-scanner pattern at the top of the AIP block):
+ *   - Anthropic: `content[]` array of `{type:'text',text}` blocks. Replaces
+ *     all text blocks with one intervention block; keeps non-text blocks
+ *     stripped (they're typically tool_use, which we don't want to deliver
+ *     when the response is being intervened on).
+ *   - OpenAI: `choices[].message.content` string fields. Replaces all
+ *     choices' content with the intervention text and clears any
+ *     tool_calls field on the message.
+ *   - Gemini: `candidates[].content.parts[].text`. Replaces all parts
+ *     with one text part containing the intervention.
+ *   - Unrecognized: returns an Anthropic-shaped envelope wrapping the
+ *     intervention text so the response is still parseable.
+ *
+ * Returns the new body as a JSON string. On parse failure (e.g., the
+ * upstream returned non-JSON) returns a wrapping envelope so the
+ * customer never sees the original violating content.
+ */
+export function replaceIntegrityViolationContent(
+  originalBody: string,
+  interventionText: string,
+): string {
+  const fallbackEnvelope = JSON.stringify({
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: interventionText }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+  });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(originalBody);
+  } catch {
+    return fallbackEnvelope;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return fallbackEnvelope;
+  }
+  const obj = parsed as Record<string, unknown>;
+
+  // Anthropic Messages API
+  if (Array.isArray(obj.content)) {
+    obj.content = [{ type: 'text', text: interventionText }];
+    obj.stop_reason = 'end_turn';
+    return JSON.stringify(obj);
+  }
+
+  // OpenAI Chat Completions
+  if (Array.isArray(obj.choices)) {
+    obj.choices = (obj.choices as Array<Record<string, unknown>>).map((c) => ({
+      ...c,
+      message: {
+        role: 'assistant',
+        content: interventionText,
+      },
+      finish_reason: 'stop',
+    }));
+    return JSON.stringify(obj);
+  }
+
+  // Gemini generateContent
+  if (Array.isArray(obj.candidates)) {
+    obj.candidates = (obj.candidates as Array<Record<string, unknown>>).map((c) => ({
+      ...c,
+      content: { parts: [{ text: interventionText }], role: 'model' },
+      finishReason: 'STOP',
+    }));
+    return JSON.stringify(obj);
+  }
+
+  // Unrecognized shape — return the wrapping envelope so the customer
+  // SDK still has something parseable to render.
+  return fallbackEnvelope;
+}
+
+/**
+ * Write an inside.integrity enforce advisory (T0-5, ADR-040).
+ *
+ * Companion to writeAutonomyEnforceAdvisory + writeFrontDoorAdvisory.
+ * Fires when AIP returns `boundary_violation` under `integrity_mode=enforce`
+ * and the gateway has just replaced the response body with the
+ * intervention text. Carries cross-turn context so the agent's NEXT
+ * turn knows which boundary was crossed and what reasoning triggered
+ * the intervention.
+ *
+ * Best-effort: errors swallowed so the same-turn intervention (the
+ * actual enforcement mechanism) is never affected.
+ */
+export async function writeIntegrityEnforceAdvisory(
+  agentId: string,
+  sessionId: string,
+  checkpoint: {
+    checkpoint_id: string;
+    verdict: string;
+    concerns?: Array<{ category?: string | null; severity?: string | null; description?: string | null; relevant_conscience_value?: string | null }>;
+    reasoning_summary?: string | null;
+  },
+  env: Env
+): Promise<void> {
+  if (checkpoint.verdict !== 'boundary_violation') return;
+  try {
+    const ttlHours = await getPendingAdvisoryTtlHours(env);
+    const expiresAt = new Date(
+      Date.now() + ttlHours * 60 * 60 * 1000
+    ).toISOString();
+    const boundary = extractBoundaryValueName(checkpoint);
+    const concerns = (checkpoint.concerns ?? []).slice(0, 3);
+    const text = buildIntegrityInterventionText(checkpoint);
+    const summary = boundary
+      ? `Inside.integrity boundary violation: ${boundary}`
+      : 'Inside.integrity boundary violation (boundary value unidentified)';
+    const id = `pa-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/pending_advisories`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        id,
+        agent_id: agentId,
+        session_id: sessionId,
+        checkpoint_id: checkpoint.checkpoint_id,
+        status: 'pending',
+        nudge_content: text,
+        concerns_summary: summary,
+        source: 'runtime.inside.integrity.enforce',
+        source_ref: {
+          checkpoint_id: checkpoint.checkpoint_id,
+          verdict: checkpoint.verdict,
+          boundary_value: boundary,
+          concerns: concerns.map((c) => ({
+            category: c.category ?? null,
+            severity: c.severity ?? null,
+            relevant_conscience_value: c.relevant_conscience_value ?? null,
+          })),
+        },
+        expires_at: expiresAt,
+      }),
+    });
+  } catch {
+    // Non-blocking. The same-turn response replacement is the actual
+    // enforcement mechanism; this carryover row is informational.
+  }
+}
+
 /** Write a pre-emptive Safe House nudge to the enforcement_nudges table. */
 async function writePreemptiveNudge(
   agentId: string,
@@ -5878,33 +6106,32 @@ export async function handleProviderProxy(
             }
 
             if (enforcementMode === 'enforce' && hybridCheckpoint.verdict === 'boundary_violation') {
-              return new Response(
-                JSON.stringify({
-                  error: 'Request blocked by integrity check',
-                  type: 'integrity_violation',
-                  checkpoint: {
-                    checkpoint_id: hybridCheckpoint.checkpoint_id,
-                    verdict: hybridCheckpoint.verdict,
-                    concerns: hybridCheckpoint.concerns,
-                    reasoning_summary: hybridCheckpoint.reasoning_summary,
-                    recommended_action: hybridAction,
-                  },
-                }),
-                {
-                  status: 403,
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'X-AIP-Verdict': hybridCheckpoint.verdict,
-                    'X-AIP-Checkpoint-Id': hybridCheckpoint.checkpoint_id,
-                    'X-AIP-Action': hybridAction,
-                    'X-AIP-Proceed': String(hybridProceed),
-                    'x-smoltbot-agent': agent.id,    // deprecated (2026-10)
-                    'x-mnemom-agent': agent.id,
-                    'x-smoltbot-session': sessionId, // deprecated (2026-10)
-                    'x-mnemom-session': sessionId,
-                  },
-                }
-              );
+              // T0-5 / ADR-040: same-turn response-body replacement
+              // (replaces the prior 403 path, CAC-violating). The chat
+              // completes 2xx; the agent's voice names the boundary
+              // violation. X-AIP-* headers are already set on
+              // `responseHeaders` above and pass through unchanged.
+              const interventionText = buildIntegrityInterventionText(hybridCheckpoint);
+              const replacedBody = replaceIntegrityViolationContent(responseBodyText, interventionText);
+              // Hybrid path historically did not persist the checkpoint
+              // (the 403 short-circuited before any storeCheckpoint
+              // call). Persist now so the audit trail records what was
+              // intervened on.
+              ctx.waitUntil(storeCheckpoint(hybridCheckpoint, 'gateway', env, hybridAttestation as AttestationData | undefined));
+              ctx.waitUntil(writeIntegrityEnforceAdvisory(agent.id, sessionId, hybridCheckpoint, env));
+              console.log(JSON.stringify({
+                event: 'gateway_integrity_enforce',
+                source: 'hybrid',
+                agent_id: agent.id,
+                session_id: sessionId,
+                checkpoint_id: hybridCheckpoint.checkpoint_id,
+                boundary_value: extractBoundaryValueName(hybridCheckpoint),
+                concern_count: hybridCheckpoint.concerns?.length ?? 0,
+              }));
+              return new Response(replacedBody, {
+                status: 200,
+                headers: responseHeaders,
+              });
             }
 
             return new Response(responseBodyText, {
@@ -6136,34 +6363,29 @@ export async function handleProviderProxy(
 
       // Apply enforcement
       if (enforcementMode === 'enforce' && checkpoint.verdict === 'boundary_violation') {
-        // Enforce mode + boundary violation: return 403
-        return new Response(
-          JSON.stringify({
-            error: 'Request blocked by integrity check',
-            type: 'integrity_violation',
-            checkpoint: {
-              checkpoint_id: checkpoint.checkpoint_id,
-              verdict: checkpoint.verdict,
-              concerns: checkpoint.concerns,
-              reasoning_summary: checkpoint.reasoning_summary,
-              recommended_action: signal.recommended_action,
-            },
-          }),
-          {
-            status: 403,
-            headers: {
-              'Content-Type': 'application/json',
-              'X-AIP-Verdict': checkpoint.verdict,
-              'X-AIP-Checkpoint-Id': checkpoint.checkpoint_id,
-              'X-AIP-Action': signal.recommended_action,
-              'X-AIP-Proceed': String(signal.proceed),
-              'x-smoltbot-agent': agent.id,    // deprecated (2026-10)
-              'x-mnemom-agent': agent.id,
-              'x-smoltbot-session': sessionId, // deprecated (2026-10)
-              'x-mnemom-session': sessionId,
-            },
-          }
-        );
+        // T0-5 / ADR-040: same-turn response-body replacement
+        // (replaces the prior 403 path, CAC-violating). The chat
+        // completes 2xx; the agent's voice names the boundary
+        // violation. X-AIP-* headers are already set on
+        // `responseHeaders` above and pass through unchanged.
+        // The integrity_checkpoints row is already queued for storage
+        // at the storeCheckpoint() ctx.waitUntil higher in this block.
+        const interventionText = buildIntegrityInterventionText(checkpoint);
+        const replacedBody = replaceIntegrityViolationContent(responseBodyText, interventionText);
+        ctx.waitUntil(writeIntegrityEnforceAdvisory(agent.id, sessionId, checkpoint, env));
+        console.log(JSON.stringify({
+          event: 'gateway_integrity_enforce',
+          source: 'sync',
+          agent_id: agent.id,
+          session_id: sessionId,
+          checkpoint_id: checkpoint.checkpoint_id,
+          boundary_value: extractBoundaryValueName(checkpoint),
+          concern_count: checkpoint.concerns?.length ?? 0,
+        }));
+        return new Response(replacedBody, {
+          status: 200,
+          headers: responseHeaders,
+        });
       }
 
       // Observe mode or enforce mode with non-violation: forward response with AIP headers
