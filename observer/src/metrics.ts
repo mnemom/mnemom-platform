@@ -60,6 +60,19 @@ export interface QueueDepth {
 }
 
 // ============================================================================
+// Threshold-breach thresholds (ADR-043)
+// ============================================================================
+// Tempo TraceQL metrics aren't accepted as alert input by Grafana SSE (long-
+// vs-wide data-frame mismatch). To make these gauges alertable via the same
+// spanmetrics counter pattern that ObserverPoisonAckRate already uses, we
+// emit a separate breach span only when a threshold is crossed. Alert rules
+// then become PromQL `rate(traces_spanmetrics_calls_total{span_name=…})>0`.
+// See ADR-043 for the full rationale and the alternatives considered.
+export const QUEUE_BACKLOG_BREACH = 50_000; // main-queue depth; ~70 min backlog at Phase 1 target throughput.
+export const QUEUE_DLQ_BREACH = 0;          // any DLQ message is operationally interesting.
+export const QUEUE_CONSUMER_LAG_BREACH_MS = 600_000; // 10 minutes — Step 53 SLO line.
+
+// ============================================================================
 // Span emitters
 // ============================================================================
 
@@ -82,6 +95,11 @@ export async function emitQueueBatchSpan(
   for (let i = 0; i < stats.poison_acks; i++) {
     spans.push(buildPoisonSpan(env_, mode, gw));
   }
+  // ADR-043 — emit a counter-style breach span when consumer lag crosses
+  // the SLO threshold so the alert layer can fire on rate(...)>0.
+  if (stats.oldest_message_lag_ms > QUEUE_CONSUMER_LAG_BREACH_MS) {
+    spans.push(buildLagBreachSpan(env_, mode, gw, stats.oldest_message_lag_ms));
+  }
 
   await postSpans(env, spans);
 }
@@ -101,7 +119,15 @@ export async function emitQueueBacklogSpans(
   const env_ = envLabel(env);
   const gw = env.GATEWAY_ID;
 
-  const spans = depths.map((d) => buildBacklogSpan(env_, gw, d));
+  const spans: OtlpSpan[] = depths.map((d) => buildBacklogSpan(env_, gw, d));
+  // ADR-043 — counter-style breach spans for the depth gauges.
+  for (const d of depths) {
+    if (d.queue === 'main' && d.messages > QUEUE_BACKLOG_BREACH) {
+      spans.push(buildDepthBreachSpan('observer.queue_backlog_breach', env_, gw, d));
+    } else if (d.queue === 'dlq' && d.messages > QUEUE_DLQ_BREACH) {
+      spans.push(buildDepthBreachSpan('observer.queue_dlq_breach', env_, gw, d));
+    }
+  }
   await postSpans(env, spans);
 }
 
@@ -176,6 +202,66 @@ function buildPoisonSpan(env_: string, mode: string, gatewayId: string): OtlpSpa
       str('mode', mode),
       str('gateway_id', gatewayId),
       str('reason', 'poison'),
+    ],
+    status: { code: 2 },
+  };
+}
+
+/**
+ * ADR-043 — emit a counter-style breach span when a depth gauge crosses
+ * its threshold. Spanmetrics rolls these into per-name `traces_spanmetrics_*`
+ * series; alert rules become PromQL `rate(...) > 0` mirrors of
+ * ObserverPoisonAckRate. status=ERROR matches the poison-span convention.
+ */
+function buildDepthBreachSpan(
+  name: 'observer.queue_backlog_breach' | 'observer.queue_dlq_breach',
+  env_: string,
+  gatewayId: string,
+  d: QueueDepth,
+): OtlpSpan {
+  const nowNs = timeUnixNano();
+  return {
+    traceId: hex32(),
+    spanId: hex16(),
+    name,
+    kind: 1,
+    startTimeUnixNano: nowNs,
+    endTimeUnixNano: nowNs,
+    attributes: [
+      str('env', env_),
+      str('queue', d.queue),
+      str('gateway_id', gatewayId),
+      int('depth', d.messages),
+    ],
+    status: { code: 2 },
+  };
+}
+
+/**
+ * ADR-043 — counter-style breach span for consumer lag SLO breaches.
+ * Emitted only when a queue_batch's `oldest_message_lag_ms` exceeds the
+ * threshold. Carries the breached value for triage; alert rule fires on
+ * rate(...) > 0 against `traces_spanmetrics_calls_total`.
+ */
+function buildLagBreachSpan(
+  env_: string,
+  mode: string,
+  gatewayId: string,
+  lagMs: number,
+): OtlpSpan {
+  const nowNs = timeUnixNano();
+  return {
+    traceId: hex32(),
+    spanId: hex16(),
+    name: 'observer.queue_consumer_lag_breach',
+    kind: 1,
+    startTimeUnixNano: nowNs,
+    endTimeUnixNano: nowNs,
+    attributes: [
+      str('env', env_),
+      str('mode', mode),
+      str('gateway_id', gatewayId),
+      int('oldest_message_lag_ms', lagMs),
     ],
     status: { code: 2 },
   };

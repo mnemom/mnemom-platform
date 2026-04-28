@@ -260,6 +260,141 @@ describe('emitQueueBacklogSpans', () => {
   });
 });
 
+// ===========================================================================
+// ADR-043 — threshold-breach spans turn the gauge signals into counter-style
+// signals that ride spanmetrics → Prometheus, where the alert layer can
+// actually evaluate them. The non-breach attribute spans (queue_backlog,
+// queue_batch) keep emitting unchanged for Tempo triage.
+// ===========================================================================
+
+describe('emitQueueBacklogSpans — ADR-043 breach spans', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue(FETCH_OK({}));
+    vi.stubGlobal('fetch', fetchMock);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('emits no breach spans when both queues are below thresholds', async () => {
+    await emitQueueBacklogSpans(makeEnv(), [
+      { queue: 'main', messages: 1234 },
+      { queue: 'dlq', messages: 0 },
+    ]);
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    expect(spans.map((s) => s.name)).toEqual([
+      'observer.queue_backlog',
+      'observer.queue_backlog',
+    ]);
+  });
+
+  it('emits observer.queue_backlog_breach when main queue depth crosses 50000', async () => {
+    await emitQueueBacklogSpans(makeEnv(), [
+      { queue: 'main', messages: 50_001 },
+      { queue: 'dlq', messages: 0 },
+    ]);
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    const breach = spans.find((s) => s.name === 'observer.queue_backlog_breach');
+    expect(breach).toBeDefined();
+    expect(attr(breach!, 'queue')).toBe('main');
+    expect(attr(breach!, 'depth')).toBe('50001');
+    expect(attr(breach!, 'env')).toBe('staging');
+    expect(attr(breach!, 'gateway_id')).toBe('mnemom-staging');
+    expect(breach!.status.code).toBe(2);
+  });
+
+  it('does NOT emit backlog_breach exactly at threshold (strict >)', async () => {
+    await emitQueueBacklogSpans(makeEnv(), [{ queue: 'main', messages: 50_000 }]);
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    expect(spans.some((s) => s.name === 'observer.queue_backlog_breach')).toBe(false);
+  });
+
+  it('emits observer.queue_dlq_breach when DLQ has any message', async () => {
+    await emitQueueBacklogSpans(makeEnv(), [
+      { queue: 'main', messages: 0 },
+      { queue: 'dlq', messages: 1 },
+    ]);
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    const breach = spans.find((s) => s.name === 'observer.queue_dlq_breach');
+    expect(breach).toBeDefined();
+    expect(attr(breach!, 'queue')).toBe('dlq');
+    expect(attr(breach!, 'depth')).toBe('1');
+    expect(breach!.status.code).toBe(2);
+  });
+
+  it('emits both breach spans when both queues breach simultaneously', async () => {
+    await emitQueueBacklogSpans(makeEnv(), [
+      { queue: 'main', messages: 60_000 },
+      { queue: 'dlq', messages: 5 },
+    ]);
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    const names = spans.map((s) => s.name).sort();
+    expect(names).toEqual([
+      'observer.queue_backlog',
+      'observer.queue_backlog',
+      'observer.queue_backlog_breach',
+      'observer.queue_dlq_breach',
+    ]);
+  });
+
+  it('main-queue-with-zero-dlq does not accidentally fire dlq_breach', async () => {
+    // Regression guard for the queue label discrimination: ensure the dlq
+    // threshold is only checked against the dlq row.
+    await emitQueueBacklogSpans(makeEnv(), [{ queue: 'main', messages: 99_999 }]);
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    expect(spans.some((s) => s.name === 'observer.queue_dlq_breach')).toBe(false);
+  });
+});
+
+describe('emitQueueBatchSpan — ADR-043 lag breach span', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue(FETCH_OK({}));
+    vi.stubGlobal('fetch', fetchMock);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('does NOT emit lag breach when oldest_message_lag_ms is below 600000', async () => {
+    await emitQueueBatchSpan(makeEnv(), makeStats({
+      oldest_message_lag_ms: 599_999,
+      poison_acks: 0,
+    }));
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    expect(spans.some((s) => s.name === 'observer.queue_consumer_lag_breach')).toBe(false);
+  });
+
+  it('emits observer.queue_consumer_lag_breach when lag crosses 600000ms', async () => {
+    await emitQueueBatchSpan(makeEnv(), makeStats({
+      oldest_message_lag_ms: 600_001,
+      poison_acks: 0,
+    }));
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    const breach = spans.find((s) => s.name === 'observer.queue_consumer_lag_breach');
+    expect(breach).toBeDefined();
+    expect(attr(breach!, 'oldest_message_lag_ms')).toBe('600001');
+    expect(attr(breach!, 'env')).toBe('staging');
+    expect(attr(breach!, 'mode')).toBe('queue');
+    expect(attr(breach!, 'gateway_id')).toBe('mnemom-staging');
+    expect(breach!.status.code).toBe(2);
+  });
+
+  it('lag breach + poison breach can coexist on a single batch', async () => {
+    await emitQueueBatchSpan(makeEnv(), makeStats({
+      oldest_message_lag_ms: 700_000,
+      poison_acks: 2,
+    }));
+    const spans = getSpans(fetchMock.mock.calls[0][1] as RequestInit);
+    const names = spans.map((s) => s.name).sort();
+    expect(names).toEqual([
+      'observer.queue_batch',
+      'observer.queue_consumer_lag_breach',
+      'observer.queue_poison',
+      'observer.queue_poison',
+    ]);
+  });
+});
+
 describe('extractBacklogGroups', () => {
   it('returns rows tolerating missing avg fields', () => {
     const body = {

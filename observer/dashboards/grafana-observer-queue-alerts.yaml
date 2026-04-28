@@ -1,37 +1,44 @@
-# Alert rules for the mnemom-observer queue pipeline — Step 52, ADR-032.
+# Alert rules for the mnemom-observer queue pipeline — Step 52, ADR-032 +
+# ADR-043.
 #
-# Split into two groups by evaluation source:
+# All four rules are now uniform Prometheus spanmetrics alerts, importable
+# via Grafana Cloud → Alerting → Alert rules → Import Prometheus alert rules,
+# pointed at grafanacloud-mnemom-prom. The underlying series
+# (`traces_spanmetrics_*`) are populated by Grafana's metrics-generator from
+# the spans observer emits on the /v1/traces route.
 #
-#   - prometheus (spanmetrics): imported via Grafana Cloud → Alerting →
-#       Alert rules → Import Prometheus alert rules, pointed at
-#       grafanacloud-mnemom-prom. Works because the underlying series
-#       (traces_spanmetrics_*) are populated by Grafana's metrics-generator
-#       from the spans the observer emits on the /v1/traces route.
-#
-#   - traceql (Tempo metrics queries): Grafana-managed rules — cannot be
-#       imported via this YAML. Create in Grafana UI: Alerting → Alert
-#       rules → New alert rule → Data source = grafanacloud-mnemom-traces.
-#       Paste the expression from the `traceql:` block below. Thresholds
-#       and annotations carried verbatim from the Prometheus rules they
-#       replace so dashboards + runbook references stay valid.
+# History — why the rules look the same shape now: the original Step 52 cut
+# (PR #178) tried direct OTLP /v1/metrics; ADR-032 pivoted to span-derived
+# observability; PRs #188 + #189 shipped that. The three depth/lag alerts
+# were intended as Tempo TraceQL rules. On 2026-04-28 we discovered Grafana
+# SSE cannot accept TraceQL metrics output (long-format vs. wide-format
+# data-frame mismatch), so ADR-043 converted those three gauges into
+# threshold-breach spans. Each emits a separate span name on threshold
+# crossing; spanmetrics rolls them into per-name counters; alerts now mirror
+# ObserverPoisonAckRate exactly.
 #
 # Source spans emitted by observer/src/metrics.ts:
 #
-#   observer.queue_batch    (one per MessageBatch; attrs: env, mode,
-#                            gateway_id, batch_size, processed, skipped,
-#                            acks_on_missing, poison_acks, retries,
-#                            oldest_message_lag_ms; status=ERROR if
-#                            poison_acks > 0)
-#   observer.queue_poison   (one per poison-acked message; attrs: env,
-#                            mode, gateway_id, reason=poison;
-#                            status=ERROR)
-#   observer.queue_backlog  (one per queue per scheduled() tick; attrs:
-#                            env, queue, gateway_id, depth)
+#   observer.queue_batch                 (one per MessageBatch; attrs: env,
+#                                          mode, gateway_id, batch_size,
+#                                          processed, skipped, acks_on_missing,
+#                                          poison_acks, retries,
+#                                          oldest_message_lag_ms; status=ERROR
+#                                          if poison_acks > 0)
+#   observer.queue_poison                (one per poison-acked message)
+#   observer.queue_backlog               (one per queue per scheduled() tick;
+#                                          attrs: env, queue, gateway_id,
+#                                          depth)
+#   observer.queue_backlog_breach        (ADR-043 — emitted only when
+#                                          queue=main and depth > 50000)
+#   observer.queue_dlq_breach            (ADR-043 — emitted only when
+#                                          queue=dlq and depth > 0)
+#   observer.queue_consumer_lag_breach   (ADR-043 — emitted only when a
+#                                          queue_batch's oldest_message_lag_ms
+#                                          exceeds 600000)
 #
-# Consumer lag (ADR-033) is measured per-batch in handleQueueBatch and
-# carried as the `oldest_message_lag_ms` attribute on observer.queue_batch.
-# CF Analytics doesn't expose oldest-unacked-message age; we measure it
-# directly from message.timestamp at batch arrival.
+# The non-breach spans keep emitting unchanged so Tempo trace search remains
+# the smooth-gauge view for incident triage.
 #
 # Severity maps to our two-tier setup (critical=P0 page, high=P1 Slack).
 
@@ -41,13 +48,11 @@ groups:
     rules:
 
       # ─── Poison-ack rate > 0 sustained (consumer dropping messages) ─────────
-      # Works as a direct spanmetrics rate query: each poison-acked message
-      # emits its own observer.queue_poison span, so the call-count rate is
-      # the message rate.
       - alert: ObserverPoisonAckRate
         expr: |
           sum by (gateway_id) (
             rate(traces_spanmetrics_calls_total{
+              service_name="mnemom-observer",
               span_name="observer.queue_poison"
             }[15m])
           ) > 0
@@ -64,60 +69,79 @@ groups:
             poison-ack drops a trace permanently. Sustained poison acks
             usually mean a decryption-key mismatch on a new R2 object shape
             (rotate LOGPUSH_DECRYPT_PRIVATE_KEY or re-check the Logpush
-            envelope format). Note: the `gateway_id` label requires
-            promotion on the metrics-generator config — until that's added,
-            this alert fires with an empty `gateway_id`; the runbook
-            narrows down by checking staging vs prod observer logs.
+            envelope format).
+          runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
+
+      # ─── Main-queue backlog over threshold (consumer not draining) ──────────
+      - alert: ObserverQueueBacklogHigh
+        expr: |
+          sum by (gateway_id) (
+            rate(traces_spanmetrics_calls_total{
+              service_name="mnemom-observer",
+              span_name="observer.queue_backlog_breach"
+            }[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: high
+          service: mnemom-observer
+          area: observer-scale
+        annotations:
+          summary: Observer main queue backlog > 50k for 5m
+          description: |
+            Each emission of observer.queue_backlog_breach indicates the main
+            queue's avg depth crossed 50000 messages on that scheduled() tick.
+            Sustained signal means the consumer isn't draining: likely
+            consumer crash-loop, Anthropic rate-limit, Supabase 5xx, or a
+            recent deploy regression.
+          runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
+
+      # ─── DLQ has any backlog ─────────────────────────────────────────────────
+      - alert: ObserverDLQNonEmpty
+        expr: |
+          sum by (gateway_id) (
+            rate(traces_spanmetrics_calls_total{
+              service_name="mnemom-observer",
+              span_name="observer.queue_dlq_breach"
+            }[10m])
+          ) > 0
+        for: 10m
+        labels:
+          severity: high
+          service: mnemom-observer
+          area: observer-scale
+        annotations:
+          summary: Observer DLQ has backlogged message(s)
+          description: |
+            A message exhausted max_retries or was classified as poison that
+            evaded the isPoisonError classifier. Inspect Tier 3 Worker logs
+            for the message ID and decide whether to redrive or quarantine.
+          runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
+
+      # ─── Consumer lag > 10m (Step 53 SLO breach) ────────────────────────────
+      - alert: ObserverConsumerLagHigh
+        expr: |
+          sum by (gateway_id) (
+            rate(traces_spanmetrics_calls_total{
+              service_name="mnemom-observer",
+              span_name="observer.queue_consumer_lag_breach"
+            }[10m])
+          ) > 0
+        for: 10m
+        labels:
+          severity: high
+          service: mnemom-observer
+          area: observer-scale
+        annotations:
+          summary: Observer consumer lag > 10m
+          description: |
+            ADR-033: per-batch lag is captured at batch arrival as
+            (Date.now() - min(message.timestamp)) on every queue_batch span.
+            ADR-043: a counter-style observer.queue_consumer_lag_breach span
+            fires when that value crosses 600000ms. Breach of Step 53's
+            load-test SLO; often co-fires with ObserverQueueBacklogHigh.
           runbook_url: https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
 
 # ============================================================================
-# TraceQL metrics rules — create via Grafana UI, not YAML import.
-# ============================================================================
-#
-# These three alerts evaluate gauge-style signals (queue depth, consumer lag)
-# that don't map to spanmetrics call-rate semantics. They run against Tempo
-# via TraceQL metrics queries and must be provisioned as Grafana-managed
-# alert rules (Alerting → New alert rule → grafanacloud-mnemom-traces).
-#
-#   ObserverQueueBacklogHigh
-#     expr:       {resource.service.name="mnemom-observer"
-#                   && name="observer.queue_backlog"
-#                   && span.queue="main"} | max_over_time(span.depth)
-#     threshold:  > 50000
-#     for:        5m
-#     severity:   high
-#     summary:    Observer main queue backlog > 50k for 5m
-#     description same as pre-refactor: consumer not draining; likely causes
-#                 are consumer crash-loop, Anthropic rate-limit, Supabase
-#                 5xx, or recent deploy regression.
-#
-#   ObserverDLQNonEmpty
-#     expr:       {resource.service.name="mnemom-observer"
-#                   && name="observer.queue_backlog"
-#                   && span.queue="dlq"} | max_over_time(span.depth)
-#     threshold:  > 0
-#     for:        10m
-#     severity:   high
-#     summary:    Observer DLQ has backlogged message(s)
-#     description same as pre-refactor: a message exhausted max_retries or
-#                 was classified as poison that evaded the isPoisonError
-#                 classifier; inspect Tier 3 Worker logs for message ID.
-#
-#   ObserverConsumerLagHigh
-#     expr:       {resource.service.name="mnemom-observer"
-#                   && name="observer.queue_batch"}
-#                   | max_over_time(span.oldest_message_lag_ms)
-#     threshold:  > 600000   (10 minutes in ms)
-#     for:        10m
-#     severity:   high
-#     summary:    Observer consumer lag > 10m
-#     description ADR-033: per-batch lag is captured at batch arrival as
-#                 (Date.now() - min(message.timestamp)) on every queue_batch
-#                 span. Breaches Step 53's load-test SLO; often co-fires
-#                 with ObserverQueueBacklogHigh.
-#
-# All three share runbook_url:
-#   https://github.com/mnemom/scale/blob/main/runbooks/observer-queue-metrics.md
-#
 # Provisioning follow-up: move these to Terraform-managed Grafana resources
 # once the refactor burns in (tracked in scale/implementation-plan.md).
