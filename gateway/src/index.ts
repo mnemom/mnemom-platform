@@ -74,7 +74,6 @@ import {
   parseL2Response,
   mergeL1AndL2,
   buildThreatContextForAIP,
-  buildPreemptiveNudgeContent,
   redactDLPMatches,
   type DLPMatch,
   buildSHExitAnalysisPrompt,
@@ -5080,15 +5079,59 @@ export function summarizeRequestInterventions(args: {
   return summaries;
 }
 
-/** Write a pre-emptive Safe House nudge to the enforcement_nudges table. */
-async function writePreemptiveNudge(
+/**
+ * Write an inside.integrity nudge advisory (T0-11, ADR-040).
+ *
+ * Companion to writeIntegrityEnforceAdvisory (T0-5). Fires when AIP
+ * returns `boundary_violation` under `integrity_mode='nudge'` — the
+ * mode-side counterpart to enforce. Same payload shape as the enforce
+ * variant; differs only in the `source` value
+ * (`runtime.inside.integrity.nudge`) and the agent-voice text framing
+ * ("noticed" vs. "intervened").
+ *
+ * Replaces the legacy `createPendingNudge` writer at the buffered
+ * AIP call site for nudge mode. Streaming-path AIP call sites still
+ * use `createPendingNudge` until streaming gets its own T0-5
+ * equivalent.
+ *
+ * Best-effort: errors swallowed.
+ */
+export async function writeIntegrityNudgeAdvisory(
   agentId: string,
   sessionId: string,
-  nudge: { nudge_content: string; threat_type: string; sh_score: number; pre_emptive: true },
-  env: Env
+  checkpoint: {
+    checkpoint_id: string;
+    verdict: string;
+    concerns?: Array<{ category?: string | null; severity?: string | null; description?: string | null; relevant_conscience_value?: string | null }>;
+    reasoning_summary?: string | null;
+  },
+  env: Env,
 ): Promise<void> {
+  if (checkpoint.verdict !== 'boundary_violation') return;
   try {
-    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/enforcement_nudges`, {
+    const ttlHours = await getPendingAdvisoryTtlHours(env);
+    const expiresAt = new Date(
+      Date.now() + ttlHours * 60 * 60 * 1000,
+    ).toISOString();
+    const boundary = extractBoundaryValueName(checkpoint);
+    const concerns = (checkpoint.concerns ?? []).slice(0, 3);
+    const summary = (checkpoint.reasoning_summary ?? '').trim();
+    const summaryClause = summary
+      ? ` (${summary.length > 240 ? `${summary.slice(0, 237)}...` : summary})`
+      : '';
+    const text = boundary
+      ? `[Mnemom advisory: an integrity checkpoint flagged ` +
+        `the BOUNDARY value \`${boundary}\` in my reasoning${summaryClause}. ` +
+        `Review my approach and self-correct if needed.]`
+      : `[Mnemom advisory: an integrity checkpoint flagged a boundary ` +
+        `concern in my reasoning${summaryClause}. ` +
+        `Review my approach and self-correct if needed.]`;
+    const summaryShort = boundary
+      ? `Inside.integrity nudge: ${boundary}`
+      : 'Inside.integrity nudge (boundary value unidentified)';
+    const id = `pa-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+
+    await supabaseFetch(`${env.SUPABASE_URL}/rest/v1/pending_advisories`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SECRET_KEY,
@@ -5097,22 +5140,37 @@ async function writePreemptiveNudge(
         Prefer: 'return=minimal',
       },
       body: JSON.stringify({
+        id,
         agent_id: agentId,
         session_id: sessionId,
-        // checkpoint_id intentionally omitted — NULL means Safe House-originated (see migration 107)
+        checkpoint_id: checkpoint.checkpoint_id,
         status: 'pending',
-        concerns_summary: nudge.nudge_content,
-        metadata: {
-          pre_emptive: true,
-          threat_type: nudge.threat_type,
-          sh_score: nudge.sh_score,
+        nudge_content: text,
+        concerns_summary: summaryShort,
+        source: 'runtime.inside.integrity.nudge',
+        source_ref: {
+          checkpoint_id: checkpoint.checkpoint_id,
+          verdict: checkpoint.verdict,
+          boundary_value: boundary,
+          concerns: concerns.map((c) => ({
+            category: c.category ?? null,
+            severity: c.severity ?? null,
+            relevant_conscience_value: c.relevant_conscience_value ?? null,
+          })),
         },
+        expires_at: expiresAt,
       }),
     });
   } catch {
-    // Non-blocking
+    // Non-blocking. ADR-040: pending advisories are best-effort.
   }
 }
+
+// T0-11: writePreemptiveNudge function deleted. The function POSTed an
+// unsupported `metadata` column + missing `nudge_content` to the
+// enforcement_nudges compatibility view, so every call was failing
+// silently in production. Front-door enforce paths now use
+// writeFrontDoorAdvisory (T0-3); observe mode is silent per ADR-040.
 
 /** Write Safe House result to KV so the AIP analysis (Phase 1+) can enrich its conscience prompt. */
 async function cacheSHResultForAIP(
@@ -5288,9 +5346,12 @@ async function runObserveSH(
     // Deliver Safe House webhooks
     await deliverSHWebhooks(decision, agentId, sessionId, env);
 
-    // Write pre-emptive nudge — will be picked up on the NEXT request for this agent
-    const nudge = buildPreemptiveNudgeContent(decision);
-    if (nudge) await writePreemptiveNudge(agentId, sessionId, nudge, env);
+    // T0-11 removed the legacy writePreemptiveNudge call here. ADR-040
+    // mandates observe mode is silent for the agent — the cross-turn
+    // carryover advisory belonged to nudge / enforce modes only. The
+    // legacy writer also POSTed an unsupported `metadata` column +
+    // missing `nudge_content`, so it was failing silently in
+    // production anyway.
 
     console.log(JSON.stringify({
       event: 'sh_observe',
@@ -5881,12 +5942,16 @@ export async function handleProviderProxy(
 
             // Cache Safe House result in KV for AIP enrichment (Phase 1+)
             ctx.waitUntil(cacheSHResultForAIP(sessionId, decision, env));
-            // Write pre-emptive nudge to enforcement channel when score >= 0.6
-            // Gateway's existing injectPendingNudges() picks this up automatically
-            const nudge = buildPreemptiveNudgeContent(decision);
-            if (nudge) {
-              ctx.waitUntil(writePreemptiveNudge(agent.id, sessionId, nudge, env));
-            }
+            // T0-11 removed the legacy writePreemptiveNudge call here.
+            // For block / quarantine verdicts, writeFrontDoorAdvisory
+            // already fires above (T0-3) and writes the canonical
+            // `runtime.front_door.enforce` advisory. For warn verdicts
+            // under enforce mode, the same-turn intervention IS the
+            // decoration; no carryover advisory is written (ADR-040
+            // doesn't enumerate a `runtime.front_door.warn` source).
+            // The legacy writer was also POSTing an unsupported
+            // `metadata` column + missing `nudge_content`, so it was
+            // failing silently in production anyway.
           }
 
           // Always update session state with this message's score
@@ -6802,18 +6867,29 @@ export async function handleProviderProxy(
         ).catch(() => { /* fail-open */ }));
       }
 
-      // Create pending nudge for boundary violations (nudge or enforce mode)
+      // T0-11: cross-turn nudge advisory for boundary violations under
+      // nudge mode. Enforce mode is handled by writeIntegrityEnforceAdvisory
+      // in the same-turn replacement path below — firing both writers
+      // for one event was the duplicate-rows situation T0-11 dedupes.
       if (
         checkpoint.verdict === 'boundary_violation' &&
-        (enforcementMode === 'nudge' || enforcementMode === 'enforce')
+        enforcementMode === 'nudge'
       ) {
         ctx.waitUntil(
-          countSessionViolations(agent.id, sessionId, env).then(violationCount => {
+          countSessionViolations(agent.id, sessionId, env).then((violationCount) => {
             if (shouldCreateNudge(agentSettings, violationCount)) {
-              return createPendingNudge(checkpoint, agent.id, sessionId, env);
+              return writeIntegrityNudgeAdvisory(agent.id, sessionId, checkpoint, env);
             }
-          })
+          }),
         );
+        ctx.waitUntil(checkAutoContainment(agent.id, sessionId, checkpoint, env));
+      } else if (
+        checkpoint.verdict === 'boundary_violation' &&
+        enforcementMode === 'enforce'
+      ) {
+        // Auto-containment still fires under enforce; the carryover
+        // advisory itself is written by writeIntegrityEnforceAdvisory in
+        // the same-turn replacement block.
         ctx.waitUntil(checkAutoContainment(agent.id, sessionId, checkpoint, env));
       }
 
