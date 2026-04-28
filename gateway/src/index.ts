@@ -1546,6 +1546,28 @@ function buildNudgeText(
 }
 
 /**
+ * Build the system-message text from a set of pending advisories
+ * (T0-7, ADR-040). Each advisory's `nudge_content` is already
+ * formatted in the agent's voice by the writer that produced it
+ * (T0-3..T0-6 produce "[Mnemom advisory: ...]" or "[Mnemom
+ * Intervention: ...]" prefixes), so this function just wraps the
+ * concatenated bodies with a thin header noting these are cross-turn
+ * carryover from prior turns.
+ *
+ * Replaces the previous integrity-only `buildNudgeText` for the read
+ * path; that function stays in place for legacy createPendingNudge
+ * write-time usage which T0-7 doesn't touch.
+ */
+function buildAdvisoryText(
+  advisories: Array<{ id: string; source: string; nudge_content: string }>,
+): string {
+  if (advisories.length === 0) return '';
+  const header = '[Mnemom advisories from prior turns]';
+  const lines = advisories.map((a) => a.nudge_content.trim());
+  return `${header}\n\n${lines.join('\n\n')}`;
+}
+
+/**
  * Inject nudge text into the request body's system parameter.
  * Handles string, array-of-content-blocks, or absent system field.
  */
@@ -1595,9 +1617,10 @@ function injectNudgeForProvider(
  * Returns the IDs of injected nudges (for later marking as delivered).
  * Fail-open: errors logged, request proceeds unmodified.
  */
-async function injectPendingNudges(
+export async function injectPendingNudges(
   requestBody: Record<string, any>,
   agentId: string,
+  sessionId: string | null,
   enforcementMode: string,
   env: Env,
   provider: GatewayProvider = 'anthropic',
@@ -1612,37 +1635,65 @@ async function injectPendingNudges(
   }
 
   try {
-    const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
-    const response = await supabaseFetch(
-      `${env.SUPABASE_URL}/rest/v1/enforcement_nudges?agent_id=eq.${agentId}&status=eq.pending&created_at=gte.${fourHoursAgo}&order=created_at.asc&limit=5`,
-      {
-        headers: {
-          apikey: env.SUPABASE_SECRET_KEY,
-          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
-        },
-      }
-    );
+    // T0-7: read directly from pending_advisories (not the legacy
+    // `enforcement_nudges` compatibility view) so we get the `source`
+    // field + the per-row `expires_at` instead of the view's hardcoded
+    // 4h horizon. `or=(expires_at.is.null,expires_at.gt.<now>)` matches
+    // the view's "non-expired" semantics; rows with NULL expires_at
+    // can only exist for legacy data the migration-150 backfill missed.
+    const nowIso = new Date().toISOString();
+    const params = [
+      `agent_id=eq.${agentId}`,
+      'status=eq.pending',
+      `or=(expires_at.is.null,expires_at.gt.${encodeURIComponent(nowIso)})`,
+      'select=id,source,nudge_content',
+      'order=created_at.asc',
+      'limit=5',
+    ];
+    // Optional session filter: when a sessionId is in scope, prefer
+    // advisories targeted at that session, but still surface unscoped
+    // advisories (older rows or platform-level advisories) so the
+    // agent's context isn't artificially narrowed.
+    if (sessionId) {
+      params.push(
+        `or=(session_id.eq.${encodeURIComponent(sessionId)},session_id.is.null)`,
+      );
+    }
+    const url = `${env.SUPABASE_URL}/rest/v1/pending_advisories?${params.join('&')}`;
+    const response = await supabaseFetch(url, {
+      headers: {
+        apikey: env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+      },
+    });
 
     if (!response.ok) {
-      console.warn(`[gateway/nudge] Failed to fetch pending nudges: ${response.status}`);
+      console.warn(`[gateway/advisory] Failed to fetch pending advisories: ${response.status}`);
       return [];
     }
 
-    const nudges = (await response.json()) as Array<{
+    const advisories = (await response.json()) as Array<{
       id: string;
-      checkpoint_id: string;
-      concerns_summary: string;
+      source: string;
+      nudge_content: string;
     }>;
 
-    if (nudges.length === 0) return [];
+    if (advisories.length === 0) return [];
 
-    const nudgeText = buildNudgeText(nudges);
-    injectNudgeForProvider(requestBody, nudgeText, provider);
-    console.log(`[gateway/nudge] Injected ${nudges.length} nudge(s) for ${agentId} (provider: ${provider})`);
+    const advisoryText = buildAdvisoryText(advisories);
+    injectNudgeForProvider(requestBody, advisoryText, provider);
+    console.log(JSON.stringify({
+      event: 'gateway_advisory_injection',
+      agent_id: agentId,
+      session_id: sessionId,
+      provider,
+      count: advisories.length,
+      sources: Array.from(new Set(advisories.map((a) => a.source))),
+    }));
 
-    return nudges.map((n) => n.id);
+    return advisories.map((a) => a.id);
   } catch (error) {
-    console.error('[gateway/nudge] Error injecting nudges (fail-open):', error);
+    console.error('[gateway/advisory] Error injecting pending advisories (fail-open):', error);
     return [];
   }
 }
@@ -2364,7 +2415,7 @@ async function analyzeStreamInBackground(
  * Mark nudges as delivered after successful injection.
  * Called via ctx.waitUntil() after the forward completes.
  */
-async function markNudgesDelivered(
+export async function markNudgesDelivered(
   nudgeIds: string[],
   sessionId: string,
   env: Env
@@ -2373,8 +2424,18 @@ async function markNudgesDelivered(
 
   try {
     for (const nudgeId of nudgeIds) {
+      // T0-7: atomic mark-consumed. The URL filter pins both
+      // id=eq.${nudgeId} AND status=eq.pending into the WHERE clause.
+      // PostgREST translates this to UPDATE ... WHERE id=$1 AND
+      // status='pending', so a concurrent request that already flipped
+      // the row to 'delivered' makes this PATCH a no-op (0 rows
+      // affected). Prevents double-mark; combined with status=eq.pending
+      // on the read side, prevents the same advisory from being
+      // re-delivered after another request has consumed it. Writes
+      // directly to pending_advisories (not the enforcement_nudges
+      // compatibility view) for the same reasons as the read path.
       const response = await supabaseFetch(
-        `${env.SUPABASE_URL}/rest/v1/enforcement_nudges?id=eq.${nudgeId}`,
+        `${env.SUPABASE_URL}/rest/v1/pending_advisories?id=eq.${nudgeId}&status=eq.pending`,
         {
           method: 'PATCH',
           headers: {
@@ -2392,12 +2453,12 @@ async function markNudgesDelivered(
       );
 
       if (!response.ok) {
-        console.warn(`[gateway/nudge] Failed to mark nudge ${nudgeId} delivered: ${response.status}`);
+        console.warn(`[gateway/advisory] Failed to mark advisory ${nudgeId} delivered: ${response.status}`);
       }
     }
-    console.log(`[gateway/nudge] Marked ${nudgeIds.length} nudge(s) as delivered`);
+    console.log(`[gateway/advisory] Marked ${nudgeIds.length} advisory/advisories as delivered`);
   } catch (error) {
-    console.error('[gateway/nudge] Error marking nudges delivered:', error);
+    console.error('[gateway/advisory] Error marking advisories delivered:', error);
   }
 }
 
@@ -5381,6 +5442,7 @@ export async function handleProviderProxy(
         injectedNudgeIds = await injectPendingNudges(
           requestBody,
           agent.id,
+          sessionId,
           agentEnforcementMode,
           env,
           provider,
