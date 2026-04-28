@@ -44,6 +44,7 @@ import {
   generateCertificateId,
 } from './attestation';
 import { readStreamToText, parseSSEEvents } from './sse-parser';
+import { synthesizeProviderStream, streamFromText } from './sse-synthesizer';
 import {
   mapUnifiedCardToAAP,
   mapCanonicalToSafeHouseConfig,
@@ -2031,10 +2032,20 @@ async function countSessionViolations(
 }
 
 /**
- * Background analysis for tee'd streaming responses.
+ * Background or foreground analysis for tee'd streaming responses.
+ *
  * Reads the analysis fork of the stream, parses SSE, extracts thinking,
- * runs the full AIP pipeline with attestation, creates nudges if needed.
- * Entirely fail-open — errors are logged but never affect the client stream.
+ * runs the full AIP pipeline with attestation, writes mode-appropriate
+ * advisories. Entirely fail-open — errors are logged but never affect
+ * the client stream.
+ *
+ * Returns the resulting checkpoint (or null on early-exit / failure) so
+ * foreground callers can branch on the verdict — used by the streaming
+ * inside.integrity enforce path (T0-5 streaming addendum, ADR-040) which
+ * awaits the analysis synchronously, then either re-emits the upstream
+ * SSE (clear) or synthesizes an intervention SSE (boundary_violation).
+ *
+ * Background callers ignore the return.
  */
 async function analyzeStreamInBackground(
   stream: ReadableStream,
@@ -2048,7 +2059,7 @@ async function analyzeStreamInBackground(
   env: Env,
   /** Canaries already checked inline by the CBD stream transform — skip redundant re-check */
   alreadyCheckedCanaries?: string[],
-): Promise<void> {
+): Promise<IntegrityCheckpoint | null> {
   try {
     // 1. Read the tee'd stream to completion
     const sseText = await readStreamToText(stream);
@@ -2059,7 +2070,7 @@ async function analyzeStreamInBackground(
     // 3. Skip if no thinking content
     if (!parsed.thinking) {
       console.log(`[gateway/stream-aip] No thinking block in streaming response (provider: ${provider})`);
-      return;
+      return null;
     }
 
     // 4. Fetch alignment data and recent checkpoints in parallel
@@ -2072,7 +2083,7 @@ async function analyzeStreamInBackground(
 
     if (!card) {
       console.log('[gateway/stream-aip] No alignment card found, skipping');
-      return;
+      return null;
     }
 
     // ADR-039 Decision 1: integrity_mode === 'off' means the customer / org /
@@ -2082,7 +2093,7 @@ async function analyzeStreamInBackground(
       console.log(JSON.stringify({
         event: 'aip_skipped', agent_id: agent.id, reason: 'integrity_mode_off',
       }));
-      return;
+      return null;
     }
 
     const aipCard = mapCardToAIP(card);
@@ -2196,31 +2207,41 @@ async function analyzeStreamInBackground(
           const hybridResult = (await hybridResponse.json()) as Record<string, unknown>;
           const hybridCheckpoint = hybridResult.checkpoint as IntegrityCheckpoint;
 
-          // Create nudge for violations
+          // T0-11 streaming dedupe: write the mode-appropriate advisory via
+          // the unified writers instead of the legacy createPendingNudge.
+          // Enforce-mode writes happen in the foreground caller (T0-5
+          // streaming addendum) so we only fire here for nudge mode.
           if (
             hybridCheckpoint.verdict === 'boundary_violation' &&
-            (enforcementMode === 'nudge' || enforcementMode === 'enforce')
+            enforcementMode === 'nudge'
           ) {
             const violationCount = await countSessionViolations(agent.id, sessionId, env);
             if (shouldCreateNudge(agentSettings, violationCount)) {
-              await createPendingNudge(hybridCheckpoint, agent.id, sessionId, env);
+              await writeIntegrityNudgeAdvisory(agent.id, sessionId, hybridCheckpoint, env);
             }
+            await checkAutoContainment(agent.id, sessionId, hybridCheckpoint, env);
+          } else if (
+            hybridCheckpoint.verdict === 'boundary_violation' &&
+            enforcementMode === 'enforce'
+          ) {
+            // Auto-containment still fires under enforce; the carryover
+            // advisory itself is written by the streaming-enforce caller.
             await checkAutoContainment(agent.id, sessionId, hybridCheckpoint, env);
           }
           console.log(`[gateway/stream-aip] Hybrid analysis complete: verdict=${hybridCheckpoint.verdict}`);
-          return;
+          return hybridCheckpoint;
         }
         console.error(`[gateway/stream-aip] Hybrid analyze returned ${hybridResponse.status}`);
       } catch (hybridErr) {
         console.error('[gateway/stream-aip] Hybrid analyze failed:', hybridErr);
       }
-      return; // fail-open for hybrid
+      return null; // fail-open for hybrid
     }
 
     // 8. Skip if no analysis capability configured
     if (!env.ANTHROPIC_API_KEY) {
       console.log('[gateway/stream-aip] No analysis capability configured, skipping');
-      return;
+      return null;
     }
 
     // 9. Build conscience prompt and call analysis LLM
@@ -2392,21 +2413,32 @@ async function analyzeStreamInBackground(
       ).catch(() => { /* fail-open */ });
     }
 
-    // 14. Create nudge for boundary violations
+    // 14. T0-11 streaming dedupe: mode-appropriate advisory write via the
+    // unified writers. Enforce-mode writes happen in the foreground caller
+    // (T0-5 streaming addendum) so we only fire here for nudge mode.
     if (
       checkpoint.verdict === 'boundary_violation' &&
-      (enforcementMode === 'nudge' || enforcementMode === 'enforce')
+      enforcementMode === 'nudge'
     ) {
       const violationCount = await countSessionViolations(agent.id, sessionId, env);
       if (shouldCreateNudge(agentSettings, violationCount)) {
-        await createPendingNudge(checkpoint, agent.id, sessionId, env);
+        await writeIntegrityNudgeAdvisory(agent.id, sessionId, checkpoint, env);
       }
+      await checkAutoContainment(agent.id, sessionId, checkpoint, env);
+    } else if (
+      checkpoint.verdict === 'boundary_violation' &&
+      enforcementMode === 'enforce'
+    ) {
+      // Auto-containment still fires under enforce; the carryover advisory
+      // itself is written by the streaming-enforce caller.
       await checkAutoContainment(agent.id, sessionId, checkpoint, env);
     }
 
     console.log(`[gateway/stream-aip] Analysis complete: verdict=${checkpoint.verdict}, cert=${attestation?.certificate_id || 'none'}`);
+    return checkpoint;
   } catch (error) {
     console.error('[gateway/stream-aip] Background analysis failed (fail-open):', error);
+    return null;
   }
 }
 
@@ -3137,18 +3169,20 @@ function extractToolsFromRequest(
  * the chat completes, the agent's response names the prevention, no
  * fabricated tool calls.
  *
- * Streaming (`stream: true`) requests today receive the same buffered
- * 403 JSON regardless of mode; this synthetic 200 keeps the same shape
- * (no SSE), preserving the existing contract. SSE-shaped synthesis is
- * a follow-up.
+ * Streaming (`stream: true`) requests are handled by the streaming-aware
+ * branch at the call site (T0-4 streaming addendum) which calls
+ * `synthesizeProviderStream` with the text returned by
+ * `buildAutonomyInterventionText` to produce a per-provider SSE shape.
+ * This buffered JSON synthesizer covers the non-streaming path only.
  */
-export function buildAutonomyEnforceResponse(
-  provider: GatewayProvider,
-  evalResult: { verdict: string; violations: Array<{ tool_name?: string; type?: string; reason?: string; rule_id?: string; severity?: string }> },
-  requestBody: Record<string, any> | null,
-): { body: string; contentType: string } {
-  // Compose the agent-facing text. Lists up to three violating tools;
-  // names rule_id when present so reviewers can trace back to the card.
+/**
+ * Compose the agent-facing intervention text for a CLPI enforce-mode
+ * fail. Shared by `buildAutonomyEnforceResponse` (buffered JSON shape)
+ * and the streaming SSE synthesis path (T0-4 streaming addendum).
+ */
+export function buildAutonomyInterventionText(
+  evalResult: { violations: Array<{ tool_name?: string; type?: string; reason?: string; rule_id?: string }> },
+): string {
   const violations = evalResult.violations.slice(0, 3);
   const violationLines = violations.map((v) => {
     const tool = v.tool_name ? `\`${v.tool_name}\`` : 'a tool';
@@ -3156,13 +3190,22 @@ export function buildAutonomyEnforceResponse(
     const ruleSuffix = v.rule_id ? ` (rule: ${v.rule_id})` : '';
     return `- ${tool}: ${reason}${ruleSuffix}`;
   });
-  const intervention =
+  return (
     `[Mnemom Intervention: I cannot proceed with this request. ` +
     `My alignment card prevents the following tool${violations.length === 1 ? '' : 's'}:\n` +
     `${violationLines.join('\n')}\n\n` +
     `The tool side effect did not happen. If you'd like to continue, ` +
     `you can either remove the disallowed capabilities from the request ` +
-    `or update the alignment card to permit them.]`;
+    `or update the alignment card to permit them.]`
+  );
+}
+
+export function buildAutonomyEnforceResponse(
+  provider: GatewayProvider,
+  evalResult: { verdict: string; violations: Array<{ tool_name?: string; type?: string; reason?: string; rule_id?: string; severity?: string }> },
+  requestBody: Record<string, any> | null,
+): { body: string; contentType: string } {
+  const intervention = buildAutonomyInterventionText(evalResult);
 
   const requestedModel: string =
     (requestBody && typeof (requestBody as any).model === 'string'
@@ -5094,10 +5137,9 @@ export function summarizeRequestInterventions(args: {
  * (`runtime.inside.integrity.nudge`) and the agent-voice text framing
  * ("noticed" vs. "intervened").
  *
- * Replaces the legacy `createPendingNudge` writer at the buffered
- * AIP call site for nudge mode. Streaming-path AIP call sites still
- * use `createPendingNudge` until streaming gets its own T0-5
- * equivalent.
+ * Replaces the legacy `createPendingNudge` writer at both the buffered
+ * and streaming AIP call sites for nudge mode. Streaming dedupe landed
+ * with the T0-4 / T0-5 streaming addenda (this PR).
  *
  * Best-effort: errors swallowed.
  */
@@ -6136,24 +6178,50 @@ export async function handleProviderProxy(
             // Best-effort cross-turn advisory writes the violation context
             // for the next turn.
             if (enforcementMode === 'enforce' && evalResult.verdict === 'fail') {
-              const synthesized = buildAutonomyEnforceResponse(
-                provider,
-                evalResult,
-                requestBody,
-              );
               ctx.waitUntil(
                 writeAutonomyEnforceAdvisory(agent.id, sessionId, evalResult, env),
               );
+              const wantsStream = requestBody?.stream === true;
               console.log(JSON.stringify({
                 event: 'gateway_autonomy_enforce',
                 agent_id: agent.id,
                 session_id: sessionId,
                 provider,
+                stream: wantsStream,
                 violation_count: evalResult.violations.length,
                 violation_tools: evalResult.violations
                   .map((v: any) => v.tool_name)
                   .filter((n: unknown) => typeof n === 'string'),
               }));
+
+              if (wantsStream) {
+                // T0-4 streaming addendum (ADR-040): synthesize a per-provider
+                // SSE intervention so streaming clients receive the same-turn
+                // 200 in their expected format. Pre-PR, streaming clients
+                // received an application/json body (the buffered shape),
+                // breaking SDK parsers that assert text/event-stream on a
+                // stream:true request.
+                const interventionText = buildAutonomyInterventionText(evalResult);
+                const synthesized = synthesizeProviderStream(
+                  provider,
+                  interventionText,
+                  requestBody,
+                );
+                return new Response(synthesized.body, {
+                  status: 200,
+                  headers: {
+                    ...synthesized.headers,
+                    'X-Policy-Verdict': 'fail',
+                    'X-Mnemom-Autonomy-Verdict': 'enforced',
+                  },
+                });
+              }
+
+              const synthesized = buildAutonomyEnforceResponse(
+                provider,
+                evalResult,
+                requestBody,
+              );
               return new Response(synthesized.body, {
                 status: 200,
                 headers: {
@@ -6286,6 +6354,113 @@ export async function handleProviderProxy(
       const cbdCanaries = (env.SAFE_HOUSE_ENABLED === 'true' && env.BILLING_CACHE)
         ? await fetchAgentCanaries(agent.id, env).catch(() => [] as string[])
         : [] as string[];
+
+      // T0-5 streaming addendum (ADR-040): same-turn AIP enforce. Under
+      // `integrity_mode='enforce'` we trade chunked TTFB for same-turn
+      // semantics — buffer the upstream stream to text, run AIP, then either
+      // re-emit the upstream bytes (clear) or synthesize a per-provider
+      // intervention SSE (boundary_violation). Pre-PR, streaming under
+      // enforce returned the upstream stream verbatim (no intervention) and
+      // wrote a pending advisory for the next turn — that is not same-turn
+      // and violated I10.
+      //
+      // Mode is fetched once here so observe/nudge can stay on the
+      // tee-and-background path (zero TTFB cost). The double-fetch by the
+      // foreground analyzer is acceptable — enforce is the rare path.
+      const streamingIntegrityMode = await fetchAlignmentData(agent.id, env)
+        .then((d) => d.enforcementMode)
+        .catch(() => 'observe');
+
+      if (streamingIntegrityMode === 'enforce') {
+        // Apply CBD canary scan inline (same as below) but on the buffered
+        // bytes. The foreground path doesn't tee — we read once, parse,
+        // analyze, then decide.
+        const upstreamSSE = await readStreamToText(response.body);
+
+        // Inline CBD canary scan on the assembled output text. The streaming
+        // tee path runs scanForCanaryUse via the background analyzer; the
+        // foreground path runs it equivalently below before emitting bytes.
+        if (cbdCanaries.length > 0) {
+          const parsedForCanary = parseSSEEvents(upstreamSSE, provider);
+          const triggered = scanForCanaryUse(parsedForCanary.text, cbdCanaries);
+          if (triggered) {
+            console.log(JSON.stringify({
+              event: 'sh_canary_triggered',
+              agent_id: agent.id,
+              session_id: sessionId,
+              path: 'streaming_enforce_foreground',
+              canary_prefix: triggered.slice(0, 6) + '****',
+            }));
+            void markCanaryTriggered(agent.id, triggered, env);
+            responseHeaders.set('X-Safe-House-Canary-Triggered', 'true');
+            return new Response(JSON.stringify({
+              error: 'Agent response blocked — canary credential detected (confirmed compromise)',
+              type: 'sh_canary_triggered',
+              agent_id: agent.id,
+              session_id: sessionId,
+            }), {
+              status: 500,
+              headers: {
+                'Content-Type': 'application/json',
+                ...Object.fromEntries(responseHeaders.entries()),
+              },
+            });
+          }
+        }
+
+        // Run the full AIP pipeline foreground. We feed the buffered bytes
+        // through the same analyzer used for the background path; it now
+        // returns the resulting checkpoint so we can branch on the verdict.
+        const analysisInputStream = streamFromText(upstreamSSE);
+        const checkpoint = await analyzeStreamInBackground(
+          analysisInputStream, provider, agent, sessionId,
+          agentSettings, quotaContext, requestBody, otelExporter, env,
+          cbdCanaries,
+        );
+
+        if (checkpoint && checkpoint.verdict === 'boundary_violation') {
+          // Same-turn enforce: synthesize per-provider SSE intervention.
+          const interventionText = buildIntegrityInterventionText(checkpoint);
+          const synthesized = synthesizeProviderStream(provider, interventionText, requestBody);
+          ctx.waitUntil(writeIntegrityEnforceAdvisory(agent.id, sessionId, checkpoint, env));
+          console.log(JSON.stringify({
+            event: 'gateway_integrity_enforce',
+            source: 'streaming_foreground',
+            agent_id: agent.id,
+            session_id: sessionId,
+            checkpoint_id: checkpoint.checkpoint_id,
+            boundary_value: extractBoundaryValueName(checkpoint),
+            concern_count: checkpoint.concerns?.length ?? 0,
+          }));
+          responseHeaders.set('X-AIP-Verdict', 'boundary_violation');
+          responseHeaders.set('X-AIP-Checkpoint-Id', checkpoint.checkpoint_id);
+          for (const [k, v] of Object.entries(synthesized.headers)) {
+            responseHeaders.set(k, v);
+          }
+          return new Response(synthesized.body, {
+            status: 200,
+            headers: responseHeaders,
+          });
+        }
+
+        // Pass-through: re-emit the upstream SSE bytes. Set X-AIP-Verdict
+        // from the checkpoint when available (clear / suspect / etc.); fall
+        // back to 'pending' if analysis was skipped (no card / mode=off /
+        // no thinking / error).
+        if (checkpoint) {
+          responseHeaders.set('X-AIP-Verdict', checkpoint.verdict);
+          responseHeaders.set('X-AIP-Checkpoint-Id', checkpoint.checkpoint_id);
+        } else {
+          responseHeaders.set('X-AIP-Verdict', 'skipped');
+        }
+        const upstreamContentType = response.headers.get('Content-Type') ?? 'text/event-stream';
+        responseHeaders.set('Content-Type', upstreamContentType);
+        return new Response(streamFromText(upstreamSSE), {
+          status: response.status,
+          headers: responseHeaders,
+        });
+      }
+
       const cbdFilteredBody = response.body
         ? response.body.pipeThrough(
             createCBDStreamTransform(agent.id, sessionId, cbdCanaries, env, ctx)

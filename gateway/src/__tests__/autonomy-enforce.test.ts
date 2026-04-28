@@ -20,9 +20,12 @@ vi.stubGlobal('fetch', mockFetch);
 
 import {
   buildAutonomyEnforceResponse,
+  buildAutonomyInterventionText,
   writeAutonomyEnforceAdvisory,
   type Env,
 } from '../index';
+import { parseSSEEvents } from '../sse-parser';
+import { synthesizeProviderStream } from '../sse-synthesizer';
 
 interface KVStub {
   get: ReturnType<typeof vi.fn>;
@@ -375,5 +378,36 @@ describe('writeAutonomyEnforceAdvisory', () => {
     );
     expect(body.nudge_content).toContain('unspecified');
     expect(body.source_ref.violations).toEqual([]);
+  });
+});
+
+// ─── buildAutonomyInterventionText (T0-4 streaming addendum) ────────────────
+
+describe('buildAutonomyInterventionText', () => {
+  it('returns the same text the buffered builder embeds in its body', () => {
+    const evalResult = makeEvalResult();
+    const text = buildAutonomyInterventionText(evalResult);
+    const buffered = JSON.parse(
+      buildAutonomyEnforceResponse('anthropic', evalResult, null).body,
+    );
+    expect(text).toBe(buffered.content[0].text);
+  });
+
+  it('feeds synthesizeProviderStream so the SSE round-trips with the same text', async () => {
+    for (const provider of ['anthropic', 'openai', 'gemini'] as const) {
+      const evalResult = makeEvalResult();
+      const text = buildAutonomyInterventionText(evalResult);
+      const { body } = synthesizeProviderStream(provider, text, { model: 'm' });
+      const decoder = new TextDecoder();
+      const chunks: string[] = [];
+      const reader = body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(decoder.decode(value));
+      }
+      const parsed = parseSSEEvents(chunks.join(''), provider);
+      expect(parsed.text).toBe(text);
+    }
   });
 });
