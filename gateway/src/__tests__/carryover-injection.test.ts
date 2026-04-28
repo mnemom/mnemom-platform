@@ -296,7 +296,10 @@ describe('markNudgesDelivered — atomic mark-consumed', () => {
     await markNudgesDelivered(['pa-bbbb2222'], 'sess-99', makeEnv());
     const init = mockFetch.mock.calls[0][1] as RequestInit;
     const body = JSON.parse(init.body as string);
-    expect(body.status).toBe('delivered');
+    // T0-12: status now writes the ADR-040 canonical value 'consumed'
+    // (was 'delivered' pre-T0-12). mnemom-api migration 154 extends
+    // the CHECK to allow both during the transition.
+    expect(body.status).toBe('consumed');
     expect(body.delivery_session_id).toBe('sess-99');
     const deliveredAt = new Date(body.delivered_at).getTime();
     expect(deliveredAt).toBeGreaterThanOrEqual(before);
