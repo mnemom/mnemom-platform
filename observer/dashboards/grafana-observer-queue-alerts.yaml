@@ -40,6 +40,13 @@
 # The non-breach spans keep emitting unchanged so Tempo trace search remains
 # the smooth-gauge view for incident triage.
 #
+# Label note: this stack's metrics-generator emits the resource service
+# label as `service` (NOT the OTel-default `service_name`). All filters
+# below use `service="mnemom-observer"`. Switched 2026-05-01 after
+# discovering that filters using `service_name=...` matched zero series
+# (silent NoData). See `scale/decisions/gate-M8-2026-05-01.md` §"Same-day
+# operational follow-ups" item D.
+#
 # Severity maps to our two-tier setup (critical=P0 page, high=P1 Slack).
 
 groups:
@@ -52,7 +59,7 @@ groups:
         expr: |
           sum by (gateway_id) (
             rate(traces_spanmetrics_calls_total{
-              service_name="mnemom-observer",
+              service="mnemom-observer",
               span_name="observer.queue_poison"
             }[15m])
           ) > 0
@@ -77,7 +84,7 @@ groups:
         expr: |
           sum by (gateway_id) (
             rate(traces_spanmetrics_calls_total{
-              service_name="mnemom-observer",
+              service="mnemom-observer",
               span_name="observer.queue_backlog_breach"
             }[5m])
           ) > 0
@@ -101,7 +108,7 @@ groups:
         expr: |
           sum by (gateway_id) (
             rate(traces_spanmetrics_calls_total{
-              service_name="mnemom-observer",
+              service="mnemom-observer",
               span_name="observer.queue_dlq_breach"
             }[10m])
           ) > 0
@@ -123,7 +130,7 @@ groups:
         expr: |
           sum by (gateway_id) (
             rate(traces_spanmetrics_calls_total{
-              service_name="mnemom-observer",
+              service="mnemom-observer",
               span_name="observer.queue_consumer_lag_breach"
             }[10m])
           ) > 0
