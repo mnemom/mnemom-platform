@@ -6578,6 +6578,23 @@ export async function handleProviderProxy(
         console.log('[gateway/aip] No alignment card found, forwarding as clear');
         responseHeaders.set('X-AIP-Verdict', 'clear');
         responseHeaders.set('X-AIP-Synthetic', 'true');
+        // T0-8 / ADR-040 §I10: same suffix logic as the AIP-running path.
+        // shVerdict was set in the front-door pass and may be quarantine /
+        // block / nudge — we still owe the caller a user-visible
+        // explanation when an intervention occurred earlier in the pipeline,
+        // even though AIP itself is sitting this turn out.
+        const t08Summaries = summarizeRequestInterventions({
+          shVerdict,
+          outboundDLPMatches: [],
+          backDoorBodyReplaced: false,
+        });
+        if (t08Summaries.length > 0) {
+          const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
+          if (i10.suffixed) {
+            responseBodyText = i10.body;
+            responseHeaders.set('X-Mnemom-Suffixed', 'true');
+          }
+        }
         return new Response(responseBodyText, {
           status: response.status,
           statusText: response.statusText,
@@ -6595,6 +6612,26 @@ export async function handleProviderProxy(
         }));
         responseHeaders.set('X-AIP-Verdict', 'clear');
         responseHeaders.set('X-AIP-Synthetic', 'true');
+        // T0-8 / ADR-040 §I10: same as the no-card branch above. A
+        // front-door enforce on a `protection_mode=enforce / integrity_mode=off`
+        // cell sets shVerdict=quarantine|block but otherwise skips the AIP
+        // path that previously owned suffix injection — without this hoist
+        // the user never sees an intervention reference, breaking the
+        // "100% user-visible explanation on enforce" invariant. Surfaced by
+        // Safe House harness T1-3 (front-door-injection-anthropic ×
+        // harness-penf-aoff-ioff failed I10 on run 2026-05-01).
+        const t08Summaries = summarizeRequestInterventions({
+          shVerdict,
+          outboundDLPMatches: [],
+          backDoorBodyReplaced: false,
+        });
+        if (t08Summaries.length > 0) {
+          const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
+          if (i10.suffixed) {
+            responseBodyText = i10.body;
+            responseHeaders.set('X-Mnemom-Suffixed', 'true');
+          }
+        }
         return new Response(responseBodyText, {
           status: response.status,
           statusText: response.statusText,
@@ -6629,6 +6666,21 @@ export async function handleProviderProxy(
         console.log(`[gateway/aip] No thinking block found in response (provider: ${provider})`);
         responseHeaders.set('X-AIP-Verdict', 'clear');
         responseHeaders.set('X-AIP-Synthetic', 'true');
+        // T0-8 / ADR-040 §I10: front-door interventions still need a
+        // user-visible explanation even when AIP is bailing out for lack
+        // of a thinking block to analyze.
+        const t08Summaries = summarizeRequestInterventions({
+          shVerdict,
+          outboundDLPMatches: [],
+          backDoorBodyReplaced: false,
+        });
+        if (t08Summaries.length > 0) {
+          const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
+          if (i10.suffixed) {
+            responseBodyText = i10.body;
+            responseHeaders.set('X-Mnemom-Suffixed', 'true');
+          }
+        }
         return new Response(responseBodyText, {
           status: response.status,
           statusText: response.statusText,
