@@ -77,12 +77,26 @@ export function extractPolicyFromCard(card: UnifiedAlignmentCard): Policy {
       reason: typeof t.reason === 'string' ? t.reason : '',
     }));
 
-  // Defaults: card.enforcement.{unmapped_tool_action, fail_open, mode, grace_period_hours}
-  // unmapped_severity is derived from unmapped_tool_action:
+  // Defaults: card.enforcement.{allow_unmapped_tools, fail_open, mode, grace_period_hours}
+  //
+  // Source of truth for unmapped-tool action is `allow_unmapped_tools`
+  // (boolean) on canonical cards (post-ADR-039 cutover; mnemom-api
+  // composer no longer emits the legacy `unmapped_tool_action` alias).
+  // Translation:
+  //   allow_unmapped_tools=false → 'deny'
+  //   allow_unmapped_tools=true  → 'allow'
+  // Fallback path reads `unmapped_tool_action` directly for older
+  // canonical rows that pre-date the cutover.
+  //
+  // unmapped_severity is derived from the resolved action:
   //   deny  → high   (explicit denial is a hard violation)
   //   warn  → medium (caller is asking for awareness, not rejection)
   //   allow → low    (informational only)
-  const unmappedAction = (enforcement.unmapped_tool_action as PolicyDefaults['unmapped_tool_action']) || 'allow';
+  const allowUnmapped = (enforcement as Record<string, unknown>).allow_unmapped_tools;
+  const unmappedAction: PolicyDefaults['unmapped_tool_action'] =
+    typeof allowUnmapped === 'boolean'
+      ? (allowUnmapped ? 'allow' : 'deny')
+      : ((enforcement.unmapped_tool_action as PolicyDefaults['unmapped_tool_action']) || 'allow');
   const unmappedSeverity: PolicyDefaults['unmapped_severity'] =
     unmappedAction === 'deny' ? 'high'
     : unmappedAction === 'warn' ? 'medium'

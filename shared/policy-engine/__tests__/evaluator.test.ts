@@ -89,6 +89,21 @@ describe('evaluatePolicy (UC-8)', () => {
       expect(result.verdict).toBe('pass');
       expect(result.warnings).toHaveLength(0);
     });
+
+    it('passes with unmapped tools when canonical allow_unmapped_tools=true', () => {
+      // Post-ADR-039 canonical-card path: composer emits
+      // `allow_unmapped_tools` and drops the legacy alias. Extractor
+      // must read the canonical field.
+      const card = makeCard();
+      delete card.enforcement!.unmapped_tool_action;
+      card.enforcement!.allow_unmapped_tools = true;
+      const result = evaluatePolicy(makeInput({
+        card,
+        tools: [{ name: 'SomeUnknownTool' }],
+      }));
+      expect(result.verdict).toBe('pass');
+      expect(result.warnings).toHaveLength(0);
+    });
   });
 
   describe('warn verdict', () => {
@@ -112,6 +127,24 @@ describe('evaluatePolicy (UC-8)', () => {
   });
 
   describe('fail verdict', () => {
+    it('fails on unmapped tool when canonical allow_unmapped_tools=false', () => {
+      // The canonical-card path: composer emits `allow_unmapped_tools:
+      // false` (no `unmapped_tool_action` on canonical post-ADR-039).
+      // Extractor must translate to internal action='deny' so the
+      // unmapped tool yields a high-severity violation → fail verdict.
+      const card = makeCard();
+      delete card.enforcement!.unmapped_tool_action;
+      card.enforcement!.allow_unmapped_tools = false;
+      const result = evaluatePolicy(makeInput({
+        card,
+        tools: [{ name: 'SomeUnknownTool' }],
+      }));
+      expect(result.verdict).toBe('fail');
+      expect(result.violations).toHaveLength(1);
+      expect(result.violations[0].type).toBe('unmapped_denied');
+      expect(result.violations[0].severity).toBe('high');
+    });
+
     it('fails on forbidden tool match', () => {
       const result = evaluatePolicy(makeInput({
         tools: [{ name: 'mcp__fs__delete_file' }],
