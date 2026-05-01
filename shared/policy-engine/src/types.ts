@@ -121,6 +121,18 @@ export interface UnifiedAlignmentCard {
   }>;
   enforcement?: {
     forbidden_tools?: Array<{ pattern: string; reason: string; severity: 'critical' | 'high' | 'medium' | 'low' }>;
+    /**
+     * Canonical (post-ADR-039) input field. The mnemom-api composer emits
+     * this on canonical cards; the legacy `unmapped_tool_action` alias is
+     * no longer emitted (per `mnemom-api/src/composition/compose.ts`
+     * "legacy enforcement aliases ... no longer emitted on canonical").
+     * Read by `extractPolicyFromCard` and translated to the internal
+     * `PolicyDefaults.unmapped_tool_action` (`false → 'deny'`,
+     * `true → 'allow'`).
+     */
+    allow_unmapped_tools?: boolean;
+    /** @deprecated Pre-ADR-039 alias. Read as a fallback only — the
+     *  composer no longer emits it. */
     unmapped_tool_action?: 'allow' | 'deny' | 'warn';
     fail_open?: boolean;
     mode?: 'off' | 'warn' | 'enforce';
