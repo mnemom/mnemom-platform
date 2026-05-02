@@ -6693,14 +6693,63 @@ export async function handleProviderProxy(
       testModeEnabledForBackDoor &&
       harnessAgentForBackDoor
     ) {
-      // Append a known-PII string with the same shapes the unit-test
-      // corpus uses (`sk-live-…` Stripe-shaped key, valid SSN). The DLP
-      // regexes in shared/safe-house/src/dlp.ts match these
-      // deterministically, so the rest of the back-door pipeline runs
-      // exactly as if the upstream model had returned PII organically.
-      const SYNTHETIC_PII_PAYLOAD =
-        ' (test-mode injected: API_KEY=sk-live-T1ESTtestK3YN0TARealOneJustForFixtureTesting; SSN=219-09-9999)';
-      responseBodyText = responseBodyText + SYNTHETIC_PII_PAYLOAD;
+      // Inject the known-PII payload INSIDE the JSON envelope, not
+      // appended outside it: bare string concatenation produces
+      // `{...} (extra)` which is no longer parseable by
+      // `appendSuffixToProviderResponse` (T0-8) or
+      // `replaceIntegrityViolationContent` (T0-5), and the back-door
+      // fixture's I10 assertion fails because the suffix never lands.
+      //
+      // PII shapes match the dlp.ts regexes exactly:
+      //   - API_KEY_PATTERN `\b(sk-[a-zA-Z0-9]{20,}|...)\b`: needs a
+      //     `sk-` prefix followed by 20+ alphanumerics with no
+      //     internal hyphens. The fixture-corpus token
+      //     `sk-live-T1ESTtest…` does NOT match (the `live-` hyphen
+      //     breaks the alphanumeric run); use a no-hyphen variant.
+      //   - SSN_PATTERN `\b\d{3}-\d{2}-\d{4}\b` with area-block
+      //     exclusions; `219-09-9999` is the harness standard.
+      const SYNTHETIC_PII_TEXT =
+        '[harness test-mode injected PII: sk-T1ESTtestK3YN0TARealHarnessSyntheticOneJustForFixtureTesting 219-09-9999]';
+      try {
+        const parsed = JSON.parse(responseBodyText) as Record<string, unknown>;
+        // Anthropic Messages API: append a text block to content[].
+        if (Array.isArray(parsed.content)) {
+          parsed.content = [
+            ...(parsed.content as unknown[]),
+            { type: 'text', text: SYNTHETIC_PII_TEXT },
+          ];
+          responseBodyText = JSON.stringify(parsed);
+        }
+        // OpenAI Chat Completions: append to last choice's message.content.
+        else if (Array.isArray(parsed.choices) && parsed.choices.length > 0) {
+          const choices = parsed.choices as Array<Record<string, unknown>>;
+          const last = choices[choices.length - 1];
+          const message = (last.message as Record<string, unknown> | undefined) ?? {
+            role: 'assistant',
+            content: '',
+          };
+          const existing = typeof message.content === 'string' ? message.content : '';
+          choices[choices.length - 1] = {
+            ...last,
+            message: { ...message, content: existing ? `${existing} ${SYNTHETIC_PII_TEXT}` : SYNTHETIC_PII_TEXT },
+          };
+          parsed.choices = choices;
+          responseBodyText = JSON.stringify(parsed);
+        }
+        // Gemini generateContent: append to last candidate's content.parts.
+        else if (Array.isArray(parsed.candidates) && parsed.candidates.length > 0) {
+          const candidates = parsed.candidates as Array<Record<string, unknown>>;
+          const last = candidates[candidates.length - 1];
+          const content = (last.content as Record<string, unknown> | undefined) ?? { parts: [], role: 'model' };
+          const parts = (content.parts as unknown[] | undefined) ?? [];
+          last.content = { ...content, parts: [...parts, { text: SYNTHETIC_PII_TEXT }] };
+          parsed.candidates = candidates;
+          responseBodyText = JSON.stringify(parsed);
+        }
+      } catch {
+        // If the upstream body isn't valid JSON, fall through silently —
+        // the test-mode injection is best-effort.
+      }
       console.log(JSON.stringify({
         event: 'back_door_test_mode_inject',
         agent_id: agent.id,
