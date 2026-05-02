@@ -54,6 +54,18 @@ id = "d13bd450c5ab4a2c9766f2dc26ce513c"
 [env.staging]
 name = "mnemom-gateway-staging"
 
+# CF Workers Paid Standard plan — needed so `ctx.waitUntil` tasks
+# (notably `markNudgesDelivered`'s PATCH that flips
+# `pending_advisories.status` from `pending` → `consumed`) reliably
+# complete on the staging worker. Production has the same setting; the
+# staging block previously omitted it and inherited the bundled-tier
+# 50ms-CPU ceiling, which was dropping the deferred PATCH and leaving
+# every consumed advisory unflipped (verified during Safe House
+# Hardening T1-3 — staging accumulated 200+ pending rows with
+# delivered_at=null even though the synchronous nudge-injection had
+# fired). Surfaced + tracked as a T1-3 follow-up; this closes it.
+usage_model = "standard"
+
 # See ADR-026 — opt in to workers_trace_events for Tier 2 + Tier 3.
 logpush = true
 

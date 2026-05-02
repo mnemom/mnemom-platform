@@ -3907,6 +3907,123 @@ async function writeSHDriftTrainingTraces(
 }
 
 /**
+ * Read the platform-wide pending advisory TTL (ADR-040, T0-2). Mirrors
+ * `gateway/src/index.ts::getPendingAdvisoryTtlHours` so observer-side
+ * sideband writes use the same value the gateway-side runtime writers
+ * do — KV-cached under the same key so a single Supabase round-trip
+ * services both workers. Default 24h on any failure.
+ */
+async function readPendingAdvisoryTtlHours(env: Env): Promise<number> {
+  const DEFAULT_TTL_HOURS = 24;
+  const cacheKey = 'platform:pending-advisory-ttl';
+  if (env.BILLING_CACHE) {
+    try {
+      const cached = (await env.BILLING_CACHE.get(cacheKey, 'json')) as
+        | { ttl_hours: number }
+        | null;
+      if (cached && Number.isInteger(cached.ttl_hours)) return cached.ttl_hours;
+    } catch {
+      // Fall through to Supabase.
+    }
+  }
+  try {
+    const res = await observerSupabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/platform_settings?id=eq.default&select=pending_advisory_ttl_hours`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+        },
+      },
+    );
+    if (!res.ok) return DEFAULT_TTL_HOURS;
+    const rows = (await res.json()) as Array<{ pending_advisory_ttl_hours: number }>;
+    const ttl = rows[0]?.pending_advisory_ttl_hours;
+    if (!Number.isInteger(ttl) || ttl < 1 || ttl > 168) return DEFAULT_TTL_HOURS;
+    if (env.BILLING_CACHE) {
+      await env.BILLING_CACHE.put(cacheKey, JSON.stringify({ ttl_hours: ttl }), {
+        expirationTtl: 3600,
+      }).catch(() => {});
+    }
+    return ttl;
+  } catch {
+    return DEFAULT_TTL_HOURS;
+  }
+}
+
+/**
+ * Write a `pending_advisories` row with `source: 'sideband.drift'` so the
+ * gateway picks it up on the agent's next request and surfaces it to the
+ * model via `injectPendingNudges` (per ADR-040 §I9). Closes the T1-3
+ * follow-up "observer writes pending_advisories for sideband sources"
+ * for the drift path — the only sideband detection path actually live
+ * in observer today. Coherence / fault-line / fleet detectors don't yet
+ * exist in observer code; their writers will be added by the same
+ * pattern when those tracks ship.
+ *
+ * Fire-and-forget. Failure to write the carryover row never blocks the
+ * `drift_alerts` row that the dashboard + reconciliation depend on.
+ */
+async function writeDriftSidebandAdvisory(
+  agentId: string,
+  driftAlert: DriftAlert,
+  driftAlertId: string,
+  env: Env,
+): Promise<void> {
+  try {
+    const ttlHours = await readPendingAdvisoryTtlHours(env);
+    const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000).toISOString();
+    const direction = driftAlert.analysis.drift_direction;
+    const similarity = driftAlert.analysis.similarity_score;
+    const text =
+      `[Mnemom advisory: a sideband drift detector flagged your recent reasoning ` +
+      `as drifting toward \`${direction}\` (similarity ${similarity.toFixed(2)}). ` +
+      `Recalibrate against your declared values before the next response.]`;
+    const summary = `Sideband drift: ${direction} (similarity ${similarity.toFixed(2)})`;
+    const id = `pa-${randomHex(12)}`;
+    const resp = await observerSupabaseFetch(
+      `${env.SUPABASE_URL}/rest/v1/pending_advisories`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          id,
+          agent_id: agentId,
+          // session_id NULL — sideband advisories are not session-scoped.
+          // The gateway's injectPendingNudges query
+          // `or=(session_id.eq.<X>,session_id.is.null)` matches both
+          // session-scoped runtime advisories and unscoped sideband ones.
+          session_id: null,
+          status: 'pending',
+          nudge_content: text,
+          concerns_summary: summary,
+          source: 'sideband.drift',
+          source_ref: { drift_alert_id: driftAlertId },
+          expires_at: expiresAt,
+        }),
+      },
+    );
+    if (!resp.ok) {
+      console.warn(
+        `[observer/safe-house] Failed to write sideband.drift advisory for ${agentId}: ${resp.status}`,
+      );
+      return;
+    }
+    console.log(
+      `[observer/safe-house] Wrote sideband.drift advisory for ${agentId} (drift_alert_id=${driftAlertId}, ttl=${ttlHours}h)`,
+    );
+  } catch (err) {
+    // Fire-and-forget: never throws.
+    console.error('[observer/safe-house] Error writing sideband.drift advisory:', err);
+  }
+}
+
+/**
  * Store a drift alert in Supabase
  */
 async function storeDriftAlert(
@@ -3946,6 +4063,12 @@ async function storeDriftAlert(
     } else {
       // Write Safe House training traces for preceding messages (fire-and-forget)
       writeSHDriftTrainingTraces(agentId, alert.id, driftAlert.trace_ids, env).catch(() => {});
+      // T1-3 follow-up: write a `pending_advisories` row with
+      // source='sideband.drift' so the gateway surfaces this drift signal
+      // to the agent on its next request via `injectPendingNudges` (per
+      // ADR-040 §I9). Fire-and-forget; failure here does not roll back
+      // the `drift_alerts` row above.
+      writeDriftSidebandAdvisory(agentId, driftAlert, alert.id, env).catch(() => {});
     }
   } catch (error) {
     console.error('[observer] Error storing drift alert:', error);
