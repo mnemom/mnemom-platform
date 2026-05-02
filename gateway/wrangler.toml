@@ -72,6 +72,13 @@ SAFE_HOUSE_ENABLED = "true"
 # request in the Safe House enforce branch. Production stays `off` until
 # we've reviewed shadow telemetry per the correctness gate.
 RECIPE_MODE = "shadow"
+# Safe House Hardening T1-3 test-mode: lets the staging mode-matrix
+# harness drive AIP intervention + back-door redaction paths
+# deterministically via X-Safe-House-Test-* headers. The gateway only
+# honors those headers when this flag is "true" AND the agent name
+# starts with `harness-` (T1-3 fleet-only). MUST remain unset in the
+# production block above; the prod gateway has no test-mode behavior.
+SAFE_HOUSE_TEST_MODE = "true"
 # Sovereign agent recommended Safe House config (set via /v1/agents/:id/cfd/config):
 # mode: enforce, screen_surfaces: all, thresholds: 0.5/0.70/0.85
 # Canaries: POST /v1/cfd/canaries for each primary tool credential
