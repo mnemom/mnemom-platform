@@ -2561,7 +2561,8 @@ function buildSyntheticAipAnalysisResponse(
       conflicts: verdict === 'boundary_violation' ? [boundaryName] : [],
       supports: verdict === 'clear' ? valueNames : [],
       considerations: ['test-mode injection — Haiku call bypassed'],
-      consultation_depth: 'shallow',
+      // ConsultationDepth = 'surface' | 'standard' | 'deep' (per AIP types).
+      consultation_depth: 'surface',
     },
   });
 }
