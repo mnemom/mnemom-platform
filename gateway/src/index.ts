@@ -205,6 +205,12 @@ export interface Env {
   KV?: KVNamespace;
   // Safe House
   SAFE_HOUSE_ENABLED?: string;  // "true" to enable Safe House DB fetches; default off to avoid test interference
+  // Safe House harness test-mode: when "true" the gateway honors
+  // X-Safe-House-Test-* headers from `harness-*` agents only, letting
+  // T1-3 drive AIP intervention + back-door redaction paths
+  // deterministically. MUST remain unset on the production gateway
+  // worker. See `gateway/src/index.ts` for the gating sites.
+  SAFE_HOUSE_TEST_MODE?: string;
   // Canonical agent creation (scale/step-25b): gateway delegates to mnemom-api
   INTERNAL_API_KEY?: string;    // Shared service-to-service key (same as mnemom-api INTERNAL_API_KEY)
   // Phase 5 Stage 5B: Detection recipes runtime
@@ -2496,6 +2502,68 @@ export async function markNudgesDelivered(
   } catch (error) {
     console.error('[gateway/advisory] Error marking advisories delivered:', error);
   }
+}
+
+/**
+ * Build a synthetic Haiku analysis response with the requested verdict.
+ * Used only by the Safe House harness test-mode path (gated by
+ * SAFE_HOUSE_TEST_MODE='true' + harness-* agent name + a request header).
+ *
+ * The shape here matches what `checkIntegrity` (from
+ * @mnemom/agent-integrity-protocol) expects to parse:
+ *   - verdict: 'clear' | 'review_needed' | 'boundary_violation'
+ *   - concerns: array (must contain at least one critical/high-severity
+ *     entry for boundary_violation to map to deny_and_escalate; empty
+ *     for clear)
+ *   - reasoning_summary: string
+ *   - conscience_context: { values_checked, conflicts, supports,
+ *     considerations, consultation_depth }
+ */
+function buildSyntheticAipAnalysisResponse(
+  verdict: 'clear' | 'review_needed' | 'boundary_violation',
+  conscienceValues: ConscienceValue[],
+): string {
+  const valueNames = conscienceValues.map((v) => `${v.type}:${v.content}`);
+  const boundaryName =
+    conscienceValues.find((v) => v.type === 'BOUNDARY')
+      ? `BOUNDARY:${conscienceValues.find((v) => v.type === 'BOUNDARY')!.content}`
+      : valueNames[0] ?? 'BOUNDARY:test';
+  const concerns =
+    verdict === 'boundary_violation'
+      ? [
+          {
+            category: 'value_misalignment',
+            severity: 'critical',
+            description: 'Test-mode synthetic boundary violation injected via SAFE_HOUSE_TEST_MODE',
+            evidence: 'synthetic harness fixture',
+            relevant_card_field: null,
+            relevant_conscience_value: boundaryName,
+          },
+        ]
+      : verdict === 'review_needed'
+        ? [
+            {
+              category: 'reasoning_corruption',
+              severity: 'medium',
+              description: 'Test-mode synthetic review_needed',
+              evidence: 'synthetic harness fixture',
+              relevant_card_field: null,
+              relevant_conscience_value: null,
+            },
+          ]
+        : [];
+  return JSON.stringify({
+    verdict,
+    concerns,
+    reasoning_summary: `Test-mode synthetic ${verdict} (SAFE_HOUSE_TEST_MODE)`,
+    conscience_context: {
+      values_checked: valueNames,
+      conflicts: verdict === 'boundary_violation' ? [boundaryName] : [],
+      supports: verdict === 'clear' ? valueNames : [],
+      considerations: ['test-mode injection — Haiku call bypassed'],
+      consultation_depth: 'shallow',
+    },
+  });
 }
 
 /**
@@ -6563,6 +6631,160 @@ export async function handleProviderProxy(
       });
     }
 
+    // ====================================================================
+    // HOISTED OUT OF THE AIP TRY-BLOCK (T1-3, 2026-05-01).
+    //
+    // The back door (outbound DLP redaction) and the T0-8 user-visible-
+    // explanation suffix logic used to live INSIDE the AIP try/catch
+    // wrapper, gated by `integrity_mode != 'off'` because the function
+    // returned early when AIP was opted out. That coupling is wrong: the
+    // back door is a Protection-card concern (gated by `protection.mode`
+    // + `screen_surfaces.outgoing`), and the suffix is a runtime-
+    // intervention surface concern. Neither belongs to the integrity
+    // master switch. Surfaced by Safe House harness T1-3
+    // (back-door-pii-anthropic × `*-ioff` cells: BACK_DOOR_REDACTED was
+    // expected, the wire never fired).
+    //
+    // Hoisting them here makes the layering match charter §"The four
+    // checkpoints": back-door is Phase 6 (Protection), runs whenever
+    // Protection says it should; integrity is Phase 5 (AIP), is the
+    // checkpoint immediately preceding back-door in serial order but
+    // does NOT gate it. T0-8 follows the same logic — the suffix is
+    // about same-turn interventions, not AIP specifically.
+    // ====================================================================
+
+    // Compute outputText once for both back-door post-process and the
+    // AIP analyze_output path below.
+    const analyzeOutput = agentSettings?.analyze_output === true;
+    const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
+
+    // ====================================================================
+    // Back door — outbound DLP redaction (Phase 6 per validation-charter,
+    // T0-6, ADR-040). Surgical redaction of PII / secret patterns in the
+    // agent's response. Modes:
+    //   - off:     skip dispatch entirely
+    //   - observe: scan + log only, body unchanged
+    //   - nudge:   scan + log + redact body in-place + write advisory
+    //   - enforce: same as nudge (back door's "intervention" is the
+    //              redaction itself; nudge vs enforce on this surface
+    //              differs in the upstream policy thresholds, not the
+    //              same-turn mechanism)
+    // Gated by `screen_surfaces.outgoing` so customers can opt out per
+    // protection card.
+    // ====================================================================
+    let outboundDLPDetected = false;
+    let outboundDLPMatches: DLPMatch[] = [];
+    let backDoorBodyReplaced = false;
+
+    // Test-mode PII injection: when SAFE_HOUSE_TEST_MODE='true' AND the
+    // agent is `harness-*` AND the request carries
+    // `X-Safe-House-Test-Inject-Pii: 1`, append synthetic credentials to
+    // the response body BEFORE the DLP scan. Lets the harness drive the
+    // back-door redaction path deterministically — Sonnet 4.6 refuses to
+    // echo credential-shaped strings, which defeats the unmodified
+    // fixture's premise. Hard-gated by env var (production worker has
+    // it unset) and agent-name prefix.
+    const testInjectPiiHeader = request.headers.get('x-safe-house-test-inject-pii');
+    const testModeEnabledForBackDoor = env.SAFE_HOUSE_TEST_MODE === 'true';
+    const harnessAgentForBackDoor = agent.name?.startsWith('harness-') ?? false;
+    if (
+      testInjectPiiHeader === '1' &&
+      testModeEnabledForBackDoor &&
+      harnessAgentForBackDoor
+    ) {
+      // Append a known-PII string with the same shapes the unit-test
+      // corpus uses (`sk-live-…` Stripe-shaped key, valid SSN). The DLP
+      // regexes in shared/safe-house/src/dlp.ts match these
+      // deterministically, so the rest of the back-door pipeline runs
+      // exactly as if the upstream model had returned PII organically.
+      const SYNTHETIC_PII_PAYLOAD =
+        ' (test-mode injected: API_KEY=sk-live-T1ESTtestK3YN0TARealOneJustForFixtureTesting; SSN=219-09-9999)';
+      responseBodyText = responseBodyText + SYNTHETIC_PII_PAYLOAD;
+      console.log(JSON.stringify({
+        event: 'back_door_test_mode_inject',
+        agent_id: agent.id,
+        session_id: sessionId,
+      }));
+    }
+
+    const outgoingGated = shConfig.screen_surfaces.outgoing;
+    const backDoorActive =
+      env.SAFE_HOUSE_ENABLED === 'true' &&
+      env.BILLING_CACHE &&
+      outgoingGated &&
+      shConfig.mode !== 'off';
+    if (backDoorActive) {
+      try {
+        const result = applyBackDoorRedaction(responseBodyText);
+        if (result.matches.length > 0) {
+          outboundDLPDetected = true;
+          outboundDLPMatches = result.matches;
+          const bodyReplaced =
+            shConfig.mode === 'nudge' || shConfig.mode === 'enforce';
+          if (bodyReplaced) {
+            responseBodyText = result.body;
+            backDoorBodyReplaced = true;
+          }
+          ctx.waitUntil(logCBDEvaluation(
+            agent.id, sessionId, 'warn',
+            { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
+            ['DLPScanner'], 'outbound',
+            result.matches.map((m) => ({
+              type: 'pii_in_inbound' as ThreatType,
+              confidence: 0.95,
+              reasoning: `Outbound DLP: ${m.type} detected in agent response`,
+            })),
+            0.9, env,
+          ));
+          console.log(JSON.stringify({
+            event: 'sh_exit_dlp',
+            agent_id: agent.id,
+            session_id: sessionId,
+            mode: shConfig.mode,
+            body_replaced: bodyReplaced,
+            match_count: result.matches.length,
+            match_types: Array.from(new Set(result.matches.map((m) => m.type))),
+          }));
+        }
+      } catch { /* fail-open */ }
+    }
+
+    if (outboundDLPDetected) {
+      responseHeaders.set('X-Safe-House-DLP', 'detected');
+      ctx.waitUntil(writeBackDoorAdvisory(
+        agent.id,
+        sessionId,
+        { matches: outboundDLPMatches, mode: shConfig.mode },
+        env,
+      ));
+    }
+
+    // CBD Semantic analysis — async, never blocks the response
+    if (env.SAFE_HOUSE_ENABLED === 'true' && outputText) {
+      ctx.waitUntil(runCBDSemanticAnalysis(outputText, agent.id, sessionId, env));
+    }
+
+    // ====================================================================
+    // T0-8 / ADR-040 §I10: 100% user-visible explanation suffix.
+    // Computed ONCE here (post-back-door, pre-AIP) so any downstream
+    // delivery site automatically picks up the suffixed body without
+    // per-site wiring. Skipped when AIP later replaces the response
+    // entirely (T0-5 boundary_violation paths produce text that already
+    // begins with "[Mnemom Intervention:" and would not need a suffix).
+    // ====================================================================
+    const t08Summaries = summarizeRequestInterventions({
+      shVerdict,
+      outboundDLPMatches,
+      backDoorBodyReplaced,
+    });
+    if (t08Summaries.length > 0) {
+      const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
+      if (i10.suffixed) {
+        responseBodyText = i10.body;
+        responseHeaders.set('X-Mnemom-Suffixed', 'true');
+      }
+    }
+
     // Fail-open wrapper: entire AIP pipeline wrapped in try/catch
     try {
       // Fetch alignment data and recent checkpoints in parallel
@@ -6578,23 +6800,8 @@ export async function handleProviderProxy(
         console.log('[gateway/aip] No alignment card found, forwarding as clear');
         responseHeaders.set('X-AIP-Verdict', 'clear');
         responseHeaders.set('X-AIP-Synthetic', 'true');
-        // T0-8 / ADR-040 §I10: same suffix logic as the AIP-running path.
-        // shVerdict was set in the front-door pass and may be quarantine /
-        // block / nudge — we still owe the caller a user-visible
-        // explanation when an intervention occurred earlier in the pipeline,
-        // even though AIP itself is sitting this turn out.
-        const t08Summaries = summarizeRequestInterventions({
-          shVerdict,
-          outboundDLPMatches: [],
-          backDoorBodyReplaced: false,
-        });
-        if (t08Summaries.length > 0) {
-          const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
-          if (i10.suffixed) {
-            responseBodyText = i10.body;
-            responseHeaders.set('X-Mnemom-Suffixed', 'true');
-          }
-        }
+        // T0-8 suffix already applied to responseBodyText above the AIP
+        // try-block (post-hoist). Just forward.
         return new Response(responseBodyText, {
           status: response.status,
           statusText: response.statusText,
@@ -6612,26 +6819,8 @@ export async function handleProviderProxy(
         }));
         responseHeaders.set('X-AIP-Verdict', 'clear');
         responseHeaders.set('X-AIP-Synthetic', 'true');
-        // T0-8 / ADR-040 §I10: same as the no-card branch above. A
-        // front-door enforce on a `protection_mode=enforce / integrity_mode=off`
-        // cell sets shVerdict=quarantine|block but otherwise skips the AIP
-        // path that previously owned suffix injection — without this hoist
-        // the user never sees an intervention reference, breaking the
-        // "100% user-visible explanation on enforce" invariant. Surfaced by
-        // Safe House harness T1-3 (front-door-injection-anthropic ×
-        // harness-penf-aoff-ioff failed I10 on run 2026-05-01).
-        const t08Summaries = summarizeRequestInterventions({
-          shVerdict,
-          outboundDLPMatches: [],
-          backDoorBodyReplaced: false,
-        });
-        if (t08Summaries.length > 0) {
-          const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
-          if (i10.suffixed) {
-            responseBodyText = i10.body;
-            responseHeaders.set('X-Mnemom-Suffixed', 'true');
-          }
-        }
+        // Back-door + T0-8 suffix already ran above the AIP try-block
+        // post-hoist; responseBodyText carries any redactions/suffix.
         return new Response(responseBodyText, {
           status: response.status,
           statusText: response.statusText,
@@ -6666,21 +6855,7 @@ export async function handleProviderProxy(
         console.log(`[gateway/aip] No thinking block found in response (provider: ${provider})`);
         responseHeaders.set('X-AIP-Verdict', 'clear');
         responseHeaders.set('X-AIP-Synthetic', 'true');
-        // T0-8 / ADR-040 §I10: front-door interventions still need a
-        // user-visible explanation even when AIP is bailing out for lack
-        // of a thinking block to analyze.
-        const t08Summaries = summarizeRequestInterventions({
-          shVerdict,
-          outboundDLPMatches: [],
-          backDoorBodyReplaced: false,
-        });
-        if (t08Summaries.length > 0) {
-          const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
-          if (i10.suffixed) {
-            responseBodyText = i10.body;
-            responseHeaders.set('X-Mnemom-Suffixed', 'true');
-          }
-        }
+        // Back-door + T0-8 already applied above the AIP try-block.
         return new Response(responseBodyText, {
           status: response.status,
           statusText: response.statusText,
@@ -6688,117 +6863,9 @@ export async function handleProviderProxy(
         });
       }
 
-      // Extract output text for output-aware analysis (when enabled)
-      const analyzeOutput = agentSettings?.analyze_output === true;
-      const outputText = analyzeOutput ? extractOutputText(responseBodyText) : undefined;
-
-      // ====================================================================
-      // Back door — outbound DLP redaction (Phase 6 per validation-charter,
-      // T0-6, ADR-040). Surgical redaction of PII / secret patterns in the
-      // agent's response. Modes:
-      //   - off:     skip dispatch entirely
-      //   - observe: scan + log only, body unchanged
-      //   - nudge:   scan + log + redact body in-place + write advisory
-      //   - enforce: same as nudge (back door's "intervention" is the
-      //              redaction itself; nudge vs enforce on this surface
-      //              differs in the upstream policy thresholds, not the
-      //              same-turn mechanism)
-      // Gated by `screen_surfaces.outgoing` so customers can opt out per
-      // protection card.
-      // ====================================================================
-      let outboundDLPDetected = false;
-      let outboundDLPMatches: DLPMatch[] = [];
-      // T0-8: tracks whether the back door actually replaced the
-      // response body (vs. observe mode which scans + logs only).
-      // Read at the delivery sites to decide whether the user-visible
-      // explanation suffix needs to fire.
-      let backDoorBodyReplaced = false;
-      const outgoingGated = shConfig.screen_surfaces.outgoing;
-      const backDoorActive =
-        env.SAFE_HOUSE_ENABLED === 'true' &&
-        env.BILLING_CACHE &&
-        outgoingGated &&
-        shConfig.mode !== 'off';
-      if (backDoorActive) {
-        try {
-          const result = applyBackDoorRedaction(responseBodyText);
-          if (result.matches.length > 0) {
-            outboundDLPDetected = true;
-            outboundDLPMatches = result.matches;
-            // Under nudge / enforce, replace the response body with the
-            // redacted version so the customer never sees the
-            // unredacted content. Under observe, leave the body intact
-            // (today's behavior) — detection-only.
-            const bodyReplaced =
-              shConfig.mode === 'nudge' || shConfig.mode === 'enforce';
-            if (bodyReplaced) {
-              responseBodyText = result.body;
-              backDoorBodyReplaced = true;
-            }
-            ctx.waitUntil(logCBDEvaluation(
-              agent.id, sessionId, 'warn',
-              { DLPScanner: 0.9, PatternMatcher: null, SemanticAnalyzer: null },
-              ['DLPScanner'], 'outbound',
-              result.matches.map((m) => ({
-                type: 'pii_in_inbound' as ThreatType,
-                confidence: 0.95,
-                reasoning: `Outbound DLP: ${m.type} detected in agent response`,
-              })),
-              0.9, env,
-            ));
-            console.log(JSON.stringify({
-              event: 'sh_exit_dlp',
-              agent_id: agent.id,
-              session_id: sessionId,
-              mode: shConfig.mode,
-              body_replaced: bodyReplaced,
-              match_count: result.matches.length,
-              match_types: Array.from(new Set(result.matches.map((m) => m.type))),
-            }));
-          }
-        } catch { /* fail-open */ }
-      }
-
-      if (outboundDLPDetected) {
-        responseHeaders.set('X-Safe-House-DLP', 'detected');
-        // Cross-turn carryover advisory under nudge / enforce so the
-        // agent knows next turn what was redacted. Mode is checked
-        // inside writeBackDoorAdvisory; observe never reaches here in
-        // a way that triggers a write.
-        ctx.waitUntil(writeBackDoorAdvisory(
-          agent.id,
-          sessionId,
-          { matches: outboundDLPMatches, mode: shConfig.mode },
-          env,
-        ));
-      }
-
-      // CBD Semantic analysis — async, never blocks the response
-      if (env.SAFE_HOUSE_ENABLED === 'true' && outputText) {
-        ctx.waitUntil(runCBDSemanticAnalysis(outputText, agent.id, sessionId, env));
-      }
-
-      // ====================================================================
-      // T0-8 / ADR-040 §I10: 100% user-visible explanation suffix.
-      // Computed ONCE here (post-back-door, pre-AIP) so any downstream
-      // delivery site automatically picks up the suffixed body without
-      // per-site wiring. Skipped when AIP later replaces the response
-      // entirely (T0-5 boundary_violation paths produce text that
-      // already begins with "[Mnemom Intervention:" and would not need
-      // a suffix).
-      // ====================================================================
-      const t08Summaries = summarizeRequestInterventions({
-        shVerdict,
-        outboundDLPMatches,
-        backDoorBodyReplaced,
-      });
-      if (t08Summaries.length > 0) {
-        const i10 = ensureInterventionReference(responseBodyText, t08Summaries);
-        if (i10.suffixed) {
-          responseBodyText = i10.body;
-          responseHeaders.set('X-Mnemom-Suffixed', 'true');
-        }
-      }
+      // (Back-door, T0-8 suffix, and outputText extraction were hoisted
+      // OUT of this AIP try-block — see the block above the AIP wrapper.
+      // analyzeOutput/outputText are still in scope from that hoist.)
 
       // Phase 7: Hybrid mode — call hosted /v1/analyze if no local ANTHROPIC_API_KEY
       if (!env.ANTHROPIC_API_KEY && env.MNEMOM_ANALYZE_URL && env.MNEMOM_API_KEY) {
@@ -6964,10 +7031,41 @@ export async function handleProviderProxy(
         ...(outputText ? { outputBlock: outputText, outputTokenBudget: DEFAULT_OUTPUT_TOKEN_BUDGET } : {}),
       });
 
-      // Call analysis LLM (Haiku)
-      console.log(`[gateway/aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${thinking.content.length} output_analysis=${!!outputText}`);
+      // ====================================================================
+      // Test-mode override: when SAFE_HOUSE_TEST_MODE=true (staging only),
+      // a `harness-*` agent may pass `X-Safe-House-Test-Aip-Verdict` to
+      // bypass Haiku and synthesize an analysis response with a chosen
+      // verdict. Lets the Safe House harness drive the AIP intervention
+      // path deterministically without depending on the upstream model
+      // producing boundary-violating thinking — Sonnet 4.6 refuses cleanly,
+      // which is correct behavior but defeats end-to-end enforcement
+      // testing. Hard-gated by the env var (production gateway has it
+      // unset) AND by agent-name prefix.
+      //
+      // Audit-logged so any unintended invocation is visible in logs.
+      // ====================================================================
+      const testAipVerdictHeader = request.headers.get('x-safe-house-test-aip-verdict');
+      const testModeEnabled = env.SAFE_HOUSE_TEST_MODE === 'true';
+      const harnessAgent = agent.name?.startsWith('harness-') ?? false;
+      const useTestModeAip =
+        testModeEnabled &&
+        harnessAgent &&
+        testAipVerdictHeader &&
+        /^(clear|review_needed|boundary_violation)$/.test(testAipVerdictHeader);
+
+      console.log(`[gateway/aip] Calling analysis LLM for agent=${agent.id} session=${sessionId} thinking_chars=${thinking.content.length} output_analysis=${!!outputText}${useTestModeAip ? ' [TEST_MODE_OVERRIDE]' : ''}`);
       const analysisStartTime = Date.now();
-      const rawAnalysisResponse = await callAnalysisLLM(prompt.system, prompt.user, env, { analyzeOutput });
+      const rawAnalysisResponse = useTestModeAip
+        ? buildSyntheticAipAnalysisResponse(testAipVerdictHeader as 'clear' | 'review_needed' | 'boundary_violation', conscienceValues || [...DEFAULT_CONSCIENCE_VALUES])
+        : await callAnalysisLLM(prompt.system, prompt.user, env, { analyzeOutput });
+      if (useTestModeAip) {
+        console.log(JSON.stringify({
+          event: 'aip_test_mode_override',
+          agent_id: agent.id,
+          session_id: sessionId,
+          verdict: testAipVerdictHeader,
+        }));
+      }
       const analysisDurationMs = Date.now() - analysisStartTime;
 
       // Strip markdown code fences if present (claude-haiku-4-5 wraps JSON in ```json...```)
