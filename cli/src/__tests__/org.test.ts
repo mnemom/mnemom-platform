@@ -27,6 +27,18 @@ vi.mock("../lib/format.js", () => ({
 import { orgListCommand, orgShowCommand } from "../commands/org.js";
 import * as api from "../lib/api.js";
 
+// Type captures: vitest 1.x's `vi.spyOn<T, K>` generics resist the
+// method-name parameter for `console.log` / `process.exit` at this
+// version. Capture the inferred MockInstance shape via sample call
+// expressions; the resulting types match what spyOn(...) returns at
+// each call site exactly. The `eslint-disable-next-line` is benign —
+// the value is unused; only the type information is referenced.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const spySampleLog = () => vi.spyOn(console, "log").mockImplementation(() => {});
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const spySampleExit = () =>
+  vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+
 const personalOrg: api.OrgListItem = {
   org_id: "pers-abcd1234",
   name: "Personal",
@@ -54,7 +66,13 @@ const acmeOrg: api.OrgListItem = {
 };
 
 describe("orgListCommand", () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
+  // vitest 1.x: the precisely-typed MockInstance returned by
+  // spyOn(console, "log") is not assignable to the bare
+  // ReturnType<typeof vi.spyOn> (the generics' variance is too tight).
+  // The simplest portable type at this vitest version is to capture
+  // the inferred shape via a sample call expression.
+  type LogSpy = ReturnType<typeof spySampleLog>;
+  let logSpy: LogSpy;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -89,8 +107,10 @@ describe("orgListCommand", () => {
 });
 
 describe("orgShowCommand", () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let exitSpy: ReturnType<typeof vi.spyOn>;
+  type LogSpy = ReturnType<typeof spySampleLog>;
+  type ExitSpy = ReturnType<typeof spySampleExit>;
+  let logSpy: LogSpy;
+  let exitSpy: ExitSpy;
 
   beforeEach(() => {
     vi.clearAllMocks();
