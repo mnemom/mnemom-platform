@@ -221,6 +221,68 @@ export async function listAgents(): Promise<AgentListItem[]> {
   return data.agents ?? [];
 }
 
+// ─── orgs ───────────────────────────────────────────────────────────────
+
+export interface OrgListItem {
+  org_id: string;
+  name: string;
+  slug: string;
+  is_personal: boolean;
+  is_owner: boolean;
+  role: string | null;
+  billing_email?: string | null;
+  company_name?: string | null;
+  accepted_at?: string | null;
+  created_at?: string | null;
+}
+
+export interface PersonalOrgRef {
+  org_id: string;
+  is_personal: true;
+  just_provisioned?: boolean;
+}
+
+/**
+ * GET /v1/orgs — list every org the user is a member of, including the
+ * personal-org-of-one (per ADR-044 Option A, GitHub model). Personal sorts
+ * first; multi-user orgs follow.
+ */
+export async function listMyOrgs(): Promise<OrgListItem[]> {
+  const url = validateUrl(`${API_BASE}/v1/orgs`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: await authHeaders(),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  const data = await response.json() as { orgs: OrgListItem[] };
+  return data.orgs ?? [];
+}
+
+/**
+ * GET /v1/auth/me/personal-org — accessor for the user's personal org.
+ * Idempotent: lazily provisions for legacy accounts that pre-date the
+ * mnemom-api migration 161 backfill.
+ */
+export async function getMyPersonalOrg(): Promise<PersonalOrgRef> {
+  const url = validateUrl(`${API_BASE}/v1/auth/me/personal-org`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: await authHeaders(),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  return await response.json() as PersonalOrgRef;
+}
+
 /**
  * Look up an agent in the authenticated user's account by name.
  * Tries exact match first, then single partial match.
