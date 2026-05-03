@@ -15,7 +15,7 @@
     "hono": "^4.12.14",
     "@hono/node-server": "^1.11.0",
     "ioredis": "^5.4.0",
-    "node-cron": "^3.0.3",
+    "node-cron": "^4.2.1",
     "prom-client": "^15.1.0"
   },
   "devDependencies": {
