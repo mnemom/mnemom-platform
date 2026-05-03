@@ -283,6 +283,245 @@ export async function getMyPersonalOrg(): Promise<PersonalOrgRef> {
   return await response.json() as PersonalOrgRef;
 }
 
+// ─── teams (Piece 2 of T1-3.1, ADR-044 amended) ─────────────────────────
+//
+// Per ADR-044 amended + Charter §I11: team membership is OPTIONAL. Teams
+// are an agent grouping primitive within an org; users have no team
+// concept. Backend RBAC for team-scope endpoints is purely org-level
+// (requireOrgRole(team.org_id, ...)) — the CLI sends the user's auth
+// header and the API enforces the role check.
+
+export interface TeamListItem {
+  team_id: string;
+  name: string;
+  org_id: string;
+  org_name?: string | null;
+  description?: string | null;
+  status?: string;
+  member_count?: number;
+  visibility?: string;
+}
+
+export interface TeamDetail {
+  team_id: string;
+  name: string;
+  org_id: string;
+  description?: string | null;
+  status?: string;
+  member_count?: number;
+  visibility?: string;
+  avatar_url?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface TeamTemplateBody {
+  team_id: string;
+  org_id: string;
+  name?: string;
+  template: Record<string, unknown> | null;
+  enabled: boolean;
+  agents_flagged_for_recompose?: number;
+  deleted?: boolean;
+}
+
+export type TeamTemplateKind = "alignment" | "protection";
+
+/**
+ * GET /v1/orgs/:org_id/teams for every org the user is a member of,
+ * concatenated. The CLI consumer that just wants "every team I can see"
+ * doesn't need to know about org boundaries; team_id is unique anyway.
+ * Returns the flat list with org_name attached for display.
+ */
+export async function listMyTeams(): Promise<TeamListItem[]> {
+  const orgs = await listMyOrgs();
+  const teams: TeamListItem[] = [];
+  for (const org of orgs) {
+    const url = validateUrl(`${API_BASE}/v1/orgs/${org.org_id}/teams`);
+    const response = await fetchWithAuthRetry(url, async () => ({
+      headers: await authHeaders(),
+    }));
+    if (!response.ok) {
+      // Skip orgs the user can't read teams from (e.g., role doesn't permit).
+      // The list call should succeed at the member level, but tolerate edge cases.
+      continue;
+    }
+    const data = (await response.json()) as { teams?: TeamListItem[] };
+    for (const t of data.teams ?? []) {
+      teams.push({ ...t, org_id: t.org_id ?? org.org_id, org_name: org.name });
+    }
+  }
+  return teams;
+}
+
+/**
+ * GET /v1/teams/:team_id — fetch a single team's row. Returns the team
+ * detail including org_id (which the CLI uses to disambiguate team_id
+ * collisions across orgs in error messages).
+ */
+export async function getTeam(teamId: string): Promise<TeamDetail> {
+  const url = validateUrl(`${API_BASE}/v1/teams/${teamId}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: await authHeaders(),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    if (response.status === 404) {
+      throw new Error(`Team '${teamId}' not found or not accessible.`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  return (await response.json()) as TeamDetail;
+}
+
+/**
+ * GET /v1/teams/:team_id/(alignment|protection)-template — read the
+ * current team-scope template + its enabled flag. Returns the wire body
+ * verbatim. Empty for teams that have no template set yet (template:
+ * null, enabled: false).
+ */
+export async function getTeamTemplate(
+  teamId: string,
+  kind: TeamTemplateKind,
+): Promise<TeamTemplateBody> {
+  const url = validateUrl(`${API_BASE}/v1/teams/${teamId}/${kind}-template`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: { ...(await authHeaders()), Accept: "application/json" },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    if (response.status === 403) {
+      throw new Error(`Forbidden: not a member of team '${teamId}'s org.`);
+    }
+    if (response.status === 404) {
+      throw new Error(`Team '${teamId}' not found.`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  return (await response.json()) as TeamTemplateBody;
+}
+
+/**
+ * PUT /v1/teams/:team_id/(alignment|protection)-template — write the
+ * team-scope template. Body is YAML or JSON template content; the API
+ * accepts either via Content-Type. Idempotency-Key is required (per the
+ * idempotency-with-body-hash discipline in the API).
+ *
+ * On success returns the post-write team template body, including
+ * agents_flagged_for_recompose so the caller can surface the fan-out
+ * count to the user.
+ */
+export async function putTeamTemplate(
+  teamId: string,
+  kind: TeamTemplateKind,
+  yamlBody: string,
+): Promise<TeamTemplateBody> {
+  const url = validateUrl(`${API_BASE}/v1/teams/${teamId}/${kind}-template`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "PUT",
+    headers: {
+      ...(await authHeaders()),
+      "Content-Type": "text/yaml",
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+    body: yamlBody,
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    if (response.status === 403) {
+      throw new Error(`Forbidden: org admin or owner role required to write a team template.`);
+    }
+    if (response.status === 404) {
+      throw new Error(`Team '${teamId}' not found.`);
+    }
+    if (response.status === 413) {
+      throw new Error(`Template too large (server limit: 128 KiB alignment / 64 KiB protection).`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  return (await response.json()) as TeamTemplateBody;
+}
+
+/**
+ * DELETE /v1/teams/:team_id/(alignment|protection)-template — clear the
+ * template. Idempotent (deleting an already-cleared template is a 200).
+ * Returns the post-delete team template body with deleted=true and the
+ * recompose fan-out count.
+ */
+export async function deleteTeamTemplate(
+  teamId: string,
+  kind: TeamTemplateKind,
+): Promise<TeamTemplateBody> {
+  const url = validateUrl(`${API_BASE}/v1/teams/${teamId}/${kind}-template`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "DELETE",
+    headers: {
+      ...(await authHeaders()),
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    if (response.status === 403) {
+      throw new Error(`Forbidden: org admin or owner role required to clear a team template.`);
+    }
+    if (response.status === 404) {
+      throw new Error(`Team '${teamId}' not found.`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  return (await response.json()) as TeamTemplateBody;
+}
+
+/**
+ * POST /v1/teams/:team_id/(alignment|protection)-template/preview-compose
+ * — dry-run the composer with the supplied draft against the team's
+ * current org+platform context. Returns the composed canonical output
+ * plus per-field conflicts where the draft was tightened by the
+ * org/platform floor. No DB writes.
+ */
+export async function previewComposeTeamTemplate(
+  teamId: string,
+  kind: TeamTemplateKind,
+  yamlBody: string,
+): Promise<{ composed: Record<string, unknown>; conflicts: unknown }> {
+  const url = validateUrl(
+    `${API_BASE}/v1/teams/${teamId}/${kind}-template/preview-compose`,
+  );
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "POST",
+    headers: {
+      ...(await authHeaders()),
+      "Content-Type": "text/yaml",
+      Accept: "application/json",
+    },
+    body: yamlBody,
+  }));
+  if (!response.ok) {
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Preview failed: ${response.status}`);
+  }
+  const body = (await response.json()) as {
+    composed: Record<string, unknown>;
+    conflicts: unknown;
+  };
+  return { composed: body.composed, conflicts: body.conflicts };
+}
+
 /**
  * Look up an agent in the authenticated user's account by name.
  * Tries exact match first, then single partial match.
