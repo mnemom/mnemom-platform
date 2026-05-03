@@ -16,6 +16,7 @@ import {
 } from "./commands/policy.js";
 import { protectionShowCommand, protectionPublishCommand, protectionValidateCommand, protectionEditCommand } from "./commands/protection.js";
 import { agentsListCommand } from "./commands/agents.js";
+import { orgListCommand, orgShowCommand } from "./commands/org.js";
 import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
 
 program
@@ -314,6 +315,41 @@ program
   .action(async () => {
     try {
       await agentsListCommand();
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+// ============================================================================
+// Organization management (ADR-044, Piece 1 of T1-3.1)
+// ============================================================================
+
+const orgCmd = program
+  .command("org")
+  .description("Manage your organizations (personal + multi-user)");
+
+orgCmd
+  .command("list")
+  .description("List every org you are a member of, including your personal org")
+  .option("--json", "Output JSON instead of a human-readable table")
+  .action(async (options: { json?: boolean }) => {
+    try {
+      await orgListCommand({ json: options.json });
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+orgCmd
+  .command("show [org_id]")
+  .description("Show details of an org (default: your personal org if --personal, else single membership)")
+  .option("--personal", "Show your personal-org-of-one (per ADR-044)")
+  .option("--json", "Output JSON instead of human-readable text")
+  .action(async (orgId: string | undefined, options: { personal?: boolean; json?: boolean }) => {
+    try {
+      await orgShowCommand(orgId, { personal: options.personal, json: options.json });
     } catch (error) {
       console.error("Error:", error instanceof Error ? error.message : error);
       process.exit(1);
