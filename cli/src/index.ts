@@ -17,6 +17,12 @@ import {
 import { protectionShowCommand, protectionPublishCommand, protectionValidateCommand, protectionEditCommand } from "./commands/protection.js";
 import { agentsListCommand } from "./commands/agents.js";
 import { orgListCommand, orgShowCommand } from "./commands/org.js";
+import {
+  teamListCommand,
+  teamShowCommand,
+  teamTemplateCommand,
+  teamPreviewComposeCommand,
+} from "./commands/team.js";
 import { loginCommand, logoutCommand, whoamiCommand } from "./commands/auth.js";
 
 program
@@ -355,6 +361,105 @@ orgCmd
       process.exit(1);
     }
   });
+
+// ============================================================================
+// Team management (ADR-044 amended, Piece 2 of T1-3.1)
+//
+// Per ADR-044 + Charter §I11: team membership is OPTIONAL. Solo agents
+// (zero teams) compose under Platform → Org → Agent. Backend RBAC for
+// team-template endpoints is purely org-level (requireOrgRole on the
+// team's parent org); Team Admin role lands in Piece 5.
+// ============================================================================
+
+const teamCmd = program
+  .command("team")
+  .description("Manage teams and their scope-cascade templates");
+
+teamCmd
+  .command("list")
+  .description("List every team across all orgs you are a member of")
+  .option("--json", "Output JSON instead of a human-readable table")
+  .action(async (options: { json?: boolean }) => {
+    try {
+      await teamListCommand({ json: options.json });
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+teamCmd
+  .command("show <team_id>")
+  .description("Show details of a single team")
+  .option("--json", "Output JSON instead of human-readable text")
+  .action(async (teamId: string | undefined, options: { json?: boolean }) => {
+    try {
+      await teamShowCommand(teamId, { json: options.json });
+    } catch (error) {
+      console.error("Error:", error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+teamCmd
+  .command("alignment-template <team_id>")
+  .description("Read or write the team's alignment template")
+  .option("--set <file>", "Write the template from a YAML or JSON file")
+  .option("--clear", "Clear the template")
+  .option("--json", "Output JSON instead of human-readable text")
+  .action(
+    async (
+      teamId: string | undefined,
+      options: { set?: string; clear?: boolean; json?: boolean },
+    ) => {
+      try {
+        await teamTemplateCommand("alignment", teamId, options);
+      } catch (error) {
+        console.error("Error:", error instanceof Error ? error.message : error);
+        process.exit(1);
+      }
+    },
+  );
+
+teamCmd
+  .command("protection-template <team_id>")
+  .description("Read or write the team's protection template")
+  .option("--set <file>", "Write the template from a YAML or JSON file")
+  .option("--clear", "Clear the template")
+  .option("--json", "Output JSON instead of human-readable text")
+  .action(
+    async (
+      teamId: string | undefined,
+      options: { set?: string; clear?: boolean; json?: boolean },
+    ) => {
+      try {
+        await teamTemplateCommand("protection", teamId, options);
+      } catch (error) {
+        console.error("Error:", error instanceof Error ? error.message : error);
+        process.exit(1);
+      }
+    },
+  );
+
+teamCmd
+  .command("preview-compose <team_id>")
+  .description("Dry-run the composer with a draft template (alignment by default)")
+  .option("--protection", "Preview protection template (default: alignment)")
+  .option("--from <file>", "Read draft template from a file (default: stdin)")
+  .option("--json", "Output JSON instead of human-readable text")
+  .action(
+    async (
+      teamId: string | undefined,
+      options: { protection?: boolean; from?: string; json?: boolean },
+    ) => {
+      try {
+        await teamPreviewComposeCommand(teamId, options);
+      } catch (error) {
+        console.error("Error:", error instanceof Error ? error.message : error);
+        process.exit(1);
+      }
+    },
+  );
 
 // ============================================================================
 // Auth
