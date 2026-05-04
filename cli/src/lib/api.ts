@@ -117,7 +117,8 @@ export async function postApi<T>(
     headers["X-Mnemom-Api-Key"] = cred.key;
   }
 
-  const response = await fetch(url, { // lgtm[js/file-data-url]
+  const response = await fetch(url, {
+    // lgtm[js/file-data-url]
     method: "POST",
     headers,
     body: JSON.stringify(body),
@@ -214,10 +215,10 @@ export async function listAgents(): Promise<AgentListItem[]> {
     if (response.status === 401) {
       throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
     }
-    const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
     throw new Error(err.message || `Failed to list agents: ${response.status}`);
   }
-  const data = await response.json() as { agents: AgentListItem[] };
+  const data = (await response.json()) as { agents: AgentListItem[] };
   return data.agents ?? [];
 }
 
@@ -256,10 +257,10 @@ export async function listMyOrgs(): Promise<OrgListItem[]> {
     if (response.status === 401) {
       throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
     }
-    const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
     throw new Error(err.message || `API request failed: ${response.status}`);
   }
-  const data = await response.json() as { orgs: OrgListItem[] };
+  const data = (await response.json()) as { orgs: OrgListItem[] };
   return data.orgs ?? [];
 }
 
@@ -277,10 +278,10 @@ export async function getMyPersonalOrg(): Promise<PersonalOrgRef> {
     if (response.status === 401) {
       throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
     }
-    const err = await response.json().catch(() => ({ error: "unknown" })) as ApiError;
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
     throw new Error(err.message || `API request failed: ${response.status}`);
   }
-  return await response.json() as PersonalOrgRef;
+  return (await response.json()) as PersonalOrgRef;
 }
 
 // ─── teams (Piece 2 of T1-3.1, ADR-044 amended) ─────────────────────────
@@ -499,9 +500,7 @@ export async function previewComposeTeamTemplate(
   kind: TeamTemplateKind,
   yamlBody: string,
 ): Promise<{ composed: Record<string, unknown>; conflicts: unknown }> {
-  const url = validateUrl(
-    `${API_BASE}/v1/teams/${teamId}/${kind}-template/preview-compose`,
-  );
+  const url = validateUrl(`${API_BASE}/v1/teams/${teamId}/${kind}-template/preview-compose`);
   const response = await fetchWithAuthRetry(url, async () => ({
     method: "POST",
     headers: {
@@ -533,13 +532,13 @@ export async function getAgentByName(name: string): Promise<AgentListItem | null
   const agents = await listAgents();
   const lower = name.toLowerCase();
 
-  const exact = agents.find(a => a.name?.toLowerCase() === lower);
+  const exact = agents.find((a) => a.name?.toLowerCase() === lower);
   if (exact) return exact;
 
-  const partials = agents.filter(a => a.name?.toLowerCase().includes(lower));
+  const partials = agents.filter((a) => a.name?.toLowerCase().includes(lower));
   if (partials.length === 1) return partials[0];
   if (partials.length > 1) {
-    const names = partials.map(a => a.name ?? a.id).join(", ");
+    const names = partials.map((a) => a.name ?? a.id).join(", ");
     throw new Error(`Multiple agents match '${name}': ${names}. Use a more specific name.`);
   }
 
@@ -602,10 +601,7 @@ function emptyIntegrityRow(agentId: string): IntegrityScore {
  * `{ traces: [], private: true }` leaky envelope branch is gone, so we
  * don't need a special case for it.
  */
-export async function getTraces(
-  id: string,
-  limit: number = 10
-): Promise<Trace[]> {
+export async function getTraces(id: string, limit: number = 10): Promise<Trace[]> {
   const url = validateUrl(`${API_BASE}/v1/traces?agent_id=${id}&limit=${limit}`);
   const response = await fetchWithAuthRetry(url, async () => ({
     headers: await authHeaders(),
@@ -792,7 +788,7 @@ export async function publishPolicy(
 export async function testPolicyHistorical(
   agentId: string,
   policyJson: Record<string, unknown>,
-  limit: number = 50
+  limit: number = 50,
 ): Promise<{
   agent_id: string;
   policy_name: string;
@@ -1033,4 +1029,407 @@ export async function resolveAgentId(agentName?: string): Promise<string> {
   console.error(`\nAgent not found: ${name}`);
   console.error("List your agents with: mnemom agents\n");
   process.exit(1);
+}
+
+// ─── Trust Posture (Piece 3 of T1-3.1, ADR-045) ──────────────────────────
+//
+// 12 endpoints; the client mirrors the existing team-template idiom (typed
+// helpers per route, idempotency-key on mutations, friendly error mapping).
+
+export interface PostureBody {
+  posture_schema_version: "v1.0";
+  sideband: {
+    coherence: {
+      enabled: boolean;
+      cadence_seconds: number;
+      fire_on: {
+        pairwise_governance_floor_below: number | null;
+        conflict_edge_count_exceeds: number | null;
+        outlier_agents_count_exceeds: number | null;
+      };
+      severity_on_fire: "low" | "medium" | "high" | "critical";
+    };
+    fault_line: {
+      enabled: boolean;
+      cadence_seconds: number;
+      severity_floor: "low" | "medium" | "high" | "critical";
+      use_reputation_scores: boolean;
+      severity_on_fire: "low" | "medium" | "high" | "critical";
+    };
+    fleet: {
+      enabled: boolean;
+      cadence_seconds: number;
+      patterns: {
+        outliers: boolean;
+        min_pair_score_below: number | null;
+        cluster_partition: boolean;
+      };
+      severity_on_fire: "low" | "medium" | "high" | "critical";
+    };
+  };
+  fleet_identification: { by: "team_membership" };
+  fan_out: { rule: "per_named_affected_agent" };
+}
+
+export interface PostureSummary {
+  posture_id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  scope: "platform" | "org";
+  org_id: string | null;
+  is_default: boolean;
+  current_revision_id: string | null;
+  body: PostureBody | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+export interface PostureRevision {
+  revision_id: string;
+  posture_id: string;
+  revision_no: number;
+  body: PostureBody;
+  change_summary: string | null;
+  authored_by: string | null;
+  authored_at: string;
+}
+
+export interface PostureDiffEntry {
+  path: string;
+  op: "added" | "removed" | "changed";
+  before: unknown;
+  after: unknown;
+}
+
+/** GET /v1/postures — list visible postures. */
+export async function listPostures(opts: {
+  orgId?: string;
+  includePlatform?: boolean;
+  includeDeleted?: boolean;
+}): Promise<PostureSummary[]> {
+  const params = new URLSearchParams();
+  if (opts.orgId) params.set("org_id", opts.orgId);
+  if (opts.includePlatform === false) params.set("include_platform", "false");
+  if (opts.includeDeleted) params.set("include_deleted", "true");
+  const qs = params.toString();
+  const url = validateUrl(`${API_BASE}/v1/postures${qs ? `?${qs}` : ""}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: { ...(await authHeaders()), Accept: "application/json" },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    if (response.status === 403) {
+      throw new Error(`Forbidden: not a member of org '${opts.orgId}'.`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  const data = (await response.json()) as { postures: PostureSummary[] };
+  return data.postures ?? [];
+}
+
+/** GET /v1/postures/:id — read posture with current revision body. */
+export async function getPosture(postureId: string): Promise<PostureSummary> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: { ...(await authHeaders()), Accept: "application/json" },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("Not authenticated. Run `mnemom login` or set MNEMOM_API_KEY.");
+    }
+    if (response.status === 404) throw new Error(`Posture '${postureId}' not found.`);
+    if (response.status === 403) throw new Error(`Forbidden: not visible to your account.`);
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  return (await response.json()) as PostureSummary;
+}
+
+/** GET /v1/postures/:id/revisions — list revisions, newest first. */
+export async function listPostureRevisions(postureId: string): Promise<PostureRevision[]> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}/revisions`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: { ...(await authHeaders()), Accept: "application/json" },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 404) throw new Error(`Posture '${postureId}' not found.`);
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `API request failed: ${response.status}`);
+  }
+  const data = (await response.json()) as { revisions: PostureRevision[] };
+  return data.revisions ?? [];
+}
+
+/** GET /v1/postures/:id/diff?from=N&to=M — structural diff. */
+export async function diffPostureRevisions(
+  postureId: string,
+  fromNo: number,
+  toNo: number,
+): Promise<{
+  from: { revision_no: number };
+  to: { revision_no: number };
+  changes: PostureDiffEntry[];
+}> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}/diff?from=${fromNo}&to=${toNo}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    headers: { ...(await authHeaders()), Accept: "application/json" },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 404) {
+      const errBody = (await response.json().catch(() => ({}))) as ApiError;
+      throw new Error(errBody.message || `Posture or revision not found.`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Diff failed: ${response.status}`);
+  }
+  return (await response.json()) as {
+    from: { revision_no: number };
+    to: { revision_no: number };
+    changes: PostureDiffEntry[];
+  };
+}
+
+interface CreatePostureInput {
+  scope: "org" | "platform";
+  org_id?: string;
+  slug: string;
+  name: string;
+  description?: string | null;
+  body: PostureBody;
+  change_summary?: string | null;
+}
+
+/** POST /v1/postures — create new posture (org-scope only via REST). */
+export async function createPosture(input: CreatePostureInput): Promise<PostureSummary> {
+  const url = validateUrl(`${API_BASE}/v1/postures`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "POST",
+    headers: {
+      ...(await authHeaders()),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+    body: JSON.stringify(input),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 403) {
+      throw new Error(
+        `Forbidden: org owner/admin role required (or scope=platform reserved for migrations).`,
+      );
+    }
+    if (response.status === 409)
+      throw new Error(`A posture with this slug already exists in the org.`);
+    if (response.status === 413) throw new Error(`Posture body too large (server limit: 256 KiB).`);
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Create failed: ${response.status}`);
+  }
+  return (await response.json()) as PostureSummary;
+}
+
+interface UpdatePostureInput {
+  body: PostureBody;
+  change_summary?: string | null;
+  name?: string;
+  description?: string | null;
+}
+
+/** PUT /v1/postures/:id — write a new revision (forward-only). */
+export async function updatePosture(
+  postureId: string,
+  input: UpdatePostureInput,
+): Promise<PostureSummary> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "PUT",
+    headers: {
+      ...(await authHeaders()),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+    body: JSON.stringify(input),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 403) {
+      throw new Error(
+        `Forbidden: org owner/admin required, or this is a Mnemom-shipped platform default (immutable — clone first).`,
+      );
+    }
+    if (response.status === 404) throw new Error(`Posture '${postureId}' not found.`);
+    if (response.status === 413) throw new Error(`Posture body too large (server limit: 256 KiB).`);
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Update failed: ${response.status}`);
+  }
+  return (await response.json()) as PostureSummary;
+}
+
+interface ClonePostureInput {
+  org_id: string;
+  slug?: string;
+  name?: string;
+  description?: string | null;
+}
+
+/** POST /v1/postures/:id/clone — clone source to org-scope. */
+export async function clonePosture(
+  postureId: string,
+  input: ClonePostureInput,
+): Promise<PostureSummary> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}/clone`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "POST",
+    headers: {
+      ...(await authHeaders()),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+    body: JSON.stringify(input),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 403)
+      throw new Error(`Forbidden: org owner/admin required on target org.`);
+    if (response.status === 404) throw new Error(`Source posture '${postureId}' not found.`);
+    if (response.status === 409)
+      throw new Error(`A posture with this slug already exists in the target org.`);
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Clone failed: ${response.status}`);
+  }
+  return (await response.json()) as PostureSummary;
+}
+
+/** DELETE /v1/postures/:id — soft-delete (refuses if assigned). */
+export async function deletePosture(postureId: string): Promise<void> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "DELETE",
+    headers: {
+      ...(await authHeaders()),
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 403) throw new Error(`Forbidden: platform defaults are immutable.`);
+    if (response.status === 404) throw new Error(`Posture '${postureId}' not found.`);
+    if (response.status === 409) {
+      throw new Error(
+        `Cannot delete a posture that is currently assigned to one or more teams. Unassign first.`,
+      );
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Delete failed: ${response.status}`);
+  }
+}
+
+/** POST /v1/postures/:id/assign — assign to a team. */
+export async function assignPosture(
+  postureId: string,
+  teamId: string,
+  pinRevisionNo?: number | null,
+): Promise<{ posture_id: string; team_id: string; replaced_prior: boolean }> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}/assign`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "POST",
+    headers: {
+      ...(await authHeaders()),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+    body: JSON.stringify({ team_id: teamId, pin_revision_no: pinRevisionNo ?? null }),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 403)
+      throw new Error(`Forbidden: org owner/admin required on team's org.`);
+    if (response.status === 404) {
+      const errBody = (await response.json().catch(() => ({}))) as ApiError;
+      throw new Error(errBody.message || `Posture, team, or pinned revision not found.`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Assign failed: ${response.status}`);
+  }
+  return (await response.json()) as {
+    posture_id: string;
+    team_id: string;
+    replaced_prior: boolean;
+  };
+}
+
+/** DELETE /v1/postures/:id/assignments/:team_id — remove an assignment. */
+export async function unassignPosture(postureId: string, teamId: string): Promise<void> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}/assignments/${teamId}`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "DELETE",
+    headers: {
+      ...(await authHeaders()),
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+    },
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 403) throw new Error(`Forbidden: org owner/admin required.`);
+    if (response.status === 404) {
+      throw new Error(
+        `No matching assignment to remove (posture '${postureId}' is not assigned to team '${teamId}').`,
+      );
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Unassign failed: ${response.status}`);
+  }
+}
+
+/** POST /v1/postures/:id/preview-compose — preview effective for a team. */
+export async function previewComposePosture(
+  postureId: string,
+  teamId: string,
+): Promise<{
+  team_id: string;
+  org_id: string;
+  composed: {
+    body: PostureBody;
+    scopes_applied: Array<{ scope: string; posture_id: string; revision_no: number }>;
+  };
+}> {
+  const url = validateUrl(`${API_BASE}/v1/postures/${postureId}/preview-compose`);
+  const response = await fetchWithAuthRetry(url, async () => ({
+    method: "POST",
+    headers: {
+      ...(await authHeaders()),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ team_id: teamId }),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Not authenticated.");
+    if (response.status === 404) {
+      const errBody = (await response.json().catch(() => ({}))) as ApiError;
+      throw new Error(errBody.message || `Posture or team not found.`);
+    }
+    const err = (await response.json().catch(() => ({ error: "unknown" }))) as ApiError;
+    throw new Error(err.message || `Preview-compose failed: ${response.status}`);
+  }
+  return (await response.json()) as {
+    team_id: string;
+    org_id: string;
+    composed: {
+      body: PostureBody;
+      scopes_applied: Array<{ scope: string; posture_id: string; revision_no: number }>;
+    };
+  };
 }
